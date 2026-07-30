@@ -1,0 +1,29 @@
+# Dependencies
+node_modules/
+
+# Build output
+dist/
+*.tsbuildinfo
+
+# Test output
+coverage/
+
+# Secrets — never commit credentials. See SECURITY.md.
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# MCP bundle build artifacts
+*.mcpb
+
+# Logs
+*.log
+npm-debug.log*
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/*
+!.vscode/extensions.json

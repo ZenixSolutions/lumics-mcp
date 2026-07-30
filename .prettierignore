@@ -1,0 +1,16 @@
+node_modules/
+dist/
+coverage/
+package-lock.json
+
+# Evidence artifact: captured verbatim from the vendor's API documentation.
+# Reflowing it would obscure diffs when the upstream contract changes, and the
+# whole point of committing it is that it is auditable against the source.
+docs/reference/
+
+# Governance records. Approved RFCs and ADRs are not edited in place, so
+# reformatting them would create noise in documents that must stay stable.
+docs/rfc/
+docs/adr/
+docs/DECISION_LOG.md
+docs/ENGINEERING_OS_GAPS.md

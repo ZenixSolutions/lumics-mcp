@@ -1,0 +1,18 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a security vulnerability
+    url: https://github.com/ZenixSolutions/lumics-mcp/security/advisories/new
+    about:
+      Do not open a public issue for a security problem. Use GitHub private vulnerability reporting,
+      or email security@zenixsolutions.com. See SECURITY.md.
+  - name: Question or usage help
+    url: https://github.com/ZenixSolutions/lumics-mcp/discussions
+    about: Ask about installation, configuration, or how a tool behaves. Read the README Limitations
+      section first — several surprising behaviours are documented there.
+  - name: Lumics platform or API support
+    url: https://www.lumics.io/
+    about: This is an independent community project, not affiliated with or endorsed by Lumics or
+      NetCuras. For problems with the Lumics platform or its API, contact Lumics.
+  - name: Code of Conduct
+    url: https://github.com/ZenixSolutions/lumics-mcp/blob/main/CODE_OF_CONDUCT.md
+    about: Report conduct concerns to conduct@zenixsolutions.com.

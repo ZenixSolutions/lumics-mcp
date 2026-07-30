@@ -1,0 +1,16 @@
+{
+  // The root tsconfig excludes `tests` so it is not emitted to dist/. ESLint's
+  // project service still needs a program covering test files, otherwise every
+  // type-aware rule reports "file was not found by the project service".
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "rootDir": ".."
+  },
+  "include": ["**/*.ts", "../src/**/*.ts", "../vitest.config.ts"],
+  // `exclude` is inherited from the extended config, and the root config excludes
+  // `tests` — which would exclude every file this config exists to include, so
+  // the program would be empty and `tsc -p tests` would pass trivially while
+  // ESLint still reported "not found by the project service". Override it.
+  "exclude": ["../node_modules", "../dist", "../coverage"]
+}

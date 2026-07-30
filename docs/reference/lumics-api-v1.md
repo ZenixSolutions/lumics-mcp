@@ -1,0 +1,1113 @@
+# Lumics REST API v1.0 — Extracted Specification
+
+**Source:** `https://app.lumics.io/#/documentation/api/*` (vendor's own in-app API Reference, authenticated session).
+**Extracted:** 2026-07-29. **API Version:** 1.0 (every endpoint page reports `API Version 1.0`, `Login Required true`, `Response Format application/json`).
+**Base URL:** `https://app.lumics.io`
+
+**Coverage:** Overview, Authentication, Errors, Resources index, and all 41 endpoint detail pages (slug ids 680 → 1480 in steps of 20). No page failed to load.
+
+> **Redaction note:** all example ObjectIds, IP addresses, hostnames, e-mail addresses and tokens from the documentation examples have been replaced with placeholders. Identifier *shapes* are preserved: every `hex id` in this API is a 24-character hex MongoDB ObjectId (e.g. `5628b8174b6cf000001bf163` shape → written here as `<objectId>`).
+
+> **This document is no longer only the vendor's documentation.** On **2026-07-30** the contract suite was run against a live tenant for the first time and it contradicted the vendor's documentation in several places — including one, `properties`, that makes four of the five metric endpoints unusable as documented. Those measurements are recorded here, marked, and dated. **Read [§0](#0-live-tenant-measurements--2026-07-30) before implementing anything against §6 or §12.**
+
+---
+
+## 0. Live-tenant measurements — 2026-07-30
+
+Everything outside this section and the `MEASURED 2026-07-30` markers is still the vendor's documentation as captured on 2026-07-29. Nothing the vendor wrote has been deleted: where a measurement contradicts the documentation, both are shown, because the value of this file is that it can be audited against the source.
+
+### 0.1 How to read the markers
+
+| Marker | Meaning |
+|---|---|
+| unmarked text | **Vendor documentation**, captured 2026-07-29 from the in-app API Reference. Never edited. |
+| `MEASURED 2026-07-30` | **Observed behaviour** of one live tenant on that date. It contradicts, narrows or extends the vendor text next to it. |
+| `MEASURED 2026-07-30 — CONFIRMS` | The vendor text was checked and held. |
+| `MEASURED 2026-07-30 (run 02)` | From the **second** run of that date, made after the corrections in commit `0d14149` shipped. Same tenant, same marker meaning; the suffix exists only so the two runs can be told apart, since a re-check that agreed with run 01 and a finding that only run 02 could reach are different kinds of evidence. |
+| `OBSERVED 2026-07-30 (vendor UI)` | **Not an API measurement.** What the vendor's own web application was seen doing in a browser on that date — which requests its pages issue. It is evidence about how the vendor uses its own API, not about what the API returns, and it is marked separately so the two are never conflated. |
+| `UNVERIFIED` | Neither confirmed nor contradicted: the run could not exercise it. Not the same as "fine". |
+
+A "Req" column that reads `optional — **MEASURED 2026-07-30: REQUIRED …**` has had only its *requirement marking* corrected. The Description column of every parameter table remains the vendor's verbatim wording.
+
+### 0.2 Provenance and limits of these measurements
+
+- **What ran:** `tests/contract/**`, read-only (`GET` only), against one production tenant, on 2026-07-30. No token endpoint was called. **Two runs, same date, same tenant:** run 01 produced M1–M8 and the corrections in commit `0d14149`; **run 02** was the re-run against those corrections and produced M9–M11. Findings from the second are marked `MEASURED 2026-07-30 (run 02)`.
+- **What run 02 was for, and what it cost:** it confirmed the M1 correction against the live API (see §0.4) — and it also exposed a defect in the *suite* rather than the API: 40 assumptions went UNVERIFIED because module discovery probed `componenttypes` for module names instead of the tenant's device records. That is recorded as M11 because a reader of this file needs to know which questions the second run did **not** answer, and why.
+- **What else was done on the same day:** a **manual probe** of §12.1 outside the suite (a single minimal query, which was served), and a **browser session against the vendor's own web application** in which the network traffic of a company dashboard load was observed. Both feed M12. The manual probe is an API measurement and is marked like one; the browser session is not, and carries its own marker (§0.1).
+- **Scope:** one tenant, one company, one point in time. A measurement is evidence about **this API's behaviour as deployed**, not a vendor commitment, and property names in particular are **tenant-specific** (§0.3 M2). Do not promote a measured example value to a constant in code.
+- **Reproducibility:** the credential used has since expired. Re-running requires a fresh token; every finding below is written so the suite can re-check it (`tests/contract/live-metrics.test.ts`, `tests/contract/live-resources.test.ts`).
+- **Not measured:** anything the tenant had no data for, and everything behind §12.2 `/summarize`, which never returned (M5). Those are UNVERIFIED, and the suite reports them as such rather than passing.
+
+### 0.3 Index of measured findings
+
+| # | Finding | Effect on the contract | Recorded in |
+|---|---|---|---|
+| **M1** | `properties` is **required** on §12.1, §12.2 and both §12.3 endpoints. Omitting it returns `400 {"error":"Must supply required component metrics as properties parameter"}`. On §12.4 it is genuinely optional. | **Contradicts** §12.0, which marks it optional. Four of five metric endpoints are unusable as documented. | §12.0 table, §12.5 M1, §14 defect 17 |
+| **M2** | An **invalid** `properties` value returns **HTTP 200 with empty stats**, not an error. The 400 gate tests presence only, never validity. | **Extends** — the docs describe no validation behaviour. This is a silent-failure mode. | §12.5 M2, §14 defect 18 |
+| **M3** | `componenttypes` ids are **not** valid `itemType` values (213 of 246 rejected). The metrics API wants the singular component id; `componenttypes` returns a plural alias. `itemType` is validated **before** `properties`. | **Contradicts** the implication of §12.0/§6.4 that a component type string is an `itemType`. | §6.4, §12.5 M3, §14 defect 19 |
+| **M4** | 41 of 246 `componenttypes` entries carry **no `type` field**. Present iff `id` has ≥3 underscore-separated segments. | **Contradicts** §6.4's four-field shape. | §6.4, §14 defect 20 |
+| **M5** | §12.2 `/summarize` **exceeded 90 s and never returned**, with or without `itemType`. §12.1 and §12.3 answer in 1–2 s. | Its response shape and every `sum` claim in §12.2 are **UNVERIFIED**. | §12.2, §12.5 M5, §14 defect 21 |
+| **M6** | §6.5 `deviceDefinitions/components` carries **no metric property names** — it is the inventory schema. §12.4 is the only enumeration path for property names, and it surfaces **device-scoped metrics only**. | **Contradicts** §14 defect 14's claim that these two endpoints are where the missing enumerations are found. | §6.5, §12.4, §12.5 M6, §14 defect 22 |
+| **M7** | §12.4 module coverage is partial: `snmp` and `http` answered 200; `ping` and `syslog` returned HTML error pages; `deviceConfigs` returned 500. | **Extends** — no per-module availability is documented anywhere. | §12.4, §12.5 M7, §14 defect 23 |
+| **M8** | Response envelopes for §12.1/§12.3 and §12.4 observed and consistent with the documented examples. | **CONFIRMS** §12.1, §12.3, §12.4. | §12.5 M8 |
+| **M9** _(run 02)_ | §6.4 ids do **not** compose as `<module>_<group>_<type>`. `snmp_common_ups_upsbatteries` carries all four fields, `type` = `ups`, and a fourth segment the documented rule cannot express (6 of 246 ids have four segments; 41 have two and no `type`). | **Contradicts** §6.4's composition rule. What holds is a prefix/containment relationship, not a concatenation. | §6.4, §12.5 M9, §14 defect 24 |
+| **M10** _(run 02)_ | §12.4 `data` can carry a **non-array `company` entry** alongside the array-valued item classes. | **Extends** §12.4, which documents `data` as keyed by item class and shows only arrays. | §12.4, §12.5 M10 |
+| **M11** _(run 02)_ | Metric modules are **not** discoverable from `componenttypes`. Probing the four modules that catalogue ranked first (`cisco`, `clearpass`, `cohesity`, `common`) yielded **no** property names from §12.4 — `common` returned 500 — and 40 assumptions went UNVERIFIED. The tenant's device records named `ping` 27, `snmp` 24, `deviceConfigs` 20, `http` 1, `syslog` 1 across 27 devices; `snmp` enumerates property names. | **Extends** — the catalogue is platform-wide component *types*, not this tenant's polling modules. A metric call is scoped to a module a device reports (§7.1). | §7.1, §12.4, §12.5 M11, §14 defect 14 |
+| **M12** _(runs 01–02, manual probe, vendor UI)_ | The **company-scoped metric endpoint is unreliable in practice**. §12.1 returned **HTTP 500** on ordinary queries carrying a valid `properties` — with `lastMetric`, `isMonitored`, `minIntervals`, `limit`, and with `interval=minute` and `interval=fiveMin` — while `interval=hour`, `interval=day`, `aggregate`, `alignTimeRange` and a minimal manual probe were **served**. §12.2 never returned at all (M5). §12.3 device-scoped answered in 1–2 s with populated `data` throughout. The vendor's own company dashboard issued **57 API calls on load, including its "Top devices by CPU" and "Top devices by memory" widgets, and never called `/api/v1/metrics/companies/`**. | **Extends** §12.1 and §12.2: nothing documents any failure mode, cost or reliability caveat on either. **Intermittent, not dead** — no cause established. | §12.1, §12.2, §12.5 M12, §14 defect 25 |
+
+### 0.4 Vendor claims the run confirmed (do not "correct" these)
+
+- **No pagination anywhere** (§4.3): list reads are bare arrays with no envelope, total or cursor; `limit` is honoured on devices, collectors and ipgroups; `offset` is ignored.
+- **The IPAM singular/plural asymmetry is real** (§8, §13 Q1), and the plural spelling returns **404 on a GET** — the singular read path is load-bearing, not defensive.
+- **`id` vs `_id`** (§4.2): the ipgroup list returns `id` while the single read returns `_id`.
+- Device records carry an ObjectId-shaped `company` (§7.1/§7.2) — the field the device-metric ownership pre-read depends on. **Re-confirmed run 02**, together with the other half of the pre-read: a company-scoped read of a foreign device id returns **404**, so the design is sound — a device the configured company does not own cannot be read through it, and the metric tools' refusal is the API's answer rather than a client-side guess.
+- A company-scoped read of a device id the company does not have returns **404**.
+- `dataPoints`/`width` really are required (§12.0), `sum=true` (boolean) is rejected with 400, and an unrecognised `interval` is rejected.
+
+**MEASURED 2026-07-30 (run 02) — the M1 correction is validated against the live API.** This is the headline result of the second run, and it is a confirmation of *this document's own corrections* rather than of the vendor's text:
+
+- **`properties` is REQUIRED on §12.1, §12.2 and both §12.3 endpoints** — re-measured, unchanged. The requirement markings shipped in commit `0d14149` are correct.
+- **`properties` is genuinely optional on §12.4** — a call omitting it is served. The asymmetry in the M1 table is real, not an artefact of one run.
+- **`itemType` is validated before `properties`** (the M3 ordering trap) — a wrong `itemType` is rejected naming the unknown component and **never mentions `properties`**. A client debugging the M1 requirement against a wrong `itemType` will still be told about the wrong parameter.
+
+---
+
+## 1. Overview (verbatim)
+
+> The Lumics API is used to power the Lumics monitoring application, and also to enable user access to the data.
+>
+> Most resources follow the REST pattern to support Create/Read/Update/Delete operations.
+>
+> The API uses JSON as its data format.
+
+---
+
+## 2. Authentication (verbatim, credentials redacted)
+
+> You authenticate to the Lumics API by providing a JWT token in the request headers.
+>
+> JWT tokens are an open standard to represent claims securely between two parties, using a digital signature to guarantee integrity. You can read more about the JWT spec in the RFC. Your JWT tokens identify your API requests as your user, so be sure to keep them secret. If exposed, there is an api endpoint to revoke existing tokens.
+>
+> To get a token for your user, login to the application in a browser and go to /api/v1/me/token. Alternatively you can also get one directly by POSTing to the same api with your username and password, e.g.:
+>
+> `curl -v -X POST -H 'Content-Type: application/x-www-form-urlencoded' --data 'username=<email>&password=<password>' https://app.lumics.io/api/v1/me/token`
+>
+> By default the token expires in one day. You can request a longer expiry time using the expiresIn query parameter on the api request, where expiresIn is in seconds. See the token api resource documentation for more details.
+>
+> The api token will look something like this example (but much longer): `<jwt>`
+>
+> You can then use that token in API requests by adding a header to your http request like this:
+>
+> `Authorization: Bearer <jwt>`
+>
+> e.g. here's a full example curl command:
+>
+> `curl -X GET -v --header 'Content-Type: application/json; charset=utf-8' --header 'Authorization: Bearer <jwt>' https://app.lumics.io/api/v1/me`
+
+Notes for implementers:
+- Two content types are demonstrated for the token endpoint: `application/x-www-form-urlencoded` (curl example on the Authentication page) and `application/json` (the token endpoint's own page declares `Content-Type: application/json` and a JSON body).
+- Auth header format: `Authorization: Bearer <jwt>`.
+
+---
+
+## 3. Errors — HTTP status codes (verbatim table)
+
+> The API attempts to return appropriate HTTP status codes for every request.
+
+| Code | Text | Description |
+|---|---|---|
+| 200 | OK | Success |
+| 304 | Not Modified | There was no new data to return |
+| 400 | Bad Request | The request was invalid or cannot be otherwise served - indicates a problem with the parameters supplied |
+| 401 | Unauthorized | This indicates that the request is not authenticated - probably a problem with the token |
+| 403 | Forbidden | You receive this error if you try to access data that your user does not have access to |
+| 404 | Not found | Resource could not be found |
+| 409 | Conflict | Occurs if you try to create a resource which would be a duplicate of an existing resource |
+| 423 | Locked | The resource could not be modified because another process or user has locked it |
+| 429 | Too Many Requests | Some API requests are rate limited, this error indicates you have exceeded the limit |
+| 500 | Server Error | Something went wrong on the server side |
+
+**Important:** these are the *only* documented status codes. **No endpoint detail page documents per-endpoint status codes, error bodies, or error shapes.** Rate limiting exists (429) but no limits, windows or headers are documented anywhere.
+
+---
+
+## 4. Cross-cutting conventions
+
+### 4.1 The `:context` / `:contextId` path parameters
+
+`:context` is a literal path segment naming the tenancy scope. Documented accepted values vary **per endpoint** (see §12, Q2):
+
+| Documented value set | Endpoints |
+|---|---|
+| `admingroups \| companies` | all collector endpoints; component list/read; componenttypes |
+| `admingroups \| companies \| system` | `GET /devices`, `GET /devices/:id` |
+| `companies` only | `POST /devices`, `PUT /devices/:id/modules/:module/lastDiscovery`, `PATCH /devices/:id`, `PATCH /devices/:ids/batch`, `DELETE /devices/:id` |
+| "Context - admingroups or companies" | `GET /:context/:contextId/metrics/summaries/:moduleType` |
+
+`:contextId` is documented on every one of those endpoints as `required, type: hex id` ("Context ID"). There is **no documented exception allowing `system` without a contextId.**
+
+The IPAM resources (ipaddress, ipgroup, ipsubnet), the component PATCH, and the company-scoped metric endpoints do **not** use `:context`; they hard-code `companies` and take a `:company` / `:companyId` path parameter instead.
+
+### 4.2 Response envelopes
+
+| Operation | Shape |
+|---|---|
+| GET list | **bare JSON array** (no envelope, no total/count, no paging metadata) |
+| GET single | **bare JSON object** |
+| POST create | **bare created object** (no envelope) |
+| PATCH single / PUT | `{ "updated": { ...full object... } }` |
+| PATCH batch | `{ "updated": [ {...}, {...} ] }` |
+| DELETE | `{ "deleted": { ...full object... } }` |
+| Metric list/summarize | `{ "data": [ ... ], <timing + time-range metadata> }` |
+| Metric summaries | `{ "data": { "devices": [ ... ] }, "count": n, <timing + time-range metadata> }` |
+| `POST /me/token/revoke` | `{ "message": "all tokens revoked" }` |
+
+Object identity keys are inconsistent in examples: reads/updates of collectors, devices, ipgroup list, ipsubnet list and ipaddress list return `id`; ipgroup single read, ipgroup/ipsubnet/ipaddress create-update-delete payloads and component reads return `_id`. Some documents also expose `__t` (discriminator) and `__v` (Mongoose version key) — component objects do.
+
+### 4.3 Pagination
+
+**There is no pagination in this API as documented.** Across all 41 endpoint pages the *only* result-control parameter is `limit` (`optional, type: integer`). There is **no** `offset`, `page`, `skip`, `cursor`, `after`, `sort`, or `order` parameter documented anywhere, and no response envelope carries a total count or next-page link for list endpoints. `limit` appears on:
+
+- `GET /:context/:contextId/collectors` — "Amount of results"
+- `GET /:context/:contextId/devices` — "Limits the amount of results returned." (listed under the *URL Parameters* heading on the page — a docs formatting quirk; it is a query parameter)
+- `GET /companies/:company/ipsubnet/:ipSubnet/ipaddresses` — "Amount of results"
+- `GET /companies/:company/ipgroups` — "Amount of results"
+- `GET /companies/:company/ipsubnets` — "Amount of results"
+- all four metric-data endpoints — "Maximum number of results to return"
+
+List endpoints with **no documented pagination or limit at all**: `GET /:context/:contextId/component/:component/`, `GET /:context/:contextId/componenttypes/`, `GET /api/v1/system/deviceDefinitions/components`, `GET /:context/:contextId/metrics/summaries/:moduleType`.
+
+---
+
+## 5. Collector
+
+Slug ids 680–760. All collector endpoints declare header `Content-Type: application/json` and `:context` accepted values `admingroups | companies`.
+
+### 5.1 `GET /api/v1/:context/:contextId/collectors`
+Description (verbatim): *"List all collectors for a given context."*
+
+| Param | In | Req | Type | Notes |
+|---|---|---|---|---|
+| `context` | path | required | string | Accepted values: `admingroups \| companies` |
+| `contextId` | path | required | hex id | Context ID |
+| `limit` | query | optional | integer | Amount of results |
+
+Response: bare array of collector objects. Example fields: `company`, `adminGroup`, `user`, `name`, `description`, `location`, `ipAddress`, `version`, `needsRestart` (false), `osConfig.ntpServers[]`, `createdAt`, `createdBy`, `updatedAt`, `updatedBy`, `id`.
+
+### 5.2 `GET /api/v1/:context/:contextId/collectors/:id`
+Description: *"Retrieve a single collector."*
+
+| Param | In | Req | Type | Notes |
+|---|---|---|---|---|
+| `context` | path | required | string | `admingroups \| companies` |
+| `contextId` | path | required | hex id | Context ID |
+| `id` | path | required | hex id | ID of the collector to retrieve |
+
+No query parameters. Response: bare collector object (same fields as above).
+
+### 5.3 `POST /api/v1/:context/:contextId/collectors`
+Description: *"Create a new collector."*
+
+Path: `context` (required, `admingroups | companies`), `contextId` (required, hex id).
+
+Body:
+
+| Field | Req | Type | Description (verbatim) |
+|---|---|---|---|
+| `_id` | optional | hex id | Collector ID |
+| `company` | required | hex id | Company ID |
+| `adminGroup` | optional | hex id | Admin group ID |
+| `user` | optional | hex id | User ID for the collector account. A collector user is created automatically if omitted |
+| `name` | required | string | Collector name |
+| `description` | optional | string | Collector description |
+| `location` | optional | string | Collector location |
+| `ipAddress` | optional | string | Collector IP address. This should only be updated by the collector itself |
+| `version` | optional | string | Collector software version. This should only be updated by the collector itself |
+| `needsRestart` | optional | Date | Date the collector was marked as needing a restart, or false if a restart is not needed |
+| `osConfig` | optional | object | Operating system configuration for the collector |
+
+`osConfig` nested shape seen in examples: `{ "ntpServers": [ "<host>", "<host>" ] }`. No other nested keys documented.
+
+Response: bare created collector object (server fills `user`, `needsRestart: false`, `osConfig.ntpServers: []`, `id`).
+
+### 5.4 `PATCH /api/v1/:context/:contextId/collectors/:id`
+Description: *"Modify an existing collector."*
+
+Path: `context` (required), `contextId` (required), `id` (required, hex id, "ID of the collector").
+
+Body — same field list as POST **except** `_id` is not listed and **all fields are optional**: `company`, `adminGroup`, `user` ("User ID for the collector account"), `name`, `description`, `location`, `ipAddress`, `version`, `needsRestart`, `osConfig` (descriptions identical to POST).
+
+Response: `{ "updated": { ...full collector... } }`.
+
+### 5.5 `DELETE /api/v1/:context/:contextId/collectors/:id`
+Description (verbatim, includes the caveat): *"Delete a collector. A collector cannot be deleted while devices are assigned to it."*
+
+Path: `context`, `contextId`, `id` (all required). No query params, no body.
+Response: `{ "deleted": { ...full collector... } }`.
+
+---
+
+## 6. Component
+
+### 6.1 `GET /api/v1/:context/:contextId/component/:component/`
+Description: *"Get a list of components of the specified component type."*
+
+| Param | In | Req | Type | Notes |
+|---|---|---|---|---|
+| `context` | path | required | string | Accepted values: `admingroups \| companies` |
+| `contextId` | path | required | hex id | Context ID |
+| `component` | path | required | string | The component type. |
+
+**No query parameters documented — no `limit`, no pagination.** Note the trailing slash in the documented path template.
+
+Response: bare array. Example component object: `_id`, `__t` (e.g. `"pingtcp.Port"`), `__v`, `adminGroup`, `company`, `device`, `index`, `isMonitored` (bool), `name`, plus type-specific fields (`port`).
+
+### 6.2 `GET /api/v1/:context/:contextId/component/:component/:id`
+Description: *"Get a single component with the component type and id."*
+
+Path: `context` (required, `admingroups | companies`), `contextId` (required, hex id), `component` (required, string, "The component type."), `id` (required, hex id, "The component ID").
+No query params. Response: bare component object.
+
+### 6.3 `PATCH /api/v1/companies/:companyId/component/:component/:id`
+Description: *"Update a single component."*
+**Company-scoped only — there is no `:context` variant of the component update.**
+
+| Param | In | Req | Type | Notes |
+|---|---|---|---|---|
+| `companyId` | path | required | hex id | Company ID |
+| `component` | path | required | string | The component type. |
+| `id` | path | **optional** | hex id | The component ID *(documented as optional — almost certainly a docs error, since the path segment cannot be omitted)* |
+
+**Body: no field list is documented.** Only an example request is given:
+```json
+{ "name": "component-name", "company": "<objectId>" }
+```
+Response: `{ "updated": { ...full component... } }`.
+
+### 6.4 `GET /api/v1/:context/:contextId/componenttypes/`
+Description: *"List all the component types."*
+
+Path params documented: `context` (required, `admingroups | companies`), `contextId` (required, hex id), and — spuriously — `component` (required, string, "The component type."), which does not appear in the path template. Treat `component` as a documentation error.
+
+No query params, no pagination. Response: bare array of `{ "id": "<module>_<group>_<type>", "module": "...", "group": "...", "type": "..." }`, e.g. `{"id":"cisco_ast_devices","module":"cisco","group":"ast","type":"devices"}`.
+
+> **MEASURED 2026-07-30 (M4) — the `type` field is not always present.** 41 of 246 entries carried no `type` at all. The rule observed: `type` is present iff `id` has **three or more** underscore-separated segments (2 segments → no `type`, 41 entries; 3 → 199; 4 → 6). The type-less entries span 11 modules — vmware 10, meraki 6, paloalto 6, hyperv 5, winrm 4, common 3, clearpass 2, cohesity 2, and one each for http, mongostat and pingtcp. A consumer must treat `type` as optional; `id`, `module` and `group` were present on every entry. The counts are this tenant's catalogue and will differ elsewhere — the *rule* is what the contract suite locks.
+
+> **MEASURED 2026-07-30 (run 02) (M9) — the documented id composition is wrong.** `id` is **not** `<module>_<group>_<type>`. The counter-example is `snmp_common_ups_upsbatteries`: it carries all four documented fields, its `type` is `ups`, and the documented rule would compose `snmp_common_ups`. Six of the 246 ids on this tenant have four underscore-separated segments (and 41 have two, with no `type` at all — M4), so the two-part concatenation is not a rule this API honours in either direction. **The corrected rule, and all that a consumer may rely on:** an id **begins** `<module>_<group>_`, and where `type` is present it appears as one of the segments that follow. Whether the extra segment is always *after* `type` is **UNVERIFIED** — one example is not a rule. Practical impact is nil for a client that treats an id as opaque: this server copies a `componenttypes` id verbatim into the `:component` path segment and never composes one, which is the correct handling. It is **not** nil for §12.5 M3's `itemType` construction rule — see the note there.
+
+> **MEASURED 2026-07-30 (M3) — a `componenttypes` id is NOT an `itemType`.** 213 of the 246 ids were rejected by the metric endpoints with `400 Unknown component <value>`. This endpoint returns the **plural alias** (`data.componentAlias` in §6.5), while the metrics API wants the **singular component id**: `snmp_common_cpus` → 400, `snmp_common_cpu` → 200. See §12.5 M3 for how to construct the id the metrics API accepts, and §14 defect 19. Nothing in the vendor's documentation distinguishes the two vocabularies; §12.0's `itemType` example (`snmp_f5_f5pools`) reads as though this endpoint's ids were usable directly.
+
+### 6.5 `GET /api/v1/system/deviceDefinitions/components`
+Description: *"Get device definitions for components."*
+
+**No path, query or body parameters documented at all.** Note the literal `system` segment and the *absence of any contextId*.
+
+Response: bare array of definition objects:
+```json
+[{
+  "includes": [],
+  "filePath": "/components/cisco/ast/Device.yml",
+  "data": {
+    "enabled": true,
+    "modelName": "Device",
+    "itemType": "device",
+    "componentAlias": "devices",
+    "isDefaultMonitored": true,
+    "schema": { "index": { "type": "String", "required": true } },
+    "nameProperty": "index",
+    "componentManagement": { "title": "Cisco Ast Devices", "displayProp": "index", "canManage": false }
+  },
+  "shas": {},
+  "precompiled": false
+}]
+```
+`data.schema` values may be plain type strings (`"name": "String"`) or objects (`{"type":"Schema.Types.Mixed"}`); `componentManagement` may omit `canManage`.
+
+> **MEASURED 2026-07-30 (M6) — this catalogue does NOT carry metric property names.** It is the **inventory schema**, not a metric catalogue: `data.schema` holds configuration fields (`ifDescr`, `ifIndex`, `ifAlias`, …). Across the whole 386 KB payload there were **zero** occurrences of `Calculated` or `sysUpTime`. The entry shape observed was `{data, filePath, includes, precompiled, shas}`, as documented. Consequence: §14 defect 14 is wrong to point here for metric property names — the only endpoint that enumerates them is §12.4, and it surfaces **device-scoped metrics only**, so a component-level property name such as `Calculated.ifInOctets` is discoverable from **no endpoint at all**. See §12.5 M6.
+
+> **MEASURED 2026-07-30 (M3) — this catalogue is where the metrics API's `itemType` comes from.** The id the metric endpoints accept is constructible from an entry here: take the module/group path out of `filePath` (`/components/snmp/common/Cpu.yml` → `snmp`, `common`) and join it to **`data.itemType`** (singular, e.g. `cpu`) with `_` → `snmp_common_cpu`. `data.componentAlias` is the plural form that §6.4 returns and the metrics API rejects.
+
+---
+
+## 7. Device
+
+All device endpoints declare header `Content-Type: application/json`.
+
+### 7.1 `GET /api/v1/:context/:contextId/devices`
+Description: *"List all the devices for a given context."*
+
+| Param | In | Req | Type | Notes |
+|---|---|---|---|---|
+| `context` | path | required | string | **Accepted values: `admingroups \| companies \| system`** |
+| `contextId` | path | required | hex id | Context ID |
+| `limit` | query | optional | integer | "Limits the amount of results returned." (page lists it under *URL Parameters*, but it is a query param) |
+
+Response: bare array of device objects. Documented example fields: `createdAt`, `createdBy`, `updatedAt`, `updatedBy`, `version`, `model`, `deviceType` (`switch`, `default`, …), `location`, `description`, `name`, `collector` (hex id), `ipAddress`, `company`, `adminGroup`, `priority` (0), `maintenanceType` (`disable-polling`), `maintenanceMode` (bool), `enabled` (bool), `customProperties: [{ customProperty: <objectId>, value: <any> }]`, `id`, and `modules` (map keyed by module instance name):
+
+- `modules.snmp`: `module: "snmp"`, `snmpVersion` (`"2c"`), `credential` (hex id), `enabled`, `primary`, `name`, `description`, `location`, `sysObjectID`, `lastDiscovery` (ISO date), `useIfXTable` (bool)
+- `modules.ping`: `module: "ping"`, `intervalMs`, `timeoutMs`, `packetSize`, `packetCount`, `advancedOptions` (bool), `enabled`, `primary`, `lastDiscovery`
+- `modules.deviceConfigs`: `module: "snapshots"`, `credential`, `enableCredential`, `enabled`, `snapshotItems: [{ _id, snapshotType: "startup"|"running", enabled, arguments: { dashboardVisible, eventsEnabled, captureTimeout, initialPromptTimeout, telnetPort, protocol: "ssh", interval } }]` (argument values are strings in the example)
+
+Note the module *key* need not equal `module` (`deviceConfigs` → `module: "snapshots"`).
+
+> **MEASURED 2026-07-30 (run 02) (M11) — this map is the only enumeration of a tenant's metric modules.** The `modules` map is what a `moduleType` path segment in §12.1–§12.4 must be chosen from: a metric read is scoped to a module a device polls, and `componenttypes` (§6.4) answers a different question — see §12.5 M11 for what probing the wrong catalogue cost. On this tenant the census was `ping` 27, `snmp` 24, `deviceConfigs` 20, `http` 1, `syslog` 1 across 27 device records. Since neither the key nor the `module` field is documented as the name a metric route uses, a client that discovers modules this way should treat **both** as candidates.
+
+### 7.2 `GET /api/v1/:context/:contextId/devices/:id`
+Description: *"Retrieve a single device."*
+
+Documented path params: `context` (required, `admingroups | companies | system`), `contextId` (required, hex id). **The page omits `:id` from its parameter list even though the path template contains it** — `id` is a required 24-char hex ObjectId.
+
+No query params documented. Response: bare device object.
+
+### 7.3 `POST /api/v1/:context/:contextId/devices`
+Description: *"Create a single device."*
+
+Path: `context` (required, string, **Accepted values: `companies`**), `contextId` (required, hex id).
+
+Body:
+
+| Field | Req | Type | Description |
+|---|---|---|---|
+| `company` | required | hex id | Company ID |
+| `name` | required | string | Device name |
+| `ipAddress` | required | string | Device ip address |
+| `collector` | required | hex id | Collector ID |
+| `deviceType` | required | string | Device Type |
+
+No optional body fields documented; no enumeration of legal `deviceType` values (examples show `default` and `switch`). Response: bare created device, server-populated with `priority: 0`, `maintenanceMode: false`, `maintenanceType: "disable-polling"`, `enabled: true`, `location`, `modules.ping` (`enabled: true, primary: true, lastDiscovery: null`), `customProperties: []`, `createdAt`, `createdBy`, `adminGroup`, `id`.
+
+### 7.4 `PUT /api/v1/:context/:contextId/devices/:id/modules/:module/lastDiscovery`
+Description: *"Update the last discovery time for a module of a device."*
+
+| Param | In | Req | Type | Notes |
+|---|---|---|---|---|
+| `context` | path | required | string | Accepted values: `companies` |
+| `contextId` | path | required | hex id | Context ID |
+| `id` | path | required | hex id | Device ID |
+| `module` | path | required | string | Module to be updated |
+| `date` | body | required | Date | The date that lastDiscovery will be updated to. |
+
+Example request: `{ "date": "2021-03-30T14:14:41.000Z" }` (ISO-8601 UTC). Response: `{ "updated": { ...full device, with modules.<module>.lastDiscovery set... } }`.
+
+### 7.5 `PATCH /api/v1/:context/:contextId/devices/:id`
+Description: *"Update a single device."*
+
+| Param | In | Req | Type | Notes |
+|---|---|---|---|---|
+| `context` | path | required | string | Accepted values: `companies` |
+| `contextId` | path | required | hex id | Context ID |
+| `id` | path | required | hex id | Device ID |
+| `device` | body | required | Object | "An object with the device properties that need to be updated. **Must include the device ID.**" |
+
+Caveat: the documented body field is named `device` but the example request is a *flat* object, not wrapped: `{ "name": "new-name", "id": "<objectId>" }`. Follow the example (flat body including `id`); the field list is not enumerated.
+
+Response: `{ "updated": { ...full device... } }`.
+
+### 7.6 `PATCH /api/v1/:context/:contextId/devices/:ids/batch`
+Description: *"Update multiple devices."*
+
+| Param | In | Req | Type | Notes |
+|---|---|---|---|---|
+| `context` | path | required | string | Accepted values: `companies` |
+| `contextId` | path | required | hex id | Context ID |
+| `ids` | path | **optional** | string | "A string of comma delimited IDs" *(documented optional; it is a path segment, so in practice required)* |
+| `device` | body | optional | Object | "The device properties that will be updated." |
+
+Example request (flat, again not wrapped): `{ "location": "new-location" }`. No documented cap on how many ids may be passed.
+Response: `{ "updated": [ {...device...}, {...device...} ] }` — an array inside the `updated` envelope.
+
+### 7.7 `DELETE /api/v1/:context/:contextId/devices/:id`
+Description: *"Delete a single device."*
+
+Path: `context` (required, `companies`), `contextId` (required, hex id), `id` (required, hex id, "Device ID"). No query params/body.
+Response: `{ "deleted": { ...full device... } }`.
+
+---
+
+## 8. IP Address (IPAM)
+
+> ⚠️ **Path asymmetry is real in the docs:** the two GET endpoints use the **singular** `ipsubnet` segment; POST/PATCH/DELETE use the **plural** `ipsubnets`. See §12 Q1.
+
+### 8.1 `GET /api/v1/companies/:company/ipsubnet/:ipSubnet/ipaddresses`
+Description: *"Retrieve a list of all ip addresses for a subnet."*
+
+| Param | In | Req | Type | Notes |
+|---|---|---|---|---|
+| `company` | path | required | hex id | Company ID |
+| `ipSubnet` | path | required | hex id | ID of the subnet |
+| `limit` | query | optional | integer | Amount of results |
+
+No `parent` filter here (unlike ipgroups/ipsubnets). Response: bare array of ip address objects: `company`, `ipAddress`, `ipSubnet`, `dnsName`, `macAddress`, `nat`, `description`, `note`, `state` (`"used"` / `"reserved"`), `id`, and
+`scanHistory: { firstUp: <date>, lastScan: <date>, lastStatus: "up"|"down", statusChanges: [ { newStatus: "up"|"down", time: <date> } ] }`.
+
+### 8.2 `GET /api/v1/companies/:company/ipsubnet/:ipSubnet/ipaddresses/:id`
+Description: *"Retrieve a single IP address by id."*
+Path: `company` (required, hex id), `ipSubnet` (required, hex id, "ID of the subnet"), `id` (required, hex id, "ID of the IP address"). No query params. Response: bare ip address object.
+
+### 8.3 `POST /api/v1/companies/:company/ipsubnets/:ipSubnet/ipaddresses`
+Description: *"Create a new IP address."*
+
+Path: `company` (required, hex id, "Company ID"), `ipSubnet` (required, hex id, "ID of the subnet the IP address belongs to").
+
+Body:
+
+| Field | Req | Type | Description (verbatim) |
+|---|---|---|---|
+| `_id` | optional | hex id | IP address id |
+| `company` | required | hex id | Company ID |
+| `ipSubnet` | required | hex id | ID of the subnet the IP address belongs to |
+| `ipAddress` | required | string | The IP address |
+| `dnsName` | optional | string | Name of the address found via reverse DNS lookup |
+| `name` | optional | string | Name of the address given by the user |
+| `macAddress` | optional | string | Hardware MAC address |
+| `description` | optional | string | Description for the IP address |
+| `nat` | optional | string | Can be used to record a NAT address e.g. public address |
+| `note` | optional | string | Notes for the IP address |
+| `state` | optional | string | Used or reserved |
+| `scanHistory` | optional | object | Scan status and history for the IP address |
+
+`state` values are described only as "Used or reserved"; examples use the lowercase literals `"used"` and `"reserved"`. Note `company`/`ipSubnet` must be repeated in the body even though both are in the path.
+
+Response: bare created object (`_id`, `company`, `ipSubnet`, `ipAddress`, `name`, `state: "reserved"`, `scanHistory: { statusChanges: [] }`). Note: `state` defaulted to `"reserved"` in the example although not sent — no default is documented.
+
+### 8.4 `PATCH /api/v1/companies/:company/ipsubnets/:ipSubnet/ipaddresses/:id`
+Description: *"Modify an existing IP address."*
+Path: `company`, `ipSubnet`, `id` (all required, hex id).
+Body: same 12 fields as POST, but **every field is optional** (including `company`, `ipSubnet`, `ipAddress`); descriptions identical.
+Example request `{ "ipAddress": "<ip>", "name": "<name>" }`. Response: `{ "updated": { ...full ip address... } }`.
+
+### 8.5 `DELETE /api/v1/companies/:company/ipsubnets/:ipSubnet/ipaddresses/:id`
+Description (verbatim, typo in original): *"Remove am IP address from the database."*
+Path: `company`, `ipSubnet`, `id` (all required, hex id). No body/query.
+Response: `{ "deleted": { ...full ip address... } }`.
+
+---
+
+## 9. IP Group (IPAM)
+
+### 9.1 `GET /api/v1/companies/:company/ipgroups`
+Description: *"List all the stored ip groups."* Header `Content-Type: application/json`.
+
+| Param | In | Req | Type | Notes |
+|---|---|---|---|---|
+| `company` | path | required | hex id | Company ID |
+| `parent` | query | optional | hex id | Find groups with this group as their parent |
+| `limit` | query | optional | integer | Amount of results |
+
+Response: bare array of `{ type: "group", company, parent: <objectId>|null, name, description, id }`.
+
+### 9.2 `GET /api/v1/companies/:company/ipgroups/:id`
+Description: *"Retrieve a single ip group."* Path: `company` (required), `id` (required, hex id, "ID of the ip group to retrieve"). No query params.
+Response: bare object — note it returns **`_id`**, not `id`, unlike the list endpoint.
+
+### 9.3 `POST /api/v1/companies/:company/ipgroups`
+Description: *"Create a new group."* Path: `company` (required, hex id).
+
+| Field | Req | Type | Description (verbatim) |
+|---|---|---|---|
+| `_id` | optional | hex id | ip group id |
+| `company` | required | hex id | Company ID |
+| `name` | required | string | The description of the group *(copy-paste error in docs; this is the group name)* |
+| `description` | optional | string | The description of the group |
+| `type` | optional | string | group or supernet |
+| `parent` | optional | hex id | The id of the parent (containing) group, or null for top level |
+
+Response: bare created object (`_id`, `company`, `name`, `description`, `type`, `parent`). No default documented for `type` (examples always send `"group"`).
+
+### 9.4 `PATCH /api/v1/companies/:company/ipgroups/:id`
+Description: *"Modify an existing group."* Path: `company` (required), `id` (required, hex id, "ID of the group").
+Body: same six fields as POST, **all optional** (`company` becomes optional). Example request includes `id` and `company` in the body: `{ "id": "<objectId>", "company": "<objectId>", "description": "..." }`.
+Response: `{ "updated": { ... } }`.
+
+### 9.5 `DELETE /api/v1/companies/:company/ipgroups/:id`
+Description: *"Remove a group from the database."* Path: `company`, `id` (both required, hex id).
+An **Example Request body is shown for this DELETE**: `{ "id": "<objectId>", "company": "<objectId>" }` — no body fields are formally documented.
+Response: `{ "deleted": { ... } }`. No caveat is documented about deleting a group that still contains subnets/child groups.
+
+---
+
+## 10. IP Subnet (IPAM)
+
+### 10.1 `GET /api/v1/companies/:company/ipsubnets`
+Description: *"List all the stored ip subnets."* Header `Content-Type: application/json`.
+
+| Param | In | Req | Type | Notes |
+|---|---|---|---|---|
+| `company` | path | required | hex id | Company ID |
+| `parent` | query | optional | hex id | Find subnets with this group as their parent |
+| `limit` | query | optional | integer | Amount of results |
+
+Response: bare array. Fields seen: `network`, `netmask`, `cidr` (integer), `description`, `company`, `component`, `collector`, `ipamDiscoveryRule`, `scanProgress`, `lastScan`, `addressCount`, `usedCount`, `excludeFromScheduledScan`, `scanNetworkAndBroadcast`, `parent`, `customProperties: [{customProperty, value}]`, `id`. Minimal subnets omit the scan/collector fields entirely.
+
+### 10.2 `GET /api/v1/companies/:company/ipsubnets/:id`
+Description: *"Retrieve a single ip subnet."* Path: `company` (required), `id` (required, hex id, "ID of the ip subnet to retrieve"). No query params. Response: bare subnet object (with `id`).
+
+### 10.3 `POST /api/v1/companies/:company/ipsubnets`
+Description: *"Create a new subnet."* Path: `company` (required, hex id).
+
+| Field | Req | Type | Description (verbatim) |
+|---|---|---|---|
+| `_id` | optional | hex id | ip subnet id |
+| `company` | required | hex id | Company ID |
+| `network` | required | string | The network IP address e.g. 172.27.16.0 |
+| `netmask` | required | string | The netmask e.g. 255.255.255.0 |
+| `cidr` | required | integer | The CIDR e.g. 24 |
+| `description` | optional | string | The description of the subnet |
+| `vlan` | optional | string | Optional VLAN name |
+| `vrf` | optional | string | Optional VRF |
+| `component` | optional | hex id | If the subnet is related to a network component discovered by SNMP, this id refers to that component |
+| `collector` | optional | hex id | The id for the collector which will scan this subnet |
+| `excludeFromScheduledScan` | optional | boolean | Set to true to tell the collector not to scan this subnet when performing a scheduled scan |
+| `scanNetworkAndBroadcast` | optional | boolean | Set to true to include the network and broadcast addresses when scanning this subnet |
+| `ipamDiscoveryRule` | optional | hex id | The IPAM discovery rule this subnet is assigned to |
+| `lastScan` | optional | Date | Date the last scan ran for the subnet |
+| `scanProgress` | optional | integer | Percent progress for a scan |
+| `addressCount` | optional | integer | Number of usable addresses in the subnet |
+| `usedCount` | optional | integer | Number of usable addresses which are assigned/responding |
+| `parent` | optional | hex id | The id of the parent (containing) group, or null for top level |
+| `customProperties` | optional | array | Custom property values assigned to the subnet |
+
+`customProperties` element shape (from examples): `{ "customProperty": "<objectId>", "value": <any> }`.
+Response: bare created object echoing only the supplied fields plus `_id`.
+
+### 10.4 `PATCH /api/v1/companies/:company/ipsubnets/:id`
+Description: *"Modify an existing subnet."* Path: `company` (required), `id` (required, hex id, "ID of the subnet").
+Body: identical field list to POST — **and the docs still mark `company`, `network`, `netmask` and `cidr` as `required` on the PATCH**, even though the example request sends only `{ "netmask": "...", "cidr": 16 }`. Treat "required" here as a docs artefact; the example is authoritative for partial updates.
+Response: `{ "updated": { ... } }`.
+
+### 10.5 `DELETE /api/v1/companies/:company/ipsubnets/:id`
+Description: *"Remove a subnet from the database."* Path: `company`, `id` (both required, hex id). No body/query documented.
+Response: `{ "deleted": { ... } }`. No documented caveat about contained IP addresses.
+
+---
+
+## 11. Me / Tokens
+
+All four endpoints declare header `Content-Type: application/json`, `Login Required true`.
+
+### 11.1 `GET /api/v1/me`
+Description: *"Get information about your user - can be used to obtain your company."*
+No path/query/body parameters. Response shape:
+```json
+{
+  "id": "<objectId>",
+  "email": "<email>",
+  "company": { "timezone": "<IANA tz>", "name": "<string>", "isActive": true, "id": "<objectId>" },
+  "firstName": "<string>",
+  "lastName": "<string>",
+  "role": "user",
+  "adminGroup": null
+}
+```
+`role` example value `"user"`; no enum documented. `adminGroup` is `null` for a company user (hex id otherwise, by inference).
+
+### 11.2 `GET /api/v1/me/token`
+Description: *"Get a JWT token for your user."*
+
+| Param | In | Req | Type | Description (verbatim) |
+|---|---|---|---|---|
+| `expiresIn` | query | optional | integer | "Time to live of the token in seconds (default 86400 i.e. 1 day)" |
+
+No body. Response:
+```json
+{ "token": "<jwt>", "expiresIn": 86400 }
+```
+`expiresIn` in the response is the effective TTL in seconds. **No maximum value is documented** (see §12 Q3).
+
+### 11.3 `POST /api/v1/me/token`
+Description: *"Login and get a JWT token for your user."*
+
+| Param | In | Req | Type | Description (verbatim) |
+|---|---|---|---|---|
+| `expiresIn` | query | optional | integer | "Time to live of the token in seconds (default 86400 i.e. 1 day)" |
+| `username` | body | required | string | User's email address |
+| `password` | body | required | string | User's password |
+
+Example request: `{ "username": "<email>", "password": "<password>" }`. Response: `{ "token": "<jwt>", "expiresIn": 86400 }`.
+The Authentication page also documents an `application/x-www-form-urlencoded` variant with the same two fields. Note the page still says `Login Required true` although this is the login endpoint.
+
+### 11.4 `POST /api/v1/me/token/revoke`
+Description: *"Revoke all previously issued JWT tokens for your user."*
+No path/query/body parameters documented. Response: `{ "message": "all tokens revoked" }`. Caveat: this revokes **all** tokens for the user, not a single token — there is no single-token revoke and no token-listing endpoint.
+
+---
+
+## 12. Metrics
+
+Four endpoints across three "resources". Three of them (company, company/summarize, device) share an identical 13-parameter query surface; `summarize` adds `sum`; the per-item device endpoint drops the component-selection params; `metrics/summaries` has a completely different, much smaller surface.
+
+### 12.0 The shared metric query parameters (verbatim descriptions)
+
+| Param | Req | Type | Description (verbatim) |
+|---|---|---|---|
+| `dataPoints` | **required** | integer | "The number of data points to return. Should be used in conjunction with aggregate=true to get an appropriate amount of data. Either dataPoints or width must be set, if both are set, width takes priority" |
+| `width` | **required** | integer | "The width of the graph in pixels, used to infer the number of data points to return. Should be used in conjunction with aggregate=true to get an appropriate amount of data. Either dataPoints or width must be set, if both are set, width takes priority" |
+| `aggregate` | optional | boolean | "Enable/disable on-the-fly aggregation of results" |
+| `alignTimeRange` | optional | boolean | "If true, forces time range to snap to natural time boundaries (eg hours/days/months)" |
+| `componentQuery` | optional | object | "A mongo query expression to limit the components for which metrics will be returned" |
+| `filters` | optional | object | "A filter object which can be converted into a mongo query to limit the components for which metrics will be returned" |
+| `fromMs` | optional | integer | "Used in conjunction with toMs to control the time range for which data is returned, expressed in epoch milliseconds. Defaults to one hour ago if not specified" |
+| `interval` | optional | string | "Can be used to override the time interval of the metric rollups queried. If not set, this will be chosen automatically to provide the appropriate amount of data considering the time range and number of data points requested. Valid options: minute / fiveMin / hour / day" |
+| `isMonitored` | optional | boolean | "If true, will limit the components for which metrics are returned to ones which are monitored, i.e. to filter out empty results" |
+| `itemType` | optional | string | "Can be used to limit the type of component for which metrics are returned" |
+| `lastMetric` | optional | boolean | "If set, limits the results to only include the most recent metric matching the rest of the criteria (including the time params), useful for getting status of an item" |
+| `limit` | optional | integer | "Maximum number of results to return" |
+| `minIntervals` | optional | integer | "Overrides how many intervals must fall into the time range in order for a particular metric rollup collection to be used. Defaults to 40" |
+| `properties` | optional — **MEASURED 2026-07-30: REQUIRED on §12.1, §12.2 and both §12.3 endpoints. Omitting it returns `400 "Must supply required component metrics as properties parameter"`. Optional on §12.4 only, where it acts as a FILTER. An unrecognised value is accepted with HTTP 200 and empty stats. See §12.5 M1–M2.** | string | "A comma separated list of metric properties to be included in the results" |
+| `toMs` | optional | integer | "Used in conjunction with fromMs to control the time range for which data is returned, expressed in epoch milliseconds. Defaults to the current time if not specified" |
+| `sum` | optional | string | *(summarize only)* "Which property to use when summing the data for each component - min, max, or avg" |
+
+Key facts:
+- **Time window = `fromMs` / `toMs`** (epoch **milliseconds**, integers). There is no `start`/`end`/`from`/`to`/`since`/`duration` query parameter. Defaults: `fromMs` = one hour ago, `toMs` = now.
+- **Bucket/interval size** is *not* set directly in seconds. It is derived from the requested resolution (`dataPoints` **or** `width`, with `width` winning) combined with the time range; `interval` overrides the rollup granularity with one of exactly **`minute` / `fiveMin` / `hour` / `day`**; `minIntervals` (default **40**) governs whether a given rollup collection is eligible; `alignTimeRange` snaps the range to natural boundaries; `aggregate` toggles on-the-fly aggregation.
+- **Item selection**: `itemType` (component type string, e.g. `snmp_f5_f5pools`), `isMonitored`, `componentQuery` (raw Mongo query), `filters` (filter object convertible to a Mongo query), and `properties` (comma-separated metric property paths, e.g. `aggr-space-attributes.size-used` or `status,Integer.statusEnabledState`).
+- **Top-N / limit behaviour**: the only knob is `limit` — "Maximum number of results to return". **There is no `top`, `topN`, `sort`, `order`, `orderBy` or `direction` parameter on any metric endpoint**, and `metrics/summaries` (the endpoint whose own description advertises "top X lists of devices") documents **no `limit` at all** — see §12.4.
+- `properties` on `summarize` is documented as a list, but the example passes a single property; nothing documents behaviour with multiple properties + `sum`.
+
+> **MEASURED 2026-07-30 (M1) — `properties` is not optional.** The single most consequential divergence in this document. A metric call without `properties` is rejected on four of the five metric endpoints:
+>
+> | Spec | Endpoint | Documented | Measured 2026-07-30 |
+> |---|---|---|---|
+> | §12.1 | `GET /metrics/companies/:c/modules/:m` | optional | **required** — 400 without it |
+> | §12.2 | `GET /metrics/companies/:c/modules/:m/summarize` | optional | **required** — 400 without it |
+> | §12.3 | `GET /metrics/devices/:id/modules/:m` | optional | **required** — 400 without it |
+> | §12.3 | `GET /metrics/devices/:id/modules/:m/:item` | optional | **required** — 400 without it |
+> | §12.4 | `GET /:context/:id/metrics/summaries/:m` | optional | optional — but a **filter**, not a projection (§12.5 M1) |
+>
+> The rejection body is `{"error":"Must supply required component metrics as properties parameter"}`. Note the ordering trap: `itemType` is validated **before** `properties`, so a bad `itemType` returns `400 Unknown component <value>` and hides the properties error entirely (§12.5 M3).
+
+> **MEASURED 2026-07-30 (M2) — a wrong `properties` value fails silently.** Syntax is `<TypeGroup>.<metric>`, comma-separated, no spaces (`Calculated.cpu`, `Calculated.cpu,Calculated.mem`). The 400 gate above tests **presence only, never validity**: `properties=cpu` (no group) returned 200 with 658 items whose `stats` were all `{}`, and `properties=bogusXYZ` returned exactly the same. A caller who mistypes a property name gets a successful, complete-looking, empty answer. See §12.5 M2 for the group-level detail.
+
+### 12.1 `GET /api/v1/metrics/companies/:companyId/modules/:moduleType`
+Description (verbatim): *"Gets metrics for one or more items (components), returning stats for each item separately"*
+
+Path: `companyId` (required, hex id, "Company ID"), `moduleType` (required, string, "Name of the module" — e.g. `snmp`, `netapp`).
+Query: the full shared set in §12.0 **without** `sum`.
+
+Example request (as documented — note it is shown as a JSON blob although these are query params):
+```json
+{ "companyId": "<objectId>", "moduleType": "snmp", "fromMs": 1680184403601, "isMonitored": true,
+  "itemType": "snmp_f5_f5pools", "lastMetric": true,
+  "properties": "status,Integer.statusEnabledState,Integer.statusAvailState,OctetString.statusDetailReason,OctetString.statusName",
+  "width": 1 }
+```
+Response envelope:
+```json
+{
+  "data": [
+    { "_id": "<objectId>", "item": "<objectId>", "type": "snmp_f5_f5pools", "timeMs": 1680185276731,
+      "stats": { "OctetString": { "statusName": "...", "statusDetailReason": "..." },
+                 "Integer": { "statusAvailState": 1, "statusEnabledState": 1 },
+                 "status": { "statusAvailState": { "status": "ok", "text": "green" } } } }
+  ],
+  "preQueryMs": 18, "queryMs": 13,
+  "timeInterval": 3688696, "timeIncrement": 60000,
+  "fromMs": 1680184403601, "toMs": 1680185325775,
+  "from": "2023-03-30T13:53:23.601Z", "to": "2023-03-30T14:08:45.775Z",
+  "type": "standard"
+}
+```
+`stats` is a two-level map: SNMP/other type bucket → property → value; `status` sub-objects carry `{status, text}`. `type` on the envelope indicates the aggregation mode actually used (`standard` here; `minMaxAvg` and `summed` seen elsewhere). The echoed `fromMs`/`toMs` show the effective, possibly adjusted, window.
+
+> **MEASURED 2026-07-30 — CONFIRMS the envelope (M8), but `properties` is REQUIRED here (M1).** Observed: `{"data":[{item, timeMs, stats, type}], "preQueryMs", "queryMs", "timeInterval"}`, answering in 1–2 s. A call without `properties` returns 400. A row's `type` is the **singular** component id the metrics API accepts as `itemType` — unlike the ids §6.4 returns (M3).
+
+> **MEASURED 2026-07-30 (M12) — this endpoint returns 500 on ordinary queries, intermittently.** Across both contract runs it answered `500 {"error":"Sorry, an error occurred. Please try again.","code":500,"level":"error"}` to queries that carried a **valid** `properties` value: with `lastMetric`, with `isMonitored`, with `minIntervals`, with `limit`, and with `interval=minute` and `interval=fiveMin`. The same endpoint **served** `interval=hour`, `interval=day`, `aggregate` and `alignTimeRange`, and an earlier manual probe with a minimal query returned 200. So it is **query-dependent and intermittent, not uniformly broken** — and no cause has been established: what was measured is a correlation between certain parameters and the 500, on one tenant, on one day. Nothing in the vendor documentation mentions a failure mode, a cost or a reliability caveat on this endpoint. See §12.5 M12 for the full record and for the device-scoped alternative, and §14 defect 25.
+
+### 12.2 `GET /api/v1/metrics/companies/:companyId/modules/:moduleType/summarize`
+Description (verbatim): *"Gets metrics for one or more components, aggregating across all components by summarizing them into time buckets. With the sum query param the metric will be summed across all the components in each bucket, without it, the metrics will be averaged."*
+
+Path: `companyId` (required, hex id), `moduleType` (required, string).
+Query: the full shared set in §12.0 **including `sum`** (`optional, type: string` — "Which property to use when summing the data for each component - min, max, or avg").
+
+Semantics worth pinning down for a client: presence of `sum` switches the cross-component reduction from *average* to *sum*, and its **value** selects which per-component rollup property (`min`, `max`, `avg`) feeds that sum.
+
+Example request:
+```json
+{ "alignTimeRange": true, "fromMs": 1675684433000, "toMs": 1675717905000,
+  "itemType": "netapp_ontap_dataaggregate", "minIntervals": 4,
+  "properties": "aggr-space-attributes.size-used", "sum": "max", "width": 357 }
+```
+Response:
+```json
+{
+  "data": [
+    { "_id": 5, "type": "netapp_ontap_dataaggregate", "timeMs": 1675699200000,
+      "count": 236, "countAggDocs": 4,
+      "stats": { "aggr-space-attributes": { "size-used": { "sum": 98573026832384 } } } }
+  ],
+  "preQueryMs": 23, "queryMs": 3, "timeInterval": 3600000, "timeIncrement": 3600000,
+  "fromMs": 1675681200000, "toMs": 1675717200000,
+  "from": "2023-02-06T11:00:00.000Z", "to": "2023-02-06T21:00:00.000Z",
+  "type": "summed", "components": 7
+}
+```
+Note: here `data[]._id` is an **integer bucket index**, not an ObjectId; there is no `item` field (aggregated across components); `count`/`countAggDocs` describe the bucket; the envelope adds `components` (number of components aggregated) and `type: "summed"`. With `alignTimeRange: true` the returned `fromMs`/`toMs` are snapped and differ from the requested values. Buckets with no data are omitted (`_id` 5, 6, 8 in the example — 7 missing).
+
+> **MEASURED 2026-07-30 (M5) — this endpoint did not return.** Every attempt **exceeded 90 seconds** and none produced a 200, with or without `itemType` narrowing, and with a valid `properties` (M1) supplied. §12.1 and §12.3 answered in 1–2 seconds over the same window and module. **Everything in this section is therefore UNVERIFIED against live behaviour**: the response envelope above, the `sum` semantics, `type: "summed"`, `components`, the bucket `_id`, and the claim that omitting `sum` averages. The contract suite budgets this endpoint and reports it as slow/UNVERIFIED rather than hanging; it does not assert the shape. Treat any client built on §12.2 as unexercised, and do not infer from §12.1 — the two return different row shapes. Whether this is a tenant-scale problem or an endpoint-wide one is not known from one tenant.
+
+> **MEASURED 2026-07-30 (M12) — read M5 together with the sibling endpoint's 500s.** §12.1, which shares this endpoint's company-scoped route prefix, was separately measured returning 500 on ordinary queries (M12). Neither company-scoped metric endpoint answered dependably in any run, while the device-scoped endpoints of §12.3 answered in 1–2 s throughout — and the vendor's own dashboard never calls `/api/v1/metrics/companies/` at all (§12.5 M12). A client should treat this section as the less usable half of an unreliable pair, not as a slow endpoint on an otherwise sound route.
+
+### 12.3 Metric Device
+#### `GET /api/v1/metrics/devices/:id/modules/:moduleType`
+Description: *"Get metrics for many components for a particular device"*
+Path: `id` (required, hex id, "Device ID"), `moduleType` (required, string, "Name of the module").
+Query: the full shared set in §12.0 **without** `sum` (includes `componentQuery`, `filters`, `itemType`).
+Example: `{ "id": "<objectId>", "moduleType": "snmp", "fromMs": 1680531164306, "isMonitored": true, "itemType": "snmp_cisco_envmonfan", "lastMetric": true, "properties": "status", "width": 1 }`
+Response: same envelope as §12.1 (`type: "standard"`, each `data[]` has `_id`, `item`, `type`, `timeMs`, `stats`).
+
+#### `GET /api/v1/metrics/devices/:id/modules/:moduleType/:item`
+Description: *"Get metrics for a single item (the device itself, or a component) for a particular device"*
+Path: `id` (required, hex id, "Device ID"), `moduleType` (required, string), `item` (required, hex id, **"Item ID (device ID or component ID)"** — pass the device's own id for device-level metrics).
+
+Query parameters — **reduced set**; `componentQuery`, `filters` and `itemType` are *not* documented here (they are meaningless for a single item). Documented: `dataPoints` (required), `width` (required), `aggregate`, `alignTimeRange`, `fromMs`, `interval`, `isMonitored`, `lastMetric`, `limit`, `minIntervals`, `properties`, `toMs` — descriptions identical to §12.0.
+
+Example: `{ "id": "<objectId>", "moduleType": "netapp", "item": "<objectId>", "fromMs": 1675684433000, "toMs": 1675717905000, "properties": "aggr-space-attributes.size-used", "width": 357 }`
+Response (`type: "minMaxAvg"`):
+```json
+{
+  "data": [
+    { "_id": 39, "type": "netapp_ontap_dataaggregate", "timeMs": 1675699200000,
+      "count": 5, "countAggDocs": 1,
+      "parentId": "<objectId>", "parentName": "<device name>", "item": "<objectId>",
+      "stats": { "aggr-space-attributes": { "size-used": { "avg": 4.7e13, "min": 4.7e13, "max": 4.7e13 } } } }
+  ],
+  "preQueryMs": 10, "queryMs": 7,
+  "timeInterval": 375036.41456582636, "timeIncrement": 300000,
+  "fromMs": 1675684433000, "toMs": 1675717905000,
+  "from": "2023-02-06T11:53:53.000Z", "to": "2023-02-06T21:11:45.000Z",
+  "type": "minMaxAvg"
+}
+```
+Here each bucket carries `min`/`max`/`avg` per property plus `parentId`/`parentName` (owning device). `timeInterval` can be fractional.
+
+> **MEASURED 2026-07-30 — `properties` is REQUIRED on BOTH §12.3 endpoints (M1)**, the many-component read and the single-item read alike; without it, `400 "Must supply required component metrics as properties parameter"`. Envelope confirmed as §12.1's (M8), 1–2 s. Note that the single-item endpoint does not document `itemType`, so the M3 masking trap does not apply there.
+
+### 12.4 `GET /api/v1/:context/:contextId/metrics/summaries/:moduleType`
+Description (verbatim): *"Get a summary of a set of metrics across all the relevant devices or components which report those metrics. Useful for e.g. top X lists of devices"*
+
+| Param | In | Req | Type | Description (verbatim) |
+|---|---|---|---|---|
+| `context` | path | required | string | "Context - admingroups or companies" |
+| `contextId` | path | required | hex id | "Group ID or Company ID" |
+| `moduleType` | path | required | string | Name of the module |
+| `itemType` | query | optional | string | "Can be used to limit the type of component for which summary metrics are returned" |
+| `properties` | query | optional | string | "A comma separated list of metric properties to be included in the results" |
+| `fromMs` | query | optional | integer | "Used in conjunction with toMs to control the time range for which data is returned, expressed in epoch milliseconds. Defaults to one hour ago if not specified" |
+| `toMs` | query | optional | integer | "Used in conjunction with fromMs to control the time range for which data is returned, expressed in epoch milliseconds. Defaults to the current time if not specified" |
+
+**Only four query parameters.** Explicitly **not supported/documented here:** `dataPoints`, `width`, `aggregate`, `alignTimeRange`, `interval`, `minIntervals`, `componentQuery`, `filters`, `isMonitored`, `lastMetric`, **`limit`**, `sum`. Despite the "top X lists" wording there is no top-N, sort or limit parameter — a client must retrieve the whole set and rank locally.
+
+Example request: `{ "context": "companies", "contextId": "<objectId>", "moduleType": "snmp", "fromMs": 1677943497713, "itemType": "device", "toMs": 1680535498338 }` — note `itemType: "device"` selects device-level rather than component-level summaries.
+
+Response — **`data` is an object, not an array** (keyed by item class):
+```json
+{
+  "data": { "devices": [
+      { "parents": [], "_id": "<objectId>", "name": "<device name>",
+        "stats": { "Calculated": { "mem": { "avg": 60.3, "max": 62.85 },
+                                   "cpu": { "avg": 10.33, "max": 37 } },
+                   "TimeTicks": { "sysUpTime": { "avg": 2.96e9, "max": 3.04e9 } } } }
+  ] },
+  "count": 7, "preQueryMs": 8, "queryMs": 10, "combineMs": 0,
+  "timeInterval": 86400000,
+  "fromMs": 1677943497713, "toMs": 1680535498338,
+  "from": "2023-03-04T15:24:57.713Z", "to": "2023-04-03T15:24:58.338Z"
+}
+```
+Only `avg` and `max` are returned per property in the documented example (no `min`, no `sum`). `count` is the total number of items summarised (7) even though 3 are shown. Envelope adds `combineMs`. The `data` key seen is `devices`; other keys presumably appear for component item types but none are documented.
+
+> **MEASURED 2026-07-30 — the four query parameters behaved as follows.**
+>
+> - **`properties` is optional here (M1), but it FILTERS rather than projects.** Supplying `Calculated.cpu` returned `count: 0` — items without that property were dropped from the result entirely, not returned with a narrowed `stats`. This is the opposite of the §12.1 behaviour a reader would infer from the shared wording, and it means a client using `properties` here to "ask for less" gets fewer *items*, not smaller items.
+> - **The `data` key is module-dependent.** `snmp` → `devices` (as documented); `http` → `http_endpoints`. So the key is not a fixed vocabulary and a client must read whatever keys arrive rather than looking up `devices`.
+> - **This is the only endpoint that enumerates metric property names at all (M6)** — and only **device-scoped** ones. A component-level property name is discoverable from nothing in this API.
+> - **Module coverage is partial (M7).** `snmp` 200, `http` 200, `ping` and `syslog` returned **HTML error pages** (not JSON, not a documented status), `deviceConfigs` returned **500**. Nothing documents which modules this endpoint supports, and an HTML body is outside §3 entirely.
+> - Property names are **tenant-specific**: `Calculated.cpu` and `TimeTicks.sysUpTime` existed on this tenant under `snmp`. Do not treat them as an API vocabulary.
+
+> **MEASURED 2026-07-30 (run 02) (M10) — `data` is not uniformly a map of item-class arrays.** A `data` object came back carrying a **non-array `company` entry** alongside the array-valued item classes. The documented example shows only `{"devices": [...]}`, and a client that iterates `data`'s values expecting arrays — which is exactly what a "collect every item's stats" loop does — will hit a value that is not one. Read the item classes as "the array-valued entries of `data`" and ignore, rather than trip over, anything else; `count` describes the items, not the number of `data` keys.
+
+> **MEASURED 2026-07-30 (run 02) (M11) — probe this endpoint with modules the tenant's DEVICES report.** The second run took its candidate modules from `componenttypes` and probed `cisco`, `clearpass`, `cohesity` and `common`; none returned a property name (`common` returned 500) and 40 assumptions elsewhere in §12 went UNVERIFIED for want of a `properties` value. `componenttypes` is a platform-wide catalogue of component *types*, ordered by whichever module ships the most models (snmp 150, cisco 44, netapp 11, …); it does not describe what a tenant polls. The modules this tenant's device records named (§7.1 `modules` map) were `ping` 27, `snmp` 24, `deviceConfigs` 20, `http` 1, `syslog` 1 across 27 devices — and `snmp` is the module that enumerated eleven property names (`Calculated.cpu`, `Calculated.mem`, `TimeTicks.sysUpTime`, …). Because coverage is partial (M7), **try several** candidates: the most-polled module here is `ping`, which this endpoint does not serve. See §12.5 M11.
+
+### 12.5 Measured metric behaviour — live tenant, 2026-07-30
+
+Nothing in this subsection came from the vendor's documentation. It is what a read-only contract run observed on one tenant on 2026-07-30; the sections above are unchanged apart from their `MEASURED` markers. Where a finding contradicts the vendor, §14 carries the corresponding defect (17–25). The 2026-07-30 record also includes findings from a second run of the same date, a manual probe, and one observation of the vendor's own web application — each marked for what it is (§0.1).
+
+#### M1 — `properties` is required on four of the five metric endpoints
+
+Omitting it yields `400 {"error":"Must supply required component metrics as properties parameter"}` on §12.1, §12.2 and both §12.3 endpoints. See the table in §12.0. On §12.4 it is genuinely optional, and there it behaves as a **filter**: supplying `Calculated.cpu` returned `count: 0` rather than a narrowed projection of the same items.
+
+Consequences for a client:
+
+- A metric tool that treats `properties` as optional cannot make a single successful call to §12.1–§12.3. It must either require the caller to supply one or discover one first.
+- Discovery has exactly one path (M6): §12.4, device-scoped only.
+- **Do not hardcode a property name.** Names are tenant-specific.
+
+#### M2 — an invalid `properties` value is accepted, with empty stats
+
+The 400 gate in M1 checks **presence**, never validity. Measured:
+
+| Sent | Result |
+|---|---|
+| `properties=cpu` (bare metric, no group) | **200**, 658 items, every `stats` is `{}` |
+| `properties=bogusXYZ` (meaningless) | **200**, identical to the above |
+| `properties=Rate.ifInOctets` (real group, unknown metric) | **200**, `stats` echoes the group empty: `{"Rate":{}}` |
+| unrecognised group | **200**, no `stats` key at all on the row |
+
+Type groups confirmed present on this tenant: `Calculated`, `Rate`, `TimeTicks`. Confirmed **absent**: `Counter`, `Gauge` — so a client must not offer those as choices on the strength of them being plausible SNMP type names.
+
+This is the most dangerous behaviour in §12: a typo produces a successful, fully-formed, empty answer. A client that reports "no data in this window" on an empty `stats` will be wrong, and an agent consuming that answer has no signal that anything went wrong. The contract suite locks this shape explicitly so that a change — in either direction — is noticed.
+
+#### M3 — `componenttypes` ids are not `itemType` values, and `itemType` is validated first
+
+213 of 246 ids from §6.4 were rejected as `itemType` with `400 Unknown component <value>`. §6.4 returns the **plural alias**; the metrics API wants the **singular component id**.
+
+- `snmp_common_cpus` → `400 Unknown component`
+- `snmp_common_cpu` → 200
+- bare `device` → valid
+- A §12.1 response row's own `type` field reports the **correct singular id**, so a row is a reliable source of a usable `itemType`.
+
+The id the metrics API accepts is constructible from §6.5: the module/group path in `filePath` joined to `data.itemType` (singular) with `_`. `data.componentAlias` is the plural §6.4 returns.
+
+> **That construction rule is UNVALIDATED, and run 02 gave a reason to doubt it.** It was inferred from **one** example (`/components/snmp/common/Cpu.yml` + `itemType: cpu` → `snmp_common_cpu`, accepted); no run has yet confirmed a constructed id against the metric endpoints, and the contract suite reports that case UNVERIFIED when the two catalogues cannot be lined up. M9 now shows that the sibling composition rule — §6.4's `<module>_<group>_<type>` — is **wrong**, because ids can carry a fourth segment. A rule of the same shape, inferred the same way, from the same underscore-joined vocabulary, should not be trusted further than its single example: **do not treat `filePath` + `data.itemType` as a general algorithm.** The reliable source of a usable `itemType` remains a §12.1 response row's own `type` field, which is measured, not constructed.
+
+**Ordering trap:** `itemType` is validated **before** `properties`. A call with both a bad `itemType` and no `properties` returns `400 Unknown component <value>` and the properties error never surfaces — so a client debugging M1 against a wrong `itemType` will chase the wrong parameter.
+
+#### M4 — 41 of 246 `componenttypes` entries carry no `type`
+
+Recorded at §6.4, where the four-field shape is documented.
+
+#### M5 — §12.2 `/summarize` never returned
+
+Recorded at §12.2. Its entire documented surface — envelope, `sum`, `components`, `type: "summed"` — is **UNVERIFIED**, not confirmed and not refuted.
+
+#### M6 — metric property names are enumerable from §12.4 alone, and only for devices
+
+§6.5 `deviceDefinitions/components` is the **inventory schema** and carries no metric property names (zero hits for `Calculated` or `sysUpTime` in 386 KB; `data.schema` holds config fields such as `ifDescr`, `ifIndex`, `ifAlias`). §12.4 returns real property names in its `stats`, but only for **device-scoped** metrics, and its `data` key varies by module (`devices` for `snmp`, `http_endpoints` for `http`).
+
+Therefore: a **component-level** property name — e.g. `Calculated.ifInOctets` on an interface — is discoverable from **no documented endpoint**. Combined with M1 (required) and M2 (silently accepted when wrong), this is the hardest edge in the whole API: the parameter is mandatory, its legal values are not enumerable, and a wrong value looks like success. §14 defect 14 must be read with this correction.
+
+#### M7 — §12.4 module coverage is partial
+
+`snmp` 200, `http` 200, `ping` HTML error page, `syslog` HTML error page, `deviceConfigs` 500. An HTML body is not a documented response for any endpoint (§3, §1: "The API uses JSON as its data format"), so a client must be prepared for a non-JSON body on this route.
+
+**The non-JSON body is a defect in its own right, not a variety of "the module is unsupported"** (§14 defect 23). §1 states without qualification that "The API uses JSON as its data format", and §3's table is the only documented status set; an HTML error page satisfies neither. It also cannot be classified by status: the client fails while *parsing*, so there is no API answer at all. In this repository's client that surfaces as `invalid_response` with no status, and the contract suite's coverage line renders it as `no API answer — transport failure (invalid_response)` — that line, wherever it appears in a run's evidence for §12.4, is this defect. **Run 02 did not reproduce it**, because it probed four modules (`cisco`, `clearpass`, `cohesity`, `common`) that do not include the two that produced HTML in run 01; `common` returned 500. The finding therefore stands on run 01 alone and is neither re-confirmed nor withdrawn.
+
+**Run 02 additionally measured (M11) that the module list this endpoint should be probed with does not come from `componenttypes`.** See M11 below and §12.4.
+
+#### M8 — response envelopes, confirmed
+
+- **§12.1 and §12.3:** `{"data":[{item, timeMs, stats, type}], "preQueryMs", "queryMs", "timeInterval"}` — consistent with the documented examples. Both answered in 1–2 s.
+- **§12.4:** `{"count", "combineMs", "data":{…}, "preQueryMs", "queryMs", "timeInterval"}` — consistent with the documented example, including `data` being an object rather than an array.
+
+Key sets are what was observed, not a closed schema: §4.2's warning that these are examples rather than schemas still applies.
+
+#### M9 — `componenttypes` ids do not compose as `<module>_<group>_<type>` (run 02)
+
+Recorded at §6.4, where the composition is documented. In short: `snmp_common_ups_upsbatteries` has all four fields, `type` = `ups`, and four segments; §6.4's rule composes `snmp_common_ups`. Six of 246 ids have four segments and 41 have two with no `type`. The relationship that survives is a **prefix**: an id begins `<module>_<group>_`, and where `type` is present it appears among the segments that follow. The contract suite asserts that relationship and no longer asserts the concatenation.
+
+This costs no product code — a `componenttypes` id is passed through verbatim as `:component` and never built — but it is the reason the §12.5 M3 `itemType` construction rule is now explicitly flagged unvalidated above.
+
+#### M10 — §12.4 `data` can carry a non-array entry (run 02)
+
+Alongside the array-valued item classes (`devices`, `http_endpoints`, …), a `data` object came back carrying a **`company` entry that is not an array**. Nothing in §12.4 anticipates this: the documented example shows a single array-valued key and the prose says the object is "keyed by item class". Consequence for a client: iterate the array-valued entries of `data` and skip the rest, rather than assuming every value is a list of items. The suite's property harvest already does this and so was unaffected.
+
+#### M11 — metric modules come from the tenant's devices, not from `componenttypes` (run 02)
+
+This is a finding about **how to query this API**, and it was learned the expensive way: run 02 discovered its candidate modules from `componenttypes`, probed §12.4 for `cisco`, `clearpass`, `cohesity` and `common`, harvested no property names at all (`common` returned 500), and consequently reported **40 assumptions UNVERIFIED** — every case that needs the mandatory `properties` value M1 established.
+
+The two catalogues answer different questions:
+
+| Source | What it enumerates | Suitable for choosing a `moduleType`? |
+|---|---|---|
+| §6.4 `componenttypes` | Component *types* the platform can model, tenant-wide, ordered by however many models each module ships (snmp 150, cisco 44, netapp 11, … on this tenant) | **No.** Its head is whichever module has the most component definitions, which is unrelated to what is polled. |
+| §7.1 device records' `modules` map | The polling modules **this tenant's devices actually report** — `ping` 27, `snmp` 24, `deviceConfigs` 20, `http` 1, `syslog` 1 across 27 devices | **Yes.** A metric read is scoped to a device's module: §12.3 puts one in the path, §12.1/§12.4 ask the same module across the company. |
+
+`snmp` — the module an earlier manual probe used to enumerate eleven property names (`Calculated.cpu`, `Calculated.mem`, `TimeTicks.sysUpTime`, …) — is second in the device census and absent from any short prefix of the catalogue's.
+
+Two further points a client must carry:
+
+- **Try several modules, not the top one.** Coverage is partial (M7): the most-polled module on this tenant is `ping`, which §12.4 does not serve. Run 01's outcomes were `snmp`/`http` served, `ping`/`syslog` HTML, `deviceConfigs` 500.
+- **§7.1 says the `modules` map key need not equal the `module` field** (`modules.deviceConfigs` → `module: "snapshots"`), and nothing documents which of the two names a metric route. Treat both as candidates.
+
+#### M12 — the company-scoped metric endpoint is unreliable in practice (runs 01–02, manual probe, vendor UI)
+
+This finding is about **§12.1 and §12.2 together**, and it is the reason a client should reach for §12.3 first. Four kinds of evidence, gathered on 2026-07-30, listed with what each one does and does not establish.
+
+**1. §12.1 returns 500 on ordinary queries — intermittently.** Across both contract runs, `GET /metrics/companies/:c/modules/snmp` answered:
+
+```json
+{"error":"Sorry, an error occurred. Please try again.","code":500,"level":"error"}
+```
+
+to queries that carried a **valid** `properties` value (M1/M2 satisfied). What was sent when it 500'd, and what was sent when it answered:
+
+| Query parameter | Outcome |
+|---|---|
+| `lastMetric` | **500** |
+| `isMonitored` | **500** |
+| `minIntervals` | **500** |
+| `limit` | **500** |
+| `interval=minute` | **500** |
+| `interval=fiveMin` | **500** |
+| `interval=hour` | served |
+| `interval=day` | served |
+| `aggregate` | served |
+| `alignTimeRange` | served |
+| minimal query (manual probe, earlier the same day) | **200** |
+
+**Read this as a correlation and nothing more.** No mechanism was established, no cause was isolated, and one tenant on one day is not a controlled experiment. Two things it does establish: the endpoint is **not uniformly broken** — a minimal query and four parameters were served — and a 500 here is **not** independent of the request, which is what the generic reading of a 500 assumes.
+
+**2. §12.2 `/summarize` never returned at all.** Recorded as M5, unchanged: over 90 seconds, with and without `itemType` narrowing. The two company-scoped endpoints therefore failed in different ways in the same runs.
+
+**3. §12.3 device-scoped metrics worked, reliably.** `data` came back as a populated array in the documented envelope (M8), in 1–2 seconds, in every run. This is the load-bearing half of the finding: the problem is not "metrics are unavailable on this tenant", because the same metrics were read successfully through a different route.
+
+**4. `OBSERVED 2026-07-30 (vendor UI)` — the vendor's own product does not use this endpoint.** Browsing the Lumics web application with the browser's network panel open, a **company dashboard load issued 57 API calls, including the ones behind its "Top devices by CPU" and "Top devices by memory" widgets, and not one of them was `/api/v1/metrics/companies/`.** Those widgets are exactly the company-wide, cross-device question §12.1 appears to exist for, and the vendor answers them some other way.
+
+This is the strongest single piece of evidence in the finding and also the one most easily over-read, so both edges are worth stating. It does **not** show that the endpoint is deprecated, unsupported, or broken by design — none of that was established, and the API documents §12.1 without qualification. What it does show is that this route is **not on the vendor's own exercised path** for company-wide metrics, which is a plausible reason a defect could persist there while §12.3 stays healthy, and a good reason for a client not to treat a failure as its own mistake.
+
+**Consequences for a client:**
+
+- **Prefer the device-scoped route.** Resolve devices first (§7.1), then read §12.3 per device. It is more requests; it is the path that answered.
+- **Do not withhold §12.1.** It serves some queries, and a caller who needs a cross-component row per item has no other endpoint that returns one.
+- **Do not retry a 500 here unchanged.** The failure correlates with the request, so an identical retry is the least informative thing to spend a request on. (This repository's client has never retried a 500 — 500 is absent from its retryable set — and the error it raises now says so; see §14 defect 25.)
+- **A 500 or a timeout on this route is not an absence of data.** Nothing was measured either way. Reporting "no data for this company" on the strength of one is the same silent-completeness failure M2 produces through the success path.
+
+---
+
+## 13. Answers to the three open questions
+
+### Q1 — ipaddress singular vs plural `ipsubnet(s)`: the asymmetry is real in the documentation
+
+The detail pages confirm the index page. Quoting the detail pages' own path headings:
+
+- `GET /api/v1/companies/:company/ipsubnet/:ipSubnet/ipaddresses` — *"Retrieve a list of all ip addresses for a subnet."* (**singular**)
+- `GET /api/v1/companies/:company/ipsubnet/:ipSubnet/ipaddresses/:id` — *"Retrieve a single IP address by id."* (**singular**)
+- `POST /api/v1/companies/:company/ipsubnets/:ipSubnet/ipaddresses` — *"Create a new IP address."* (**plural**)
+- `PATCH /api/v1/companies/:company/ipsubnets/:ipSubnet/ipaddresses/:id` — *"Modify an existing IP address."* (**plural**)
+- `DELETE /api/v1/companies/:company/ipsubnets/:ipSubnet/ipaddresses/:id` — *"Remove am IP address from the database."* (**plural**)
+
+Additional corroboration: the generated documentation anchors/slugs themselves encode the segment, and they match — `_api_v1_companies_company_ipsubnet_ipSubnet_ipaddresses_get_1020`, `..._ipsubnet_ipSubnet_ipaddresses_id_get_1040` vs `..._ipsubnets_ipSubnet_ipaddresses_post_1060`, `..._ipsubnets_..._patch_1080`, `..._ipsubnets_..._delete_1100`. Since these slugs are derived from the route strings the docs are generated from, the split is present **in the route definitions**, not just in prose.
+
+**Verdict:** real and consistent in the docs, but nothing in the docs calls it intentional — no note, no rationale, and the same pages contain other obvious typos ("Remove am IP address", `name` described as "The description of the group"). Read it as an upstream route inconsistency that has been faithfully documented. **Recommendation for the MCP server:** send `ipsubnet` (singular) for the two GETs and `ipsubnets` (plural) for POST/PATCH/DELETE exactly as documented; optionally retry with the other spelling on a 404, and flag it to the vendor.
+
+> **MEASURED 2026-07-30 — CONFIRMS.** The asymmetry is real in the deployed API, not only in the docs: a **GET against the plural spelling returned 404**. The singular read path is load-bearing. The "optionally retry with the other spelling on a 404" suggestion above would therefore accomplish nothing for reads — a 404 on the plural GET is the routing itself, not a missing record.
+
+### Q2 — legal values of `:context`, and whether `system` takes a `contextId`
+
+There is no single global answer; the accepted set is documented per endpoint:
+
+- Collectors (all 5), component list/read, componenttypes: *"context — required, type: string — Accepted values: admingroups | companies"*
+- `GET /devices` and `GET /devices/:id`: *"Accepted values: admingroups | companies | system"*
+- `POST /devices`, `PUT .../lastDiscovery`, `PATCH /devices/:id`, `PATCH /devices/:ids/batch`, `DELETE /devices/:id`: *"Accepted values: companies"*
+- `GET /:context/:contextId/metrics/summaries/:moduleType`: *"context — required, type: string — Context - admingroups or companies"* with *"contextId — required, type: hex id — Group ID or Company ID"*
+
+So: **`companies` is universal; `admingroups` is accepted for all reads and for collector writes but not for device writes; `system` is documented only on the two device read endpoints.**
+
+Does `system` take a contextId? **The docs say yes, implicitly and without exception.** On both endpoints that accept `system`, the very next parameter is *"contextId — required, type: hex id — Context ID"*; no page documents a `system` form of the path without a contextId, and no page gives a sentinel value to use. The only genuinely system-scoped endpoint in the whole API takes a *different, literal* path with no contextId at all: `GET /api/v1/system/deviceDefinitions/components` ("Get device definitions for components", zero documented parameters). Treat `GET /system/<contextId>/devices` as documented-but-unspecified: the docs never say what hex id to supply for `system`, so a client should not rely on it, and `/api/v1/system/deviceDefinitions/components` is the one contextId-free system route.
+
+### Q3 — the `me` token endpoints
+
+**`GET /api/v1/me/token`** — *"Get a JWT token for your user."* Header `Content-Type: application/json`. One query parameter:
+> `expiresIn` — *optional, type: integer* — *"Time to live of the token in seconds (default 86400 i.e. 1 day)"*
+
+Response: `{ "token": "<jwt>", "expiresIn": 86400 }`.
+
+**`POST /api/v1/me/token`** — *"Login and get a JWT token for your user."* Same `expiresIn` query parameter with the identical description. Body: `username` (*required, type: string* — "User's email address"), `password` (*required, type: string* — "User's password"). Example request `{"username": "<email>", "password": "<password>"}`; the Authentication page shows the same call as `application/x-www-form-urlencoded`. Response: `{ "token": "<jwt>", "expiresIn": 86400 }`.
+
+- **Units:** seconds (integer). Confirmed twice — the parameter description and the Authentication page: *"You can request a longer expiry time using the expiresIn query parameter on the api request, where expiresIn is in seconds."*
+- **Default:** `86400` (1 day). Also stated on the Authentication page: *"By default the token expires in one day."*
+- **Maximum allowed value:** **not documented anywhere.** Neither token page, nor the Authentication page, nor the Errors page states any cap, clamping behaviour, or error for an oversized `expiresIn`. The only related statement is that a *longer* expiry may be requested. Do not assume a ceiling; treat over-large values as undefined behaviour (likely 400, per the generic error table).
+- **Response shape:** exactly two fields, `token` (JWT string) and `expiresIn` (integer seconds, echoing the effective TTL). No issued-at, no expiry timestamp, no refresh token, no token id.
+- Related: **`POST /api/v1/me/token/revoke`** — *"Revoke all previously issued JWT tokens for your user."* No parameters; response `{ "message": "all tokens revoked" }`. All-or-nothing; there is no per-token revoke and no way to list outstanding tokens.
+
+> These endpoints were documented from the API Reference pages only. Per instruction, no request was issued to `/api/v1/me/token` or any other live API endpoint, so no token was minted or observed.
+
+---
+
+## 14. Documentation defects and caveats to carry into the implementation
+
+Defects 1–16 are **internal defects of the vendor's documentation**: contradictions, typos and omissions visible on the doc pages themselves, found on 2026-07-29 without calling the API. Defects 17–25 are of a different kind — places where the documentation is **contradicted by the live API**, measured on 2026-07-30 (§0, §12.5). Keep the two groups distinct: the first can be fixed by reading the docs more carefully, the second cannot be found that way at all.
+
+### Defects internal to the documentation (2026-07-29)
+
+1. `GET /:context/:contextId/devices/:id` — the parameter list **omits `id`** entirely.
+2. `GET /:context/:contextId/componenttypes/` — lists a `component` path parameter that does not exist in the path template.
+3. `PATCH /companies/:companyId/component/:component/:id` — `id` marked **optional** though it is a path segment; **no body field list at all**, only an example.
+4. `PATCH /:context/:contextId/devices/:ids/batch` — `ids` marked **optional** though it is a path segment.
+5. `PATCH /:context/:contextId/devices/:id` and `.../batch` — body documented as a single field named `device` of type `Object`, but both examples send a **flat** object. Also "Must include the device ID" for the single PATCH (id in both path and body).
+6. `PATCH /companies/:company/ipsubnets/:id` — repeats POST's `required` markers on `company`/`network`/`netmask`/`cidr` while the example performs a genuine partial update.
+7. `GET /:context/:contextId/devices` — `limit` documented under *URL Parameters* rather than *Query Parameters*.
+8. IP group POST/PATCH — `name` described as *"The description of the group"* (copy-paste of `description`).
+9. `DELETE .../ipaddresses/:id` — description typo: *"Remove am IP address from the database."*
+10. `DELETE /companies/:company/ipgroups/:id` — shows an example **request body** for a DELETE, with no body fields documented.
+11. `POST /api/v1/me/token` reports `Login Required true` although it is the login endpoint.
+12. Identifier field name is inconsistent across responses (`id` vs `_id`); some component/device docs leak Mongoose internals (`__t`, `__v`).
+13. No endpoint documents its own status codes, error bodies, rate limits, `ETag`/`If-Modified-Since` behaviour (despite the documented 304), or locking semantics (despite the documented 423).
+14. No enumerations are given for `deviceType`, `role`, `moduleType`, or component `itemType`; component/module type strings must be discovered via `GET /:context/:contextId/componenttypes/` and `GET /api/v1/system/deviceDefinitions/components`. — **MEASURED 2026-07-30: the second half of this is wrong. See defect 22 (M6): `componenttypes` ids are not `itemType` values (defect 19), and neither endpoint enumerates metric *property* names.** — **MEASURED 2026-07-30 (run 02) (M11): nor is either endpoint the place to discover a `moduleType`.** `componenttypes` is a platform-wide catalogue of component types and its module names are not the modules a tenant polls; the only enumeration of those is the `modules` map on the device records themselves (§7.1). Probing the catalogue's modules for metrics returned nothing on this tenant — see §12.5 M11.
+15. `state` on ip addresses is described only as "Used or reserved"; examples use lowercase `"used"` / `"reserved"`.
+16. Metric `Example Request` blocks render path and query parameters together as one JSON object; they are not request bodies (all four metric endpoints are GET).
+
+### Defects the live API contradicted (MEASURED 2026-07-30)
+
+Each of these is a divergence between the vendor's documentation and the deployed API, observed on one tenant on 2026-07-30 by the read-only contract suite. They are numbered continuously with the list above so an issue can cite "spec §14 defect N", but they are **measurements**, not readings of the doc pages. Detail and evidence: §0.3 and §12.5.
+
+17. **(M1) `properties` is documented `optional` and is in fact required** on §12.1, §12.2 and both §12.3 endpoints — `400 {"error":"Must supply required component metrics as properties parameter"}`. This is the highest-impact defect in the document: taken at face value, §12.0 describes four metric endpoints that cannot be called. On §12.4 it is optional but acts as a **filter** (`Calculated.cpu` → `count: 0`), which the shared wording does not hint at.
+18. **(M2) An invalid `properties` value is accepted with HTTP 200 and empty stats.** The required-parameter check tests presence only, never validity; `properties=cpu` and `properties=bogusXYZ` both returned 200 with every `stats` empty. Nothing in the documentation describes any validation of this parameter, and the failure is silent. Syntax is `<TypeGroup>.<metric>`, comma-separated, no spaces.
+19. **(M3) `componenttypes` ids are not valid `itemType` values** — 213 of 246 were rejected with `400 Unknown component <value>`. §6.4 returns a plural alias; the metrics API wants the singular component id, constructible from §6.5 (`filePath` module/group + `data.itemType`). Additionally, `itemType` is validated **before** `properties`, so a bad `itemType` masks defect 17 entirely.
+20. **(M4) `GET /:context/:contextId/componenttypes/` does not always return `type`.** 41 of 246 entries omitted it; it is present iff `id` has ≥3 underscore-separated segments. §6.4 documents an unconditional four-field object.
+21. **(M5) `GET .../modules/:moduleType/summarize` (§12.2) exceeded 90 seconds and never returned a 200**, with or without `itemType` narrowing, while §12.1 and §12.3 answered in 1–2 s. No timeout, cost or scale caveat appears anywhere in the documentation. The whole of §12.2 — envelope, `sum`, `components`, `type: "summed"` — is consequently UNVERIFIED.
+22. **(M6) Defect 14 above is itself wrong about where the missing enumerations live.** `GET /system/deviceDefinitions/components` (§6.5) carries **no metric property names** — it is the inventory schema. §12.4 is the only endpoint that enumerates property names, and only device-scoped ones, with a module-dependent `data` key (`devices` for `snmp`, `http_endpoints` for `http`). A component-level metric property name is documented and discoverable **nowhere**, while defect 17 makes supplying one mandatory.
+23. **(M7) §12.4 does not support every module, and fails non-JSON when it does not.** `snmp` and `http` returned 200; `ping` and `syslog` returned **HTML error pages**; `deviceConfigs` returned 500. No per-module availability is documented, and an HTML body contradicts §1's "The API uses JSON as its data format" as well as §3's status table. The non-JSON body is the more serious half: it cannot be classified by status at all, because the client fails while parsing and there is no API answer to classify. Run 02 probed a different set of modules and did not reach either of the two that produced HTML, so this rests on run 01; it is not withdrawn.
+24. **(M9, run 02) `GET /:context/:contextId/componenttypes/` ids do not compose as documented.** §6.4 states `id` is `<module>_<group>_<type>`; `snmp_common_ups_upsbatteries` carries all four fields with `type` = `ups` and a fourth segment the rule cannot express (6 of 246 ids have four segments). Only the prefix relationship holds. Read together with defect 20 — the same field is both conditional and not composable — this means **`id` must be treated as opaque**: derive `module` and `group` from their own fields, never by splitting the id, and never rebuild an id from parts. The related §12.5 M3 rule for constructing an `itemType` from §6.5 is inferred from one example and remains **unvalidated**; it should not be relied on either.
+
+25. **(M12) The company-scoped metric endpoints are unreliable in practice, and nothing documents it.** §12.1 returned `500 {"error":"Sorry, an error occurred. Please try again.","code":500,"level":"error"}` on ordinary queries carrying a valid `properties` — with `lastMetric`, `isMonitored`, `minIntervals`, `limit`, `interval=minute` and `interval=fiveMin` — while `interval=hour`, `interval=day`, `aggregate`, `alignTimeRange` and a minimal probe were served; §12.2 never returned at all (defect 21); §12.3 answered the same tenant in 1–2 s throughout. The documentation describes no failure mode, cost, scale or reliability caveat on either company-scoped endpoint, and §3 offers only the generic "500 Server Error" — which, uniquely on this route, is misleading, because the arguments **do** correlate with the failure and a working alternative exists. Separately, `OBSERVED 2026-07-30 (vendor UI)`: the vendor's own company dashboard issued 57 API calls on load, including its top-N device widgets, and never called `/api/v1/metrics/companies/`. **Intermittent, not dead; no cause established.** Detail: §12.5 M12.
+
+---
+
+## 15. Endpoint inventory (41 endpoints, doc slug ids)
+
+| # | Method & path | Doc slug |
+|---|---|---|
+| 1 | GET /api/v1/:context/:contextId/collectors | `_api_v1_context_contextId_collectors_get_680` |
+| 2 | GET /api/v1/:context/:contextId/collectors/:id | `..._collectors_id_get_700` |
+| 3 | POST /api/v1/:context/:contextId/collectors | `..._collectors_post_720` |
+| 4 | PATCH /api/v1/:context/:contextId/collectors/:id | `..._collectors_id_patch_740` |
+| 5 | DELETE /api/v1/:context/:contextId/collectors/:id | `..._collectors_id_delete_760` |
+| 6 | GET /api/v1/:context/:contextId/component/:component/ | `..._component_component__get_780` |
+| 7 | GET /api/v1/:context/:contextId/component/:component/:id | `..._component_component_id_get_800` |
+| 8 | PATCH /api/v1/companies/:companyId/component/:component/:id | `_api_v1_companies_companyId_component_component_id_patch_820` |
+| 9 | GET /api/v1/:context/:contextId/componenttypes/ | `..._componenttypes__get_840` |
+| 10 | GET /api/v1/system/deviceDefinitions/components | `_api_v1_system_deviceDefinitions_components_get_860` |
+| 11 | GET /api/v1/:context/:contextId/devices | `..._devices_get_880` |
+| 12 | GET /api/v1/:context/:contextId/devices/:id | `..._devices_id_get_900` |
+| 13 | POST /api/v1/:context/:contextId/devices | `..._devices_post_920` |
+| 14 | PUT /api/v1/:context/:contextId/devices/:id/modules/:module/lastDiscovery | `..._devices_id_modules_module_lastDiscovery_put_940` |
+| 15 | PATCH /api/v1/:context/:contextId/devices/:id | `..._devices_id_patch_960` |
+| 16 | PATCH /api/v1/:context/:contextId/devices/:ids/batch | `..._devices_ids_batch_patch_980` |
+| 17 | DELETE /api/v1/:context/:contextId/devices/:id | `..._devices_id_delete_1000` |
+| 18 | GET /api/v1/companies/:company/ipsubnet/:ipSubnet/ipaddresses | `_api_v1_companies_company_ipsubnet_ipSubnet_ipaddresses_get_1020` |
+| 19 | GET /api/v1/companies/:company/ipsubnet/:ipSubnet/ipaddresses/:id | `..._ipsubnet_ipSubnet_ipaddresses_id_get_1040` |
+| 20 | POST /api/v1/companies/:company/ipsubnets/:ipSubnet/ipaddresses | `..._ipsubnets_ipSubnet_ipaddresses_post_1060` |
+| 21 | PATCH /api/v1/companies/:company/ipsubnets/:ipSubnet/ipaddresses/:id | `..._ipsubnets_ipSubnet_ipaddresses_id_patch_1080` |
+| 22 | DELETE /api/v1/companies/:company/ipsubnets/:ipSubnet/ipaddresses/:id | `..._ipsubnets_ipSubnet_ipaddresses_id_delete_1100` |
+| 23 | GET /api/v1/companies/:company/ipgroups | `..._ipgroups_get_1120` |
+| 24 | GET /api/v1/companies/:company/ipgroups/:id | `..._ipgroups_id_get_1140` |
+| 25 | POST /api/v1/companies/:company/ipgroups | `..._ipgroups_post_1160` |
+| 26 | PATCH /api/v1/companies/:company/ipgroups/:id | `..._ipgroups_id_patch_1180` |
+| 27 | DELETE /api/v1/companies/:company/ipgroups/:id | `..._ipgroups_id_delete_1200` |
+| 28 | GET /api/v1/companies/:company/ipsubnets | `..._ipsubnets_get_1220` |
+| 29 | GET /api/v1/companies/:company/ipsubnets/:id | `..._ipsubnets_id_get_1240` |
+| 30 | POST /api/v1/companies/:company/ipsubnets | `..._ipsubnets_post_1260` |
+| 31 | PATCH /api/v1/companies/:company/ipsubnets/:id | `..._ipsubnets_id_patch_1280` |
+| 32 | DELETE /api/v1/companies/:company/ipsubnets/:id | `..._ipsubnets_id_delete_1300` |
+| 33 | GET /api/v1/me | `_api_v1_me_get_1320` |
+| 34 | GET /api/v1/me/token | `_api_v1_me_token_get_1340` |
+| 35 | POST /api/v1/me/token | `_api_v1_me_token_post_1360` |
+| 36 | POST /api/v1/me/token/revoke | `_api_v1_me_token_revoke_post_1380` |
+| 37 | GET /api/v1/metrics/companies/:companyId/modules/:moduleType | `_api_v1_metrics_companies_companyId_modules_moduleType_get_1400` |
+| 38 | GET /api/v1/metrics/companies/:companyId/modules/:moduleType/summarize | `..._moduleType_summarize_get_1420` |
+| 39 | GET /api/v1/metrics/devices/:id/modules/:moduleType | `_api_v1_metrics_devices_id_modules_moduleType_get_1440` |
+| 40 | GET /api/v1/metrics/devices/:id/modules/:moduleType/:item | `_api_v1_metrics_devices_id_modules_moduleType_item_get_1460` |
+| 41 | GET /api/v1/:context/:contextId/metrics/summaries/:moduleType | `_api_v1_context_contextId_metrics_summaries_moduleType_get_1480` |
+
+Doc pages visited outside the endpoint list: `/documentation/api/overview`, `/authentication`, `/index` (Resources), `/errors`. All loaded successfully.

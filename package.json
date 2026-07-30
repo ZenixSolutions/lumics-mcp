@@ -1,0 +1,81 @@
+{
+  "name": "@zenixsolutions/lumics-mcp",
+  "version": "0.1.0",
+  "description": "Model Context Protocol server for the Lumics network monitoring platform. Community project, not affiliated with or endorsed by Lumics or NetCuras.",
+  "license": "MIT",
+  "author": "Zenix Solutions",
+  "homepage": "https://github.com/ZenixSolutions/lumics-mcp#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/ZenixSolutions/lumics-mcp.git"
+  },
+  "bugs": {
+    "url": "https://github.com/ZenixSolutions/lumics-mcp/issues"
+  },
+  "keywords": [
+    "mcp",
+    "model-context-protocol",
+    "lumics",
+    "netcuras",
+    "network-monitoring",
+    "ipam",
+    "observability",
+    "claude",
+    "ai"
+  ],
+  "type": "module",
+  "main": "./dist/server.js",
+  "types": "./dist/server.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/server.d.ts",
+      "import": "./dist/server.js"
+    }
+  },
+  "bin": {
+    "lumics-mcp": "./dist/index.js"
+  },
+  "files": [
+    "dist",
+    "README.md",
+    "LICENSE",
+    "CHANGELOG.md"
+  ],
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "build": "tsc && chmod +x dist/index.js",
+    "dev": "tsc --watch",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p tests/tsconfig.json",
+    "lint": "eslint .",
+    "lint:fix": "eslint . --fix",
+    "format": "prettier --write .",
+    "format:check": "prettier --check .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:coverage": "vitest run --coverage",
+    "test:contract": "LUMICS_CONTRACT_TESTS=1 vitest run tests/contract",
+    "validate": "npm run typecheck && npm run lint && npm run format:check && npm run build && npm test",
+    "prepublishOnly": "npm run validate"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "express": "5.2.1",
+    "express-rate-limit": "8.6.1",
+    "zod": "4.4.3"
+  },
+  "devDependencies": {
+    "@eslint/js": "10.0.1",
+    "@types/express": "5.0.5",
+    "@types/node": "22.19.1",
+    "@vitest/coverage-v8": "4.1.10",
+    "eslint": "10.8.0",
+    "prettier": "3.9.6",
+    "typescript": "6.0.3",
+    "typescript-eslint": "8.65.0",
+    "vitest": "4.1.10"
+  },
+  "mcpName": "io.github.zenixsolutions/lumics-mcp"
+}

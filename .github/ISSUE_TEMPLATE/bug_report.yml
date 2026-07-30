@@ -1,0 +1,141 @@
+name: Bug report
+description: Something does not work the way the documentation says it should.
+title: 'fix: '
+labels:
+  - bug
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Before filing, please check:
+
+        - The README **Limitations** section. Several surprising behaviours are deliberate — the
+          Lumics API has no pagination, metric endpoints need a resolution parameter, raw Mongo
+          query passthrough is withheld on purpose, and ChatGPT and Grok are not supported in v0.1.
+        - Existing issues, in case this is already known.
+
+        **Do not report a security vulnerability here.** Use private reporting — see
+        [SECURITY.md](https://github.com/ZenixSolutions/lumics-mcp/blob/main/SECURITY.md).
+
+        **Redact everything sensitive** before you paste: tokens, company ids, hostnames, IP
+        addresses, and device names. A placeholder is fine.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I have read the README Limitations section and this is not documented behaviour
+          required: true
+        - label: I have searched existing issues
+          required: true
+        - label: This is not a security vulnerability
+          required: true
+        - label: I have redacted all tokens, ids, hostnames, and IP addresses from this report
+          required: true
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened
+      description: The observed behaviour, in plain terms.
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: What you expected
+      description: What you expected instead, and what led you to expect it — README, tool
+        description, or the API reference.
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: What you asked the assistant, or the exact tool call and arguments if you have
+        them.
+      placeholder: |
+        1. Configured the server with ...
+        2. Asked the assistant to ...
+        3. The tool call was lumics_list_devices with { "limit": 50 }
+        4. Result: ...
+    validations:
+      required: true
+
+  - type: input
+    id: version
+    attributes:
+      label: Server version
+      description: The version of @zenixsolutions/lumics-mcp. `npx @zenixsolutions/lumics-mcp
+        --version`, or the version your client resolved.
+      placeholder: 0.1.0
+    validations:
+      required: true
+
+  - type: dropdown
+    id: client
+    attributes:
+      label: MCP client
+      options:
+        - Claude Code
+        - Claude Desktop
+        - VS Code
+        - Cursor
+        - Codex
+        - Other (describe below)
+    validations:
+      required: true
+
+  - type: input
+    id: client-version
+    attributes:
+      label: Client version
+    validations:
+      required: true
+
+  - type: input
+    id: node-version
+    attributes:
+      label: Node.js version
+      description: '`node --version`. Node 20 or newer is required.'
+      placeholder: v20.19.0
+    validations:
+      required: true
+
+  - type: input
+    id: os
+    attributes:
+      label: Operating system
+      placeholder: macOS 15.3 / Ubuntu 24.04 / Windows 11
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: configuration
+    attributes:
+      label: Relevant configuration
+      description: Which flags were set. Do not paste values.
+      options:
+        - label: LUMICS_READ_ONLY was set
+        - label: LUMICS_ENABLE_BATCH_UPDATE was set
+        - label: LUMICS_ENABLE_TOKEN_REVOCATION was set
+        - label: LUMICS_BASE_URL was overridden
+        - label: A non-default LUMICS_TIMEOUT_MS or LUMICS_MAX_OUTPUT_CHARS was set
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error output or logs
+      description: Diagnostics from stderr or your client's MCP log. Redact before pasting.
+      render: text
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Scale of the environment, whether it is intermittent, anything you have already
+        ruled out.
