@@ -1414,6 +1414,36 @@ a wall of numbers: narrow `properties`, and set `lastMetric: true` when you want
 rather than a series. For a total or average across components instead of a row per component, use
 `lumics_summarize_company_metrics`; for one device, `lumics_get_device_metrics`.
 
+**This endpoint is unreliable in practice — read this before building on it** (spec §12.5 M12, §14
+defect 25). Measured against a production tenant on 2026-07-30, across two contract runs and a manual
+probe, it returned `500 {"error":"Sorry, an error occurred. Please try again.","code":500}` on
+**ordinary queries that carried a valid `properties` value**:
+
+| Sent                                                           | Outcome |
+| -------------------------------------------------------------- | ------- |
+| `lastMetric`, `isMonitored`, `minIntervals`, `limit`           | **500** |
+| `interval=minute`, `interval=fiveMin`                          | **500** |
+| `interval=hour`, `interval=day`, `aggregate`, `alignTimeRange` | served  |
+| a minimal query (manual probe)                                 | **200** |
+
+So it is **intermittent and query-dependent, not dead**, and no cause has been established — the
+correlation above is what was measured, on one tenant, on one day. Two further facts from the same
+day: the device-scoped endpoints (`lumics_get_device_metrics`, `lumics_get_device_item_metrics`)
+answered with populated data in one to two seconds throughout; and the vendor's own web UI never calls
+this route — a company dashboard load issued 57 API calls, including its "Top devices by CPU" and
+"Top devices by memory" widgets, and not one of them was `/api/v1/metrics/companies/`.
+
+The tool is **documented rather than withheld**: it still serves some queries, and nothing else
+returns a row per component. But for anything estate-wide, prefer resolving devices with
+`lumics_list_devices` and reading each one with `lumics_get_device_metrics`. The tool description
+carries this warning to the model, and a 500 from this endpoint carries endpoint-specific guidance
+instead of the generic "this is not a problem with your arguments" — which is untrue here — naming the
+correlated parameters and the device-scoped fallback. **The server does not retry a 500 on this
+route** (500 has never been in its retryable status set), and the error is marked non-retryable so
+nothing acts on the flag either. Transient statuses (429, 502, 503, 504) are still retried, because
+this endpoint answers in one to two seconds when it answers and those retries are both cheap and
+often right.
+
 ### `lumics_summarize_company_metrics`
 
 - **Class:** Read
@@ -1455,6 +1485,24 @@ Because the endpoint never returned during the contract run, **everything the ve
 its response is unverified against live behaviour**: the envelope, the `sum` semantics, `type:
 "summed"`, `components`, and the integer bucket `_id`. Treat any answer built on this tool's response
 shape as unexercised.
+
+**The slowness is one half of a broader reliability problem on this route** (spec §12.5 M12, §14
+defect 25). Its sibling `lumics_get_company_metrics` — same `/metrics/companies/` prefix — returned
+HTTP 500 on ordinary queries carrying a valid `properties` during the same runs, failing with
+`lastMetric`, `isMonitored`, `minIntervals`, `limit`, `interval=minute` and `interval=fiveMin` while
+`interval=hour`, `interval=day`, `aggregate`, `alignTimeRange` and a minimal query were served. Over
+the same period the **device-scoped** endpoints answered in one to two seconds with populated data,
+and the vendor's own dashboard never called `/api/v1/metrics/companies/` at all — 57 API calls on
+load, including its top-N device widgets, none of them to this route.
+
+Neither company-scoped tool is dependable, and this one is the less dependable of the two: it has
+never been observed returning. The description says so. If you need an estate-wide answer, resolve
+devices with `lumics_list_devices` and read them with `lumics_get_device_metrics` (or
+`lumics_get_device_item_metrics` for a single component) rather than aggregating here; for a per-item
+ranking, `lumics_get_metric_summary` is a different endpoint and was served. A 500 from this tool
+carries the same endpoint-specific guidance as its sibling and is **not retried** — which for this
+tool was already true of every failure, since it runs under a one-attempt budget. **Do not report a
+500 or a timeout here as an absence of data.**
 
 ### `lumics_get_device_metrics`
 

@@ -39,6 +39,15 @@
  *     retries that could not succeed. One attempt, and a timeout carries
  *     {@link SUMMARIZE_TIMEOUT_GUIDANCE} so the model does not read it as an empty
  *     estate.
+ *  D. **The company-scoped endpoint is unreliable in practice** (spec §12.5 M12).
+ *     §12.1 returned 500 on ordinary queries with a valid `properties`, the
+ *     failures tracked specific parameters while others were served, §12.2 never
+ *     returned at all, and the vendor's own UI never calls the route. §12.3 is
+ *     the dependable path. Both company-scoped tools carry
+ *     {@link COMPANY_METRIC_RELIABILITY_DISCLOSURE} and a 500 from either carries
+ *     matching guidance from `src/api/errors.ts`. The tools are **documented, not
+ *     withheld** — an owner decision, and the honest one, because a minimal query
+ *     is still served.
  *
  * Four facts from spec §12 shape every tool here, each of them a prototype defect:
  *
@@ -94,6 +103,8 @@ import {
   metricSummariesPath,
 } from '../api/paths.js';
 import {
+  COMPANY_METRIC_500_CORRELATED_PARAMS,
+  COMPANY_METRIC_500_SERVED_PARAMS,
   DEFAULT_METRIC_DATA_POINTS,
   MAX_LIST_LIMIT,
   METRIC_MIN_INTERVALS_DEFAULT,
@@ -355,24 +366,84 @@ function unwrapMetricSeries(response: unknown, operation: string): MetricSeriesR
 }
 
 /**
+ * Keys inside the §12.4 `data` object whose value is known NOT to be a class of
+ * rows.
+ *
+ * Contract testing against a live tenant returned
+ * `{"count":0,...,"data":{"company":"<id>"}}` — a scalar sitting inside `data`
+ * alongside the item classes, echoing back which company was summarised. It is
+ * request metadata, not an item class that came back in the wrong shape, so it
+ * gets a different disclosure from a key nobody anticipated: saying "rows may be
+ * missing" about it would be a false alarm.
+ *
+ * The list is deliberately one entry long. The spec documents this object only by
+ * the `devices` example (§12.4), so every other non-array key is unrecognised
+ * until it has actually been observed and understood; guessing at more would be
+ * inventing the contract.
+ */
+const SUMMARY_DATA_METADATA_KEYS: ReadonlySet<string> = new Set(['company']);
+
+/**
+ * `company="abc"` — a bounded, brace-free rendering of one non-array `data` entry
+ * for quoting inside a disclosure note.
+ *
+ * Notes are emitted *before* the JSON payload and separated from it by position
+ * alone (`src/presentation/shape.ts`), so no note in this server contains `{` or
+ * `[`: a client scanning for the start of the JSON would otherwise stop inside
+ * the prose. A scalar is therefore quoted verbatim and anything structural is
+ * described rather than dumped — which is enough to say what was there without
+ * the note pretending to be the value.
+ */
+function describeDataEntry(key: string, value: unknown): string {
+  if (isRecord(value)) {
+    const keys = Object.keys(value);
+    const shown = keys.slice(0, 10).join(', ');
+    return `${key}=<a non-array object with ${String(keys.length)} key(s)${keys.length === 0 ? '' : `: ${shown}${keys.length > 10 ? ', …' : ''}`}>`;
+  }
+
+  const rendered = typeof value === 'string' ? JSON.stringify(value) : String(value);
+  if (/[[\]{}]/.test(rendered)) {
+    return `${key}=<a ${typeof value} value, not quoted here because it contains JSON punctuation>`;
+  }
+  return `${key}=${rendered.length > 120 ? `${rendered.slice(0, 120)}… (truncated)` : rendered}`;
+}
+
+/**
  * Unwrap `{ data: { devices: [ ... ] }, count, <meta> }` (spec §12.4).
  *
  * This endpoint's `data` is an **object keyed by item class**, not an array like
  * the other four. `devices` is the only key the vendor documents; others are
  * presumed to exist for component item types but none are named, so the keys are
  * read rather than assumed.
+ *
+ * Not every entry is an item class, though. Non-array entries are separated out
+ * rather than skipped — see {@link SUMMARY_DATA_METADATA_KEYS} — because dropping
+ * one silently makes the tool output say something the response did not. Ranking,
+ * projection and budget shedding all operate on `classes` only; `metadata` and
+ * `unrecognised` exist so the handler can disclose them.
  */
 function unwrapMetricSummaries(
   response: unknown,
   operation: string,
 ): {
   readonly classes: Readonly<Record<string, readonly MetricSummaryItem[]>>;
+  /** Non-array `data` entries known to be request metadata, not rows. */
+  readonly metadata: Readonly<Record<string, unknown>>;
+  /** Non-array `data` entries this server has never seen and cannot classify. */
+  readonly unrecognised: Readonly<Record<string, unknown>>;
   readonly count: number | undefined;
   readonly meta: MetricEnvelopeMeta;
   readonly absence: SeriesAbsence;
 } {
   if (isAbsentBody(response)) {
-    return { classes: {}, count: undefined, meta: {}, absence: 'body' };
+    return {
+      classes: {},
+      metadata: {},
+      unrecognised: {},
+      count: undefined,
+      meta: {},
+      absence: 'body',
+    };
   }
   if (!isRecord(response)) {
     throw LumicsApiError.invalidResponse(
@@ -383,6 +454,8 @@ function unwrapMetricSummaries(
 
   const { data, count, ...meta } = response;
   const classes: Record<string, readonly MetricSummaryItem[]> = {};
+  const metadata: Record<string, unknown> = {};
+  const unrecognised: Record<string, unknown> = {};
   const absence: SeriesAbsence = data === undefined || data === null ? 'data' : 'none';
 
   if (data !== undefined && data !== null) {
@@ -395,12 +468,18 @@ function unwrapMetricSummaries(
     for (const [key, value] of Object.entries(data)) {
       if (Array.isArray(value)) {
         classes[key] = value as readonly MetricSummaryItem[];
+      } else if (SUMMARY_DATA_METADATA_KEYS.has(key)) {
+        metadata[key] = value;
+      } else {
+        unrecognised[key] = value;
       }
     }
   }
 
   return {
     classes,
+    metadata,
+    unrecognised,
     count: typeof count === 'number' ? count : undefined,
     meta,
     absence,
@@ -818,6 +897,54 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 }
 
 // ---------------------------------------------------------------------------
+// The company-scoped endpoint is unreliable in practice (spec §12.5 M12)
+// ---------------------------------------------------------------------------
+
+/**
+ * The reliability disclosure both company-scoped metric tools carry, and the
+ * reason they still exist.
+ *
+ * **The owner's decision is to document, not to withhold** — §12.1 answers some
+ * queries, and a tool removed is a capability a user cannot reach at all. What a
+ * model needs is the *shape* of the risk, which is:
+ *
+ *  - §12.1 returned **HTTP 500** on ordinary queries carrying a valid
+ *    `properties` value, and the failures tracked specific parameters
+ *    ({@link COMPANY_METRIC_500_CORRELATED_PARAMS}) while others
+ *    ({@link COMPANY_METRIC_500_SERVED_PARAMS}) and a minimal query were served.
+ *    So: **intermittent and query-dependent, not dead.** Saying "this endpoint is
+ *    broken" would be as wrong as saying nothing.
+ *  - §12.2 `/summarize` has **never been observed returning at all**.
+ *  - §12.3, the device-scoped path, answered with populated data in one to two
+ *    seconds in every run. That is the fallback, and it is named with the exact
+ *    tool sequence rather than described, because "use the device tools" is not
+ *    actionable while "call lumics_list_devices, then lumics_get_device_metrics
+ *    per device" is.
+ *  - The vendor's own web UI **never calls this endpoint**: a company dashboard
+ *    load issued 57 API calls, including its "Top devices by CPU" and "Top
+ *    devices by memory" widgets, and none of them was `/api/v1/metrics/companies/`.
+ *    That is the strongest single piece of evidence here — the product that owns
+ *    the API does not use this route for company-wide metrics — and it is the
+ *    reason a model should not treat a failure as its own mistake.
+ *
+ * No cause is asserted. Everything above is what one tenant did on 2026-07-30
+ * across two contract runs and a manual probe; the mechanism is unknown and this
+ * text does not invent one.
+ *
+ * The matching failure guidance lives in `src/api/errors.ts`
+ * (`companyMetricServerErrorGuidance`), so a model that ignores the description
+ * and gets a 500 is told the same things again at the point it can act on them.
+ */
+const COMPANY_METRIC_RELIABILITY_DISCLOSURE =
+  ' RELIABILITY WARNING — THIS COMPANY-SCOPED ENDPOINT IS UNRELIABLE IN PRACTICE, AND THE DEVICE-SCOPED TOOLS ARE THE DEPENDABLE PATH (spec section 12.5 M12, measured against a live tenant on 2026-07-30 across two contract runs and a manual probe).' +
+  ' What was observed: spec section 12.1 returned HTTP 500 on ORDINARY queries that carried a valid "properties" value, and spec section 12.2 /summarize did not return AT ALL over 90 seconds, with and without itemType narrowing.' +
+  ` The 500s coincided with these parameters: ${COMPANY_METRIC_500_CORRELATED_PARAMS.join(', ')} — avoid them here. These were served: ${COMPANY_METRIC_500_SERVED_PARAMS.join(', ')}, and so was a minimal query, so this endpoint is INTERMITTENT AND QUERY-DEPENDENT, NOT DEAD.` +
+  ' No cause has been established and none is claimed; the correlation is what was measured, on one tenant, on one day.' +
+  ' Corroborating evidence that this is the endpoint and not you: the vendor\'s own web UI never calls it — a company dashboard load issued 57 API calls, including its "Top devices by CPU" and "Top devices by memory" widgets, and not one of them was /api/v1/metrics/companies/.' +
+  ' WHAT TO DO INSTEAD: prefer the device-scoped route (spec section 12.3), which returned populated data in one to two seconds in every run — call lumics_list_devices to resolve the devices you care about, then lumics_get_device_metrics for each device, or lumics_get_device_item_metrics for a single component. That is more calls and it is the path that works.' +
+  ' If you do use this tool, drop the correlated parameters above, prefer interval=hour or interval=day, and treat a failure as the endpoint rather than as an absence of data: a 500 or a timeout here is NOT evidence that this company, module or metric has no data.';
+
+// ---------------------------------------------------------------------------
 // spec §12.1 — company metrics, per item
 // ---------------------------------------------------------------------------
 
@@ -830,7 +957,8 @@ const getCompanyMetrics = defineTool({
   title: 'Get company metrics per item',
   operation: 'read',
   description:
-    'Get metrics for every monitored component of one polling module across a whole Lumics company, returning a separate row per item per time bucket with its stats. Use this to answer "what does X look like across the estate" — for example the status of every F5 pool, or CPU on every switch. "properties" is REQUIRED and must name metrics as "<TypeGroup>.<metric>" (e.g. "Calculated.cpu"): the call fails without it, and an unrecognised name comes back as a successful but EMPTY result rather than an error — see the properties argument. Set lastMetric true when you want current values rather than a time series. The window defaults to the last 1 hour. A resolution is always sent because the Lumics API requires one; it defaults to 60 data points across the window unless you pass dataPoints. Each returned row carries a "type" field holding the singular component id, which is the correct value for itemType on a follow-up call. For a total or an average across components rather than a row per component, use lumics_summarize_company_metrics; for one device, use lumics_get_device_metrics.',
+    'Get metrics for every monitored component of one polling module across a whole Lumics company, returning a separate row per item per time bucket with its stats. Use this to answer "what does X look like across the estate" — for example the status of every F5 pool, or CPU on every switch. "properties" is REQUIRED and must name metrics as "<TypeGroup>.<metric>" (e.g. "Calculated.cpu"): the call fails without it, and an unrecognised name comes back as a successful but EMPTY result rather than an error — see the properties argument. Set lastMetric true when you want current values rather than a time series. The window defaults to the last 1 hour. A resolution is always sent because the Lumics API requires one; it defaults to 60 data points across the window unless you pass dataPoints. Each returned row carries a "type" field holding the singular component id, which is the correct value for itemType on a follow-up call. For a total or an average across components rather than a row per component, use lumics_summarize_company_metrics; for one device, use lumics_get_device_metrics.' +
+    COMPANY_METRIC_RELIABILITY_DISCLOSURE,
   inputSchema: {
     moduleType: moduleTypeSchema,
     companyId: companyIdSchema,
@@ -844,6 +972,22 @@ const getCompanyMetrics = defineTool({
     const companyId = context.resolveCompanyId(args.companyId);
     const request = buildMetricRequest(args);
     const operation = `GET company metrics ${args.moduleType}`;
+
+    // Deliberately NO per-request `maxAttempts` cap, unlike `/summarize` below,
+    // and the reason is that the failure this endpoint was measured producing is
+    // already not retried. A 500 is absent from `RETRYABLE_STATUSES`
+    // (`src/constants.ts`), so `LumicsClient.shouldRetry` throws it on the first
+    // attempt — the fail-fast the M12 measurement asks for is already the
+    // behaviour, and the flag on the error now says so too (see
+    // `companyMetricServerErrorGuidance` in `src/api/errors.ts`).
+    //
+    // Capping attempts here would therefore change nothing about a 500 and would
+    // instead disable retrying for 429, 502, 503 and 504 — genuinely transient
+    // statuses, on an endpoint that answers in one to two seconds when it answers
+    // at all, where a retry is cheap and often works. That is the opposite of
+    // `/summarize`, whose cap exists because its retries cost three minutes each.
+    // Removing a control that is doing useful work, to solve a problem that no
+    // longer exists, is not a trade worth making.
     const response = await context.client.get<unknown>(
       companyMetricsPath(companyId, args.moduleType),
       { query: request.query },
@@ -931,7 +1075,8 @@ const summarizeCompanyMetrics = defineTool({
   title: 'Summarize company metrics into time buckets',
   operation: 'read',
   description:
-    'Aggregate one polling module\'s metrics across ALL matching components in a company into time buckets, giving one row per bucket rather than one row per component. Without "sum" the metrics are averaged across components; with "sum" they are added up, and the value of "sum" chooses which per-component rollup property ("min", "max" or "avg") feeds that total. Use this for estate-wide trends and totals — total aggregate space used, average CPU over the day. Each bucket also carries how many samples and component-documents it covers, and buckets with no data are omitted entirely rather than returned as zero, so do not read a gap as a zero. THIS ENDPOINT IS SLOW: it aggregates every matching component in the company before it answers, and has been measured taking over 90 seconds where the other metric endpoints take one or two. This server gives it a 3-minute deadline of its own and reports a timeout immediately rather than retrying, because a retry would spend another 3 minutes failing the same way. On a large tenant it can still time out — if it does, that is a timeout and NOT evidence that there is no data. Narrow it with itemType, a shorter window or a tighter "properties" before retrying, or use lumics_get_company_metrics, which is fast. "properties" is REQUIRED here too and must name metrics as "<TypeGroup>.<metric>". The window defaults to the last 1 hour and a resolution of 60 data points is sent unless you pass dataPoints. If a short window returns nothing, lower minIntervals. For a row per component instead, use lumics_get_company_metrics. This tool CANNOT rank or identify individual devices or components: every row it returns is a time bucket covering all of them at once, and no device name or id appears in the output. If the question is "which devices are highest", "top N devices" or anything else that needs a per-device answer, use lumics_get_metric_summary instead, which returns one row per item and supports sortBy and topN. Note the confusable name: this tool summarises over TIME, lumics_get_metric_summary summarises over ITEMS.',
+    'Aggregate one polling module\'s metrics across ALL matching components in a company into time buckets, giving one row per bucket rather than one row per component. Without "sum" the metrics are averaged across components; with "sum" they are added up, and the value of "sum" chooses which per-component rollup property ("min", "max" or "avg") feeds that total. Use this for estate-wide trends and totals — total aggregate space used, average CPU over the day. Each bucket also carries how many samples and component-documents it covers, and buckets with no data are omitted entirely rather than returned as zero, so do not read a gap as a zero. THIS ENDPOINT IS SLOW: it aggregates every matching component in the company before it answers, and has been measured taking over 90 seconds where the other metric endpoints take one or two. This server gives it a 3-minute deadline of its own and reports a timeout immediately rather than retrying, because a retry would spend another 3 minutes failing the same way. On a large tenant it can still time out — if it does, that is a timeout and NOT evidence that there is no data. Narrow it with itemType, a shorter window or a tighter "properties" before retrying, or use lumics_get_company_metrics, which is fast. "properties" is REQUIRED here too and must name metrics as "<TypeGroup>.<metric>". The window defaults to the last 1 hour and a resolution of 60 data points is sent unless you pass dataPoints. If a short window returns nothing, lower minIntervals. For a row per component instead, use lumics_get_company_metrics. This tool CANNOT rank or identify individual devices or components: every row it returns is a time bucket covering all of them at once, and no device name or id appears in the output. If the question is "which devices are highest", "top N devices" or anything else that needs a per-device answer, use lumics_get_metric_summary instead, which returns one row per item and supports sortBy and topN. Note the confusable name: this tool summarises over TIME, lumics_get_metric_summary summarises over ITEMS.' +
+    COMPANY_METRIC_RELIABILITY_DISCLOSURE,
   inputSchema: {
     moduleType: moduleTypeSchema,
     companyId: companyIdSchema,
@@ -1180,8 +1325,13 @@ const getMetricSummary = defineTool({
       },
     );
 
-    const { classes, count, meta, absence } = unwrapMetricSummaries(response, operation);
+    const { classes, metadata, unrecognised, count, meta, absence } = unwrapMetricSummaries(
+      response,
+      operation,
+    );
     const classNames = Object.keys(classes);
+    const metadataKeys = Object.keys(metadata);
+    const unrecognisedKeys = Object.keys(unrecognised);
 
     // Leads for the same reason it leads on a series: it changes what everything
     // below it means. This endpoint's empty answer is a keyed `{}`, which reads
@@ -1200,6 +1350,36 @@ const getMetricSummary = defineTool({
           ? ''
           : ` Lumics reported count=${String(count)} item(s) summarised; if fewer appear below they were removed by this server's topN trim or by the output budget, not by the API.`),
     );
+
+    // Non-array entries in `data` (contract finding). This server can only rank,
+    // project and shed ARRAYS, so anything else in `data` is left out of the
+    // payload below — which is exactly the kind of omission that must not be
+    // silent. An unrecognised key leads, because it is the one that might be rows.
+    if (unrecognisedKeys.length > 0) {
+      notes.push(
+        `UNRECOGNISED NON-ARRAY ENTR${unrecognisedKeys.length === 1 ? 'Y' : 'IES'} IN "data": the Lumics response's "data" object ` +
+          `carried ${String(unrecognisedKeys.length)} entr${unrecognisedKeys.length === 1 ? 'y' : 'ies'} that ` +
+          'is not an array and that this server does not recognise, so it could not be treated as an item class and is ' +
+          `NOT in the result below. Verbatim: ${unrecognisedKeys.map((key) => describeDataEntry(key, unrecognised[key])).join('; ')}. ` +
+          'spec section 12.4 documents this object only by the "devices" example, so this server cannot tell whether ' +
+          'that is metadata (like the known "company" entry) or a class of results in a shape it cannot rank or ' +
+          'project. Treat the item list below as INCOMPLETE with respect to it: do not describe this response as the ' +
+          'whole of "data", check the entry above against the Lumics UI before reporting on it, and report it as an ' +
+          'API-contract gap.',
+      );
+    }
+
+    // Known metadata gets the opposite framing on purpose: warning that rows may
+    // be missing because `company` echoed the request back would be a false alarm.
+    if (metadataKeys.length > 0) {
+      notes.push(
+        `REQUEST METADATA INSIDE "data": Lumics placed ${metadataKeys.map((key) => describeDataEntry(key, metadata[key])).join('; ')} ` +
+          'inside the "data" object, alongside the item classes rather than beside them in the envelope. That is ' +
+          'metadata about the request, NOT a class of summarised items, so it is not shown as a row below and NO ' +
+          'items are missing because of it. It is reported only so that this response is not read as containing ' +
+          'something the Lumics body did not.',
+      );
+    }
 
     // Said whenever `properties` was sent, not only when the result came back
     // empty: a filtered-down-but-non-empty response is the more dangerous of the
@@ -1262,9 +1442,17 @@ const getMetricSummary = defineTool({
         // supplied, the measured behaviour of this endpoint makes the parameter
         // itself the likeliest cause, so leading with "nothing matched" would be
         // a confident negative about the estate produced by our own argument.
+        // "present but empty" is only true when `data` really was `{}`. With a
+        // `company` scalar or an unrecognised key in it, the object was not
+        // empty — it just held nothing this server could return as rows, and the
+        // notes above name what it did hold.
+        const nonArrayKeys = [...unrecognisedKeys, ...metadataKeys];
         notes.push(
-          'NO ITEMS: the Lumics response contained no item-class arrays at all — its "data" object was present but ' +
-            'empty. This is not an error and not a truncation, but do not report it as "this company has no data for ' +
+          'NO ITEMS: the Lumics response contained no item-class arrays at all — its "data" object was ' +
+            (nonArrayKeys.length === 0
+              ? 'present but empty'
+              : `present and held ${String(nonArrayKeys.length)} non-array entr${nonArrayKeys.length === 1 ? 'y' : 'ies'} (${nonArrayKeys.join(', ')}), described in the note(s) above, but no array of items`) +
+            '. This is not an error and not a truncation, but do not report it as "this company has no data for ' +
             'this module" until the arguments below are ruled out.' +
             (args.properties === undefined
               ? ''

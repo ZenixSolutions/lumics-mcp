@@ -167,6 +167,42 @@ defects 17–23; the decisions are
   of how much work it is doing. A per-request attempt budget can only ever **lower** the client-wide
   one, never raise it. A `/summarize` timeout now carries its own guidance saying it was attempted
   once deliberately, that **a timeout is not an empty result**, and what to narrow.
+- **The two company-scoped metric tools now say that the endpoint behind them is unreliable, and
+  route the model to the device-scoped tools instead.** Measured on 2026-07-30 across two contract
+  runs and a manual probe (spec §12.5 M12, §14 defect 25):
+  `GET /metrics/companies/:c/modules/:m` (spec §12.1) returned
+  `500 {"error":"Sorry, an error occurred. Please try again.","code":500,"level":"error"}` on
+  **ordinary queries carrying a valid `properties` value** — with `lastMetric`, `isMonitored`,
+  `minIntervals` and `limit`, and with `interval=minute` and `interval=fiveMin` — while
+  `interval=hour`, `interval=day`, `aggregate` and `alignTimeRange` were served, as was a minimal
+  probe. `/summarize` (spec §12.2) never returned at all. The device-scoped endpoints (spec §12.3)
+  answered the same tenant in one to two seconds with populated data throughout. Separately, the
+  vendor's own web UI **never calls this route**: a company dashboard load issued 57 API calls,
+  including its "Top devices by CPU" and "Top devices by memory" widgets, and none of them was
+  `/api/v1/metrics/companies/`. `lumics_get_company_metrics` and `lumics_summarize_company_metrics`
+  therefore carry a reliability warning in their descriptions naming the parameters that correlated
+  with a 500, the ones that were served, and the fallback sequence — `lumics_list_devices`, then
+  `lumics_get_device_metrics` or `lumics_get_device_item_metrics` per device. **Neither tool is
+  withheld or removed**: the endpoint is intermittent and query-dependent rather than dead, no cause
+  has been established, and a minimal query is still served, so the decision is to state the shape of
+  the risk rather than the blanket claim that it is broken.
+- **A 500 from those two endpoints no longer reaches the model as a flat internal error.** The generic
+  spec §3 mapping says "This is not a problem with your arguments. The server already retried where
+  safe" — both halves of which are misleading on this one route, where the arguments **do** correlate
+  with the failure and a working alternative exists. A 500 whose path is `/metrics/companies/:c/
+modules/:m`, with or without `/summarize`, now carries endpoint-specific guidance: that the endpoint
+  is known-unreliable, which parameters correlated and which were served, that the failure is
+  intermittent rather than total and no cause is claimed, the device-scoped fallback by tool name, and
+  that a 500 is not evidence of an absence of data. **Every other endpoint's 500 is unchanged**, as is
+  every other status on the metric route — a 400 there is still a 400.
+- **A 500 on that route is marked non-retryable.** No retry loop changed: 500 has never been in
+  `RETRYABLE_STATUSES`, so the client already failed fast on it, and the `retryable: true` flag
+  carried by the error was metadata that disagreed with the behaviour and with the new guidance. On a
+  known-unreliable, query-dependent endpoint that disagreement is load-bearing, so the flag now says
+  what the client does. The company-scoped tools deliberately did **not** get a one-attempt budget of
+  the kind `/summarize` has: it would change nothing about a 500 and would disable retrying of
+  genuinely transient statuses (429, 502, 503, 504) on an endpoint that answers in one to two seconds
+  when it answers, which would weaken a control that is doing useful work.
 
 ### Security
 
@@ -273,6 +309,16 @@ defects 17–23; the decisions are
   route, while `properties` is mandatory and a wrong value looks like success. Component-level metric
   questions are answerable only when you already know the name, from the Lumics UI or from
   institutional knowledge. This is a gap in the vendor API and this server cannot close it.
+- **The company-scoped metric endpoint is unreliable in practice.** `lumics_get_company_metrics`
+  returned HTTP 500 on ordinary queries carrying a valid `properties` (with `lastMetric`,
+  `isMonitored`, `minIntervals`, `limit`, `interval=minute`, `interval=fiveMin`), while
+  `interval=hour`, `interval=day`, `aggregate`, `alignTimeRange` and a minimal query were served;
+  `lumics_summarize_company_metrics` never returned at all. The device-scoped tools answered in one to
+  two seconds throughout, and the vendor's own dashboard never calls this route. It is intermittent
+  and query-dependent, not dead, and no cause has been established. Both tools remain available and
+  both say this; for anything estate-wide, resolve devices with `lumics_list_devices` and read them
+  with `lumics_get_device_metrics`. This server cannot fix an upstream fault — it can only stop a
+  failure being read as an absence of data.
 - **`lumics_summarize_company_metrics` is slow and its response shape is unverified.** The endpoint
   never returned during the contract run, so everything the vendor documents about it — the envelope,
   the `sum` semantics, `type: "summed"`, `components`, the integer bucket `_id` — is unverified

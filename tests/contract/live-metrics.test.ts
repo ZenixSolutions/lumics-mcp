@@ -53,6 +53,15 @@
  *    it goes UNVERIFIED. There is deliberately **no fallback literal**: writing
  *    `Calculated.cpu` into this file would turn one tenant's data into an
  *    assumption about the API.
+ *  - **The module a property name is discovered against comes from the tenant's
+ *    devices**, not from `componenttypes`. The second run (2026-07-30, run 02)
+ *    probed §12.4 for four modules read out of the component-type catalogue and
+ *    got property names from none of them, so **40 assumptions went UNVERIFIED**
+ *    — the catalogue enumerates what the platform can model, while a metric call
+ *    is scoped to a module a *device* polls (spec §7.1). {@link discover} now
+ *    takes its candidates from the device records' `modules` maps, most-polled
+ *    first, and probes several because §12.4 does not serve every module
+ *    (spec §12.5 M7).
  *  - **An invalid `properties` value returns HTTP 200 with empty stats**
  *    (spec §12.5 M2). That is a silent-failure mode a consumer cannot detect, so
  *    it gets an explicit case rather than a note.
@@ -150,8 +159,8 @@ const DOCUMENTED_ENVELOPE_TYPES = ['standard', 'minMaxAvg', 'summed'];
 
 /**
  * Fallback module name. `snmp` is not invented: it is the module the vendor's own
- * §12.1 and §12.3 examples use. Only reached when `componenttypes` is empty and
- * no device declares a module, in which case the acceptance tests still have
+ * §12.1 and §12.3 examples use. Only reached when no device declares a module and
+ * `componenttypes` is empty, in which case the acceptance tests still have
  * something valid-looking to send and the data-dependent ones go UNVERIFIED.
  *
  * There is deliberately no equivalent fallback for `properties`: a module name is
@@ -159,6 +168,30 @@ const DOCUMENTED_ENVELOPE_TYPES = ['standard', 'minMaxAvg', 'summed'];
  * one tenant's data (spec §12.5 M2/M6). See {@link Fixture.properties}.
  */
 const FALLBACK_MODULE = 'snmp';
+
+/**
+ * How many device records the module census reads (spec §7.1).
+ *
+ * Bigger than the two or three a §12.3 case needs, because this list is now what
+ * {@link moduleCensus} counts: a sample of three can miss a module that only a
+ * handful of devices poll, and the module that actually reports metrics may be
+ * the third or fourth most common rather than the first. One request either way.
+ */
+const DEVICE_CENSUS_LIMIT = 12;
+
+/**
+ * How many modules §12.4 is probed for, in census order.
+ *
+ * §12.4 does not serve every module (spec §12.5 M7 — on 2026-07-30 `ping` and
+ * `syslog` answered with HTML error pages and `deviceConfigs` with a 500), so
+ * "try the most common module" is not enough: the run of 2026-07-30 (02) probed
+ * four component modules and got property names from none of them. Six probes is
+ * enough to get past a couple of unserved modules and still bounded.
+ */
+const MODULE_PROBE_LIMIT = 6;
+
+/** How many devices the §12.3 warm-up probe will try before settling. */
+const DEVICE_METRIC_PROBES = 3;
 
 /** spec §12.4 selects device-level rather than component-level summaries. */
 const DEVICE_ITEM_TYPE = 'device';
@@ -177,6 +210,17 @@ interface Fixture {
   readonly controlOk: boolean;
   /** Modules probed, so an UNVERIFIED entry can say what was tried. */
   readonly probedModules: readonly string[];
+  /**
+   * Where the probed module names came from, in one clause for a report line.
+   *
+   * The 2026-07-30 (02) run made this worth carrying: the modules were taken from
+   * `componenttypes`, which is a platform-wide catalogue of component *types*
+   * dominated by whichever module ships the most of them, and none of the four it
+   * yielded was a module this tenant's devices report. Every UNVERIFIED entry
+   * that names the probed modules now also says how they were chosen, so a repeat
+   * of that failure is legible from the ledger rather than only from the code.
+   */
+  readonly moduleSource: string;
   /** Rows the probe returned, reused as the baseline by several tests. */
   readonly baselineRows: readonly Record<string, unknown>[];
   /** `data[].type` seen in the probe — a real, live component type string. */
@@ -305,7 +349,7 @@ function requireProperties(ctx: TestContext, spec: string, claim: string): strin
       ctx,
       spec,
       claim,
-      `no metric property name could be discovered on this tenant. spec section 12.5 M1 makes "properties" REQUIRED on sections 12.1, 12.2 and 12.3 (400 "Must supply required component metrics as properties parameter"), and spec section 12.5 M6 records that section 12.4 metrics/summaries is the only endpoint in this API that enumerates property names at all — it returned none for any module probed (${state.probedModules.join(', ')}). Property names are TENANT-SPECIFIC, so this suite will not fall back to a literal such as "Calculated.cpu": inventing one would turn one tenant's data into an assumption about the API, and spec section 12.5 M2 says a wrong value comes back as HTTP 200 with empty stats rather than an error, so the case would appear to pass`,
+      `no metric property name could be discovered on this tenant. spec section 12.5 M1 makes "properties" REQUIRED on sections 12.1, 12.2 and 12.3 (400 "Must supply required component metrics as properties parameter"), and spec section 12.5 M6 records that section 12.4 metrics/summaries is the only endpoint in this API that enumerates property names at all — it returned none for any module probed (${state.probedModules.join(', ')} — ${state.moduleSource}). Property names are TENANT-SPECIFIC, so this suite will not fall back to a literal such as "Calculated.cpu": inventing one would turn one tenant's data into an assumption about the API, and spec section 12.5 M2 says a wrong value comes back as HTTP 200 with empty stats rather than an error, so the case would appear to pass`,
     );
   }
   return state.properties;
@@ -467,34 +511,63 @@ function statPaths(row: Record<string, unknown>): readonly string[] {
  * and records that §12.4 `metrics/summaries` is the only endpoint anywhere in
  * this API that lists any.
  *
+ * **Where the module candidates come from is the whole game, and the 2026-07-30
+ * (02) run got it wrong.** That run took them from `componenttypes` and probed
+ * `cisco`, `clearpass`, `cohesity` and `common`; §12.4 returned property names
+ * for none of them and **40 assumptions went UNVERIFIED** for want of a
+ * `properties` value. The mistake is a category error, not an unlucky sample:
+ * `componenttypes` is a platform-wide catalogue of component *types* — 246
+ * entries on that tenant, dominated by whichever module ships the most models
+ * (snmp 150, cisco 44, netapp 11, …) — and it says nothing about what this
+ * tenant's devices actually poll. A metric call is scoped to a **device's**
+ * module, so the module names have to come from the device records' `modules`
+ * map (spec §7.1), which is exactly what that tenant's devices reported: ping 27,
+ * snmp 24, deviceConfigs 20, http 1, syslog 1 across 27 devices. `snmp` — the
+ * module that had enumerated eleven property names in an earlier manual probe
+ * against the same tenant — is in that census and in no prefix of the catalogue's.
+ *
  * So the order matters and is not the obvious one:
  *
- *  1. `componenttypes` for the module names.
- *  2. **§12.4 first**, per module, to harvest property names. It takes no
- *     `properties` of its own, so it is the one metric endpoint that can be
- *     called before anything is known. Its outcomes double as the module
- *     coverage measurement (spec §12.5 M7).
- *  3. §12.1 with those properties, for the control call, the baseline rows and a
+ *  1. **Devices first**, for the module census (spec §7.1) *and* for §12.3.
+ *     Candidates are the census in descending device count, because §12.4 does
+ *     not serve every module (spec §12.5 M7) and the most-polled module is not
+ *     necessarily a served one — several are tried, not one.
+ *  2. `componenttypes`, for the M3 alias pair and as a *secondary* source of
+ *     module names for a tenant whose devices declare none.
+ *  3. **§12.4 before anything else metric**, per candidate, to harvest property
+ *     names. It takes no `properties` of its own, so it is the one metric
+ *     endpoint that can be called before anything is known. Its outcomes double
+ *     as the module coverage measurement (spec §12.5 M7).
+ *  4. §12.1 with those properties, for the control call, the baseline rows and a
  *     live `itemType` (a row's own `type`, which spec §12.5 M3 says is the
  *     singular id the metrics API accepts).
- *  4. §6.5 device definitions, to build the alias/singular pair the M3 case needs.
- *  5. Devices, for §12.3.
+ *  5. §6.5 device definitions, to build the alias/singular pair the M3 case needs.
  *
- * Probing stays bounded: at most four modules, three device probes, and one
- * catalogue read each. Windows are one hour at `lastMetric=true`.
+ * Probing stays bounded: one device list, at most six §12.4 probes, three §12.3
+ * probes, and one read of each catalogue. Windows are one hour at
+ * `lastMetric=true`.
  */
 async function discover(): Promise<Fixture> {
   const { client, config } = api();
   const window = hourWindow();
 
+  // ---- step 1: the devices, and the module census taken from them ----
+  // The configured company's own list, and deliberately nothing else: these ids
+  // are the ones the device metric tools' ownership pre-read will accept. See
+  // pinnedCompanyDevices in harness.ts.
+  const devices = await pinnedCompanyDevices(DEVICE_CENSUS_LIMIT);
+  const census = moduleCensus(devices);
+
+  // ---- step 2: the component-type catalogue ----
   const types = expectArray<ComponentType>(
     await client.get(componentTypesPath(config.companyId)),
     'GET componenttypes',
   );
-  const modules = [...new Set(types.map((type) => type.module).filter(isNonEmptyString))];
-  const candidates = (modules.length > 0 ? modules : [FALLBACK_MODULE]).slice(0, 4);
+  const catalogueModules = [...new Set(types.map((type) => type.module).filter(isNonEmptyString))];
 
-  // ---- step 2: property names, from the only endpoint that has them ----
+  const { candidates, moduleSource } = moduleCandidates(census, catalogueModules, devices.length);
+
+  // ---- step 3: property names, from the only endpoint that has them ----
   const summariesProbes: SummariesProbe[] = [];
   let propertyModule: string | undefined;
   let propertyPaths: readonly string[] = [];
@@ -527,7 +600,7 @@ async function discover(): Promise<Fixture> {
     ...new Set(propertyPaths.map((path) => path.split('.')[0]).filter(isNonEmptyString)),
   ];
 
-  // ---- step 3: the §12.1 control, now that a properties value exists ----
+  // ---- step 4: the §12.1 control, now that a properties value exists ----
   // The module that produced property names is tried first: those names are
   // module-scoped, so pairing them with a different module would measure nothing.
   const seriesOrder =
@@ -575,24 +648,21 @@ async function discover(): Promise<Fixture> {
   // and a device-scoped name (spec §12.5 M6) is not a component-level one.
   const propertyPath = baselineRows.flatMap((row) => statPaths(row))[0];
 
-  // ---- step 4: the alias/singular itemType pair (spec §12.5 M3) ----
+  // ---- step 5: the alias/singular itemType pair (spec §12.5 M3) ----
   const definitions = expectArray<DeviceDefinitionComponent>(
     await client.get(deviceDefinitionComponentsPath()),
     'GET system device definitions',
   );
   const itemTypePair = findItemTypePair(definitions, types, moduleType);
 
-  // ---- step 5: devices ----
-  // The configured company's own list, and deliberately nothing else: these ids
-  // are the ones the device metric tools' ownership pre-read will accept. See
-  // pinnedCompanyDevices in harness.ts.
-  const devices = await pinnedCompanyDevices(3);
+  // ---- step 6: the device fixture for §12.3, from the list read in step 1 ----
   const firstDevice = devices[0];
   const pinnedDeviceId = firstDevice === undefined ? undefined : resourceId(firstDevice);
   const listCarriedCompany = firstDevice !== undefined && typeof firstDevice.company === 'string';
 
   let deviceId: string | undefined;
   let deviceModuleType: string | undefined;
+  let deviceProbes = 0;
 
   for (const device of devices) {
     const id = resourceId(device);
@@ -600,12 +670,23 @@ async function discover(): Promise<Fixture> {
     if (id === undefined || deviceModules.length === 0) {
       continue;
     }
-    const candidate = deviceModules[0];
+    // The module the `properties` value came from, when this device declares it:
+    // property names are module-scoped, so pairing them with a different module
+    // would leave the §12.3 cases sending a value that module has never heard of
+    // — which spec §12.5 M2 says comes back as an empty-stats 200, not an error.
+    const candidate =
+      deviceModules.find((name) => name === propertyModule) ??
+      deviceModules.find((name) => name === moduleType) ??
+      deviceModules[0];
     if (candidate === undefined) {
       continue;
     }
     deviceId ??= id;
     deviceModuleType ??= candidate;
+    if (deviceProbes >= DEVICE_METRIC_PROBES) {
+      break;
+    }
+    deviceProbes += 1;
 
     const outcome = await attempt(
       client.get<unknown>(deviceMetricsPath(id, candidate), {
@@ -628,6 +709,7 @@ async function discover(): Promise<Fixture> {
     moduleType,
     controlOk,
     probedModules: candidates,
+    moduleSource,
     baselineRows,
     itemType,
     propertyPath,
@@ -640,6 +722,90 @@ async function discover(): Promise<Fixture> {
     pinnedDeviceId,
     pinnedDeviceCount: devices.length,
     listCarriedCompany,
+  };
+}
+
+/**
+ * Count how many of the configured company's devices declare each module
+ * (spec §7.1).
+ *
+ * This is the source a metric module name has to come from. A metric read is
+ * scoped to a device's polling module — §12.3 puts one in the path, and §12.1 and
+ * §12.4 ask the same module across the company's devices — so the only list that
+ * can answer "which modules does this tenant report metrics for" is the devices'
+ * own `modules` maps. The catalogue that {@link discover} used to read instead
+ * describes what the *platform* can model, which is a different question and, on
+ * 2026-07-30 (02), a different answer.
+ *
+ * **Both the map key and the `module` field are counted.** §7.1 says the two need
+ * not match (`modules.deviceConfigs` carries `module: "snapshots"`) and does not
+ * say which one names the metric route; nothing in the spec does. Counting both
+ * costs one extra candidate in the probe order for each device module that
+ * renames itself, and guessing wrong costs the whole run — the same reason the
+ * probe tries several candidates rather than the top one.
+ *
+ * Ordered by descending device count, ties broken alphabetically so the probe
+ * order is deterministic across runs on the same estate.
+ */
+function moduleCensus(devices: readonly Device[]): readonly { name: string; devices: number }[] {
+  const counts = new Map<string, number>();
+  for (const device of devices) {
+    for (const name of deviceModuleNames(device)) {
+      counts.set(name, (counts.get(name) ?? 0) + 1);
+    }
+  }
+  return [...counts.entries()]
+    .map(([name, count]) => ({ name, devices: count }))
+    .sort((a, b) => b.devices - a.devices || a.name.localeCompare(b.name));
+}
+
+/**
+ * The modules §12.4 will be probed for, and one clause saying where they came
+ * from.
+ *
+ * Preference order, and the reason for each rung:
+ *
+ *  1. **The device census.** What this tenant actually polls (spec §7.1).
+ *  2. **`componenttypes` modules**, only for a company whose devices declare no
+ *     modules at all. It is the wrong catalogue for this question — that is
+ *     finding 1 of the 2026-07-30 (02) run — but on an estate with no device
+ *     modules to read it is the only vocabulary left, and an acceptance case
+ *     still needs a module name the API will parse. Anything data-dependent goes
+ *     UNVERIFIED regardless, so this rung cannot manufacture a false pass.
+ *  3. {@link FALLBACK_MODULE}, the vendor's own example module, for a tenant with
+ *     neither.
+ *
+ * The list is truncated to {@link MODULE_PROBE_LIMIT} rather than to one: §12.4
+ * serves some modules and not others (spec §12.5 M7), so the first candidate
+ * failing is an expected outcome and not a reason to stop.
+ */
+function moduleCandidates(
+  census: readonly { name: string; devices: number }[],
+  catalogueModules: readonly string[],
+  deviceCount: number,
+): { candidates: readonly string[]; moduleSource: string } {
+  if (census.length > 0) {
+    const ranked = census.slice(0, MODULE_PROBE_LIMIT);
+    return {
+      candidates: ranked.map((entry) => entry.name),
+      moduleSource:
+        `taken from the modules maps of the configured company's own device records (spec section 7.1) — ` +
+        `${String(census.length)} distinct module name(s) across ${String(deviceCount)} device record(s), ` +
+        `probed most-polled first: ${ranked.map((entry) => `${entry.name} (${String(entry.devices)} device(s))`).join(', ')}`,
+    };
+  }
+  if (catalogueModules.length > 0) {
+    const ranked = catalogueModules.slice(0, MODULE_PROBE_LIMIT);
+    return {
+      candidates: ranked,
+      moduleSource:
+        `NO device record in the configured company declared a module, so these fall back to the module names in the componenttypes catalogue (spec section 6.4). ` +
+        `That catalogue describes what the PLATFORM can model, not what this tenant polls, and the 2026-07-30 (02) run recorded that probing it yields modules whose metrics this tenant does not report`,
+    };
+  }
+  return {
+    candidates: [FALLBACK_MODULE],
+    moduleSource: `neither this company's device records nor its componenttypes catalogue named a module, so the only candidate is the module the vendor's own section 12.1/12.3 examples use`,
   };
 }
 
@@ -714,8 +880,14 @@ function findItemTypePair(
 }
 
 /**
- * spec §7.1: `modules` is a map whose *key* need not equal the module name, so
- * the `module` field is read rather than the key.
+ * The module names a device declares (spec §7.1), `module` field first.
+ *
+ * §7.1 records that the map *key* need not equal the `module` field
+ * (`modules.deviceConfigs` → `module: "snapshots"`) and documents no rule for
+ * which of the two names the metric route. So both are returned, the `module`
+ * field first because it is the field the spec calls the module name — the
+ * candidate list is probed in order and an extra name costs one bounded probe,
+ * while omitting the right one costs the run.
  */
 function deviceModuleNames(device: Device): readonly string[] {
   const modules = device.modules;
@@ -723,9 +895,12 @@ function deviceModuleNames(device: Device): readonly string[] {
     return [];
   }
   const names: string[] = [];
-  for (const value of Object.values(modules)) {
+  for (const [key, value] of Object.entries(modules)) {
     if (isRecord(value) && isNonEmptyString(value['module'])) {
       names.push(value['module']);
+    }
+    if (isNonEmptyString(key)) {
+      names.push(key);
     }
   }
   return [...new Set(names)];
@@ -2541,7 +2716,7 @@ describe.skipIf(!RUNNABLE)('live contract: spec 12.4 — per-module availability
               }${probe.propertyPaths.length > 0 ? ` [${String(probe.propertyPaths.length)} property name(s)]` : ''}`,
           )
           .join('; ') +
-          `. ${String(served.length)} of ${String(probes.length)} module(s) served. A "no API answer — transport failure (invalid_response)" line here is the HTML-error-page case: the body was not JSON, which contradicts section 1 ("The API uses JSON as its data format") as well as the section 3 status table`,
+          `. ${String(served.length)} of ${String(probes.length)} module(s) served; modules ${fx().moduleSource}. A "no API answer — transport failure (invalid_response)" line here is the HTML-error-page case: the body was not JSON, which contradicts section 1 ("The API uses JSON as its data format") as well as the section 3 status table`,
       );
     },
     TIMEOUT,
@@ -2558,7 +2733,7 @@ describe.skipIf(!RUNNABLE)('live contract: spec 12.4 — per-module availability
           ctx,
           '12.4',
           claim,
-          `no property name was returned by metrics/summaries for any module probed (${state.probedModules.join(', ')}). Since spec section 12.5 M1 makes the parameter REQUIRED on sections 12.1-12.3 and section 12.5 M6 records that no other endpoint enumerates the values, a caller on this tenant has no documented way to construct a legal metric request at all — which is the finding, not an absence of one`,
+          `no property name was returned by metrics/summaries for any module probed (${state.probedModules.join(', ')} — ${state.moduleSource}). Since spec section 12.5 M1 makes the parameter REQUIRED on sections 12.1-12.3 and section 12.5 M6 records that no other endpoint enumerates the values, a caller on this tenant has no documented way to construct a legal metric request at all — which is the finding, not an absence of one`,
         );
       }
       recordObserved(

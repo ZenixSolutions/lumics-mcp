@@ -83,6 +83,66 @@ export const METRIC_MIN_INTERVALS_DEFAULT = 40;
 export const METRIC_PROPERTY_TYPE_GROUPS = ['Calculated', 'Rate', 'TimeTicks'] as const;
 
 /**
+ * The two **company-scoped** metric endpoints, recognised from the path.
+ *
+ * spec §12.1 `/metrics/companies/:c/modules/:m` and spec §12.2 the same with
+ * `/summarize`. Deliberately anchored and deliberately narrow: the device-scoped
+ * paths of spec §12.3 begin `/metrics/devices/` and must NOT match, because they
+ * are the endpoints that work (§12.5 M12) and the ones a failure here sends the
+ * model to.
+ *
+ * It exists because `src/api/errors.ts` has to tell a 500 from these two apart
+ * from a 500 anywhere else, and the only thing it is given is the operation
+ * string `${method} ${path}` that `src/api/client.ts` builds. Matching a path
+ * shape is not "inventing an endpoint": every path this pattern can match is
+ * produced by `companyMetricsPath`/`companyMetricsSummarizePath` in
+ * `src/api/paths.ts` and by nothing else.
+ */
+export const COMPANY_SCOPED_METRIC_PATH_PATTERN =
+  /^\/metrics\/companies\/[^/]+\/modules\/[^/]+(?:\/summarize)?$/;
+
+/**
+ * spec §12.5 M12, MEASURED 2026-07-30: query parameters whose presence
+ * **coincided with** an HTTP 500 from spec §12.1 on a live tenant.
+ *
+ * Written as "coincided with" and not "caused", because that is all that was
+ * observed: two contract runs plus a manual probe, one tenant, one day. No
+ * mechanism was established and none is claimed. They are named anyway, because a
+ * model that has just been 500'd has no other way to know which lever to move,
+ * and "the arguments are irrelevant" — what the generic 500 guidance says — is the
+ * one thing the evidence positively contradicts.
+ *
+ * Nothing validates against this list and nothing is stripped from a request
+ * because of it. It is disclosure, not policy: the parameters are still offered
+ * and still sent if a caller asks for them.
+ */
+export const COMPANY_METRIC_500_CORRELATED_PARAMS: readonly string[] = [
+  'lastMetric',
+  'isMonitored',
+  'minIntervals',
+  'limit',
+  'interval=minute',
+  'interval=fiveMin',
+];
+
+/**
+ * spec §12.5 M12, MEASURED 2026-07-30: the counterpart list — parameters that
+ * were **served** on the same endpoint, in the same runs, against the same
+ * tenant.
+ *
+ * This half is what keeps the disclosure honest. §12.1 is intermittent, not dead:
+ * a minimal query returned 200, and so did these. Telling a model only about the
+ * failures would produce the blanket "this is broken" that the measurement does
+ * not support.
+ */
+export const COMPANY_METRIC_500_SERVED_PARAMS: readonly string[] = [
+  'interval=hour',
+  'interval=day',
+  'aggregate',
+  'alignTimeRange',
+];
+
+/**
  * Timeout for spec §12.2 `/summarize`, which is in a different class of slow from
  * every other endpoint in this API.
  *

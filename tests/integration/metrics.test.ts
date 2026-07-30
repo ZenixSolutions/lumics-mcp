@@ -19,6 +19,8 @@
 
 import { describe, expect, it } from 'vitest';
 import {
+  COMPANY_METRIC_500_CORRELATED_PARAMS,
+  COMPANY_METRIC_500_SERVED_PARAMS,
   DEFAULT_LIST_LIMIT,
   DEFAULT_MAX_ATTEMPTS,
   DEFAULT_METRIC_DATA_POINTS,
@@ -929,6 +931,170 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
     expect(payload).toEqual({
       devices: [item('a', 1)],
       pools: [item('p', 2)],
+    });
+  });
+
+  /**
+   * Live contract finding: the §12.4 `data` object is not uniformly item classes.
+   * A probe against a real tenant returned `{"count":0,...,"data":{"company":"<id>"}}`
+   * — a scalar sitting inside `data` beside the classes. The unwrapper collected
+   * only array-valued entries, so anything else vanished with nothing said, and a
+   * partial view of `data` read as the whole of it.
+   *
+   * The fix keeps the two kinds of non-array entry apart: `company` is request
+   * metadata (no rows are missing, so no alarm), while a key nobody anticipated is
+   * exactly where silence is dangerous and gets an incompleteness warning.
+   */
+  describe('non-array entries in the "data" object are disclosed, not dropped', () => {
+    const COMPANY_SCALAR = 'company-scalar-id';
+
+    it('says nothing new when every "data" entry is an item class', async () => {
+      const { payload, notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp' },
+        summary([item('a', 10)]),
+      );
+      expect(payload).toEqual([item('a', 10)]);
+      expect(notes).not.toContain('REQUEST METADATA INSIDE "data"');
+      expect(notes).not.toContain('UNRECOGNISED NON-ARRAY');
+    });
+
+    it('reports a "company" scalar as request metadata without implying missing rows', async () => {
+      const { payload, notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp' },
+        { data: { devices: [item('a', 10)], company: COMPANY_SCALAR }, count: 1 },
+      );
+      // The genuine item class is still returned exactly as before.
+      expect(payload).toEqual([item('a', 10)]);
+      expect(notes).toContain('REQUEST METADATA INSIDE "data"');
+      expect(notes).toContain(`company="${COMPANY_SCALAR}"`);
+      expect(notes).toContain('NOT a class of summarised items');
+      expect(notes).toContain('NO ' + 'items are missing because of it');
+      // A known-metadata entry must not raise the incompleteness alarm.
+      expect(notes).not.toContain('UNRECOGNISED NON-ARRAY');
+      expect(notes).not.toContain('INCOMPLETE');
+    });
+
+    it('warns that the result is incomplete when an unrecognised non-array entry appears', async () => {
+      const { payload, notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp' },
+        { data: { devices: [item('a', 10)], surprise: 42 }, count: 1 },
+      );
+      expect(payload).toEqual([item('a', 10)]);
+      expect(notes).toContain('UNRECOGNISED NON-ARRAY ENTRY IN "data"');
+      expect(notes).toContain('surprise=42');
+      expect(notes).toContain('INCOMPLETE');
+      expect(notes).toContain('report it as an API-contract gap');
+      expect(notes).not.toContain('REQUEST METADATA INSIDE "data"');
+    });
+
+    /**
+     * The note is emitted before the JSON payload and separated from it by
+     * position alone, so it must not contain `{` or `[` — a client scanning for
+     * the start of the JSON would stop inside the prose. A structural value is
+     * described, not dumped, and a long one cannot eat the output budget.
+     */
+    it('describes an unrecognised object entry without emitting JSON punctuation into the notes', async () => {
+      const { payload, notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp' },
+        { data: { devices: [item('a', 10)], surprise: { note: 'z'.repeat(500) } }, count: 1 },
+      );
+      expect(payload).toEqual([item('a', 10)]);
+      expect(notes).toContain('UNRECOGNISED NON-ARRAY ENTRY IN "data"');
+      expect(notes).toContain('surprise=<a non-array object with 1 key(s): note>');
+      expect(notes).not.toContain('z'.repeat(20));
+      expect(notes).not.toMatch(/[[\]{}]/);
+    });
+
+    it('does not quote a scalar that carries JSON punctuation into the notes', async () => {
+      const { notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp' },
+        { data: { devices: [item('a', 10)], surprise: '{"a":1}' }, count: 1 },
+      );
+      expect(notes).toContain('surprise=<a string value, not quoted here');
+      expect(notes).not.toMatch(/[[\]{}]/);
+    });
+
+    it('caps a very long scalar rather than letting it eat the output budget', async () => {
+      const { notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp' },
+        { data: { devices: [item('a', 10)], surprise: 'y'.repeat(500) }, count: 1 },
+      );
+      expect(notes).toContain('(truncated)');
+      expect(notes).not.toContain('y'.repeat(200));
+    });
+
+    it('does not call "data" empty when it held only a company scalar', async () => {
+      const { payload, notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp' },
+        { data: { company: COMPANY_SCALAR }, count: 0 },
+      );
+      expect(payload).toEqual({});
+      expect(notes).toContain('NO ITEMS:');
+      expect(notes).toContain('present and held 1 non-array entry (company)');
+      expect(notes).not.toContain('present but empty');
+      expect(notes).toContain(`company="${COMPANY_SCALAR}"`);
+    });
+
+    it('discloses a "data" object holding only unrecognised entries', async () => {
+      const { payload, notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp' },
+        { data: { company: COMPANY_SCALAR, surprise: 'x' }, count: 0 },
+      );
+      expect(payload).toEqual({});
+      expect(notes).toContain('UNRECOGNISED NON-ARRAY ENTRY IN "data"');
+      expect(notes).toContain('surprise="x"');
+      expect(notes).toContain('present and held 2 non-array entries (surprise, company)');
+      expect(notes).not.toContain('present but empty');
+    });
+
+    it('still says "present but empty" for a genuinely empty "data" object', async () => {
+      const { notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp' },
+        { data: {}, count: 0 },
+      );
+      expect(notes).toContain('NO ITEMS:');
+      expect(notes).toContain('present but empty');
+      expect(notes).not.toContain('non-array entr');
+    });
+
+    it('keeps ranking, trimming and class counting on the genuine item classes only', async () => {
+      const { payload, notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp', sortBy: 'Calculated.cpu.avg', topN: 1 },
+        {
+          data: {
+            devices: [item('a', 10), item('b', 90)],
+            pools: [item('p', 5), item('q', 50)],
+            company: COMPANY_SCALAR,
+          },
+          count: 4,
+        },
+      );
+      // The scalar is neither ranked, projected nor returned as a class.
+      expect(payload).toEqual({ devices: [item('b', 90)], pools: [item('q', 50)] });
+      // ...and it does not inflate the cross-class arithmetic.
+      expect(notes).toContain('Lumics returned 2 item classes (devices, pools)');
+      expect(notes).toContain('up to 2 row(s) can appear below');
+      expect(notes).toContain('REQUEST METADATA INSIDE "data"');
+    });
+
+    it('applies a fields projection to the classes while still disclosing the scalar', async () => {
+      const { payload, notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp', fields: ['name'] },
+        { data: { devices: [item('a', 10)], company: COMPANY_SCALAR }, count: 1 },
+      );
+      expect(payload).toEqual([{ name: 'a' }]);
+      expect(notes).toContain(`company="${COMPANY_SCALAR}"`);
     });
   });
 
@@ -1920,5 +2086,220 @@ describe('a timing-out summarize costs one deadline, not three (live finding 5, 
     expect(run.deadlines).toEqual([250_000]);
     expect(run.calls).toHaveLength(1);
     expect(run.text).toContain('250000ms');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live finding M12: the company-scoped endpoint is unreliable in practice
+// ---------------------------------------------------------------------------
+
+/**
+ * spec §12.5 M12, measured 2026-07-30 across two contract runs and a manual
+ * probe against a production tenant:
+ *
+ *  - §12.1 returned **HTTP 500** on ordinary queries carrying a valid
+ *    `properties` value, and the failures tracked specific parameters while
+ *    others — and a minimal query — were served. Intermittent, not dead.
+ *  - §12.2 `/summarize` never returned at all.
+ *  - §12.3, device-scoped, answered with populated data in one to two seconds.
+ *  - The vendor's own dashboard issued 57 API calls on load, including its top-N
+ *    device widgets, and never once called `/api/v1/metrics/companies/`.
+ *
+ * The owner's decision was to **document, not withhold**. These tests hold the
+ * documentation to that: the two tools must say what was observed, with its
+ * conditions, name the fallback tools, and stop short of "this is broken" — and
+ * a 500 must reach the model as endpoint-aware advice rather than as a flat
+ * internal error, on these two endpoints and on no others.
+ */
+describe('the company-scoped metric tools disclose that the endpoint is unreliable (spec section 12.5 M12)', () => {
+  const COMPANY_SCOPED = [
+    'lumics_get_company_metrics',
+    'lumics_summarize_company_metrics',
+  ] as const;
+  const DEVICE_SCOPED = ['lumics_get_device_metrics', 'lumics_get_device_item_metrics'] as const;
+
+  /** Read a tool's registered description without issuing a request. */
+  async function describeTool(name: string): Promise<string> {
+    const harness = await connect(makeConfig(), {
+      clientOptions: { fetchImpl: recordFetch(jsonResponse(SERIES)).fetchImpl },
+    });
+    try {
+      return harness.tool(name)?.description ?? '';
+    } finally {
+      await harness.close();
+    }
+  }
+
+  it.each(COMPANY_SCOPED)('%s warns that the endpoint is unreliable in practice', async (name) => {
+    const description = await describeTool(name);
+
+    expect(description).toContain('UNRELIABLE IN PRACTICE');
+    expect(description).toContain('spec section 12.5 M12');
+    // Both observed failures, on both tools: a model choosing between them needs
+    // to know that neither company-scoped route is dependable.
+    expect(description).toContain('HTTP 500');
+    expect(description).toMatch(/did not return AT ALL over 90 seconds/);
+  });
+
+  it.each(COMPANY_SCOPED)('%s names the parameters that correlated with a 500', async (name) => {
+    const description = await describeTool(name);
+
+    for (const param of COMPANY_METRIC_500_CORRELATED_PARAMS) {
+      expect(description).toContain(param);
+    }
+    for (const param of COMPANY_METRIC_500_SERVED_PARAMS) {
+      expect(description).toContain(param);
+    }
+  });
+
+  it.each(COMPANY_SCOPED)(
+    '%s routes the model to the device-scoped tools by name',
+    async (name) => {
+      const description = await describeTool(name);
+
+      expect(description).toContain('lumics_list_devices');
+      expect(description).toContain('lumics_get_device_metrics');
+      expect(description).toContain('lumics_get_device_item_metrics');
+      expect(description).toMatch(/one to two seconds/);
+    },
+  );
+
+  it.each(COMPANY_SCOPED)('%s records the vendor UI observation', async (name) => {
+    // The strongest single piece of evidence: the product that owns the API does
+    // not use this route for company-wide metrics.
+    const description = await describeTool(name);
+
+    expect(description).toContain('57 API calls');
+    expect(description).toContain('/api/v1/metrics/companies/');
+  });
+
+  it.each(COMPANY_SCOPED)('%s does not overstate it as simply broken', async (name) => {
+    const description = await describeTool(name);
+
+    // §12.1 served a minimal query. Saying otherwise would be as wrong as
+    // saying nothing, and would push a model off a tool that still answers.
+    expect(description).toContain('INTERMITTENT AND QUERY-DEPENDENT, NOT DEAD');
+    expect(description).toMatch(/No cause has been established/);
+  });
+
+  it.each(DEVICE_SCOPED)(
+    '%s carries no such warning — it is the endpoint that works',
+    async (name) => {
+      const description = await describeTool(name);
+      expect(description).not.toContain('UNRELIABLE IN PRACTICE');
+    },
+  );
+
+  /** A fetch that answers the device ownership pre-read and 500s everything else. */
+  function serverErrorFetch(): FetchRecorder {
+    return recordFetch((call) =>
+      call.path.startsWith(`/companies/${C}/devices/`)
+        ? jsonResponse(OWNED_DEVICE)
+        : errorResponse(500, '{"error":"Sorry, an error occurred. Please try again.","code":500}'),
+    );
+  }
+
+  async function failWith500(
+    tool: string,
+    args: Record<string, unknown>,
+  ): Promise<{ readonly text: string; readonly calls: readonly RecordedCall[] }> {
+    const fetcher = serverErrorFetch();
+    const sleeper = recordSleep();
+    const harness = await connect(makeConfig(), {
+      clientOptions: { fetchImpl: fetcher.fetchImpl, sleep: sleeper.sleep },
+    });
+    try {
+      const called = await harness.call(tool, args);
+      expect(called.isError, `${tool} was expected to fail`).toBe(true);
+      const block = called.content[0];
+      return { text: block?.type === 'text' ? block.text : '', calls: fetcher.calls };
+    } finally {
+      await harness.close();
+    }
+  }
+
+  it.each([
+    ['lumics_get_company_metrics', { moduleType: 'snmp', properties: PROPS }],
+    ['lumics_summarize_company_metrics', { moduleType: 'snmp', properties: PROPS }],
+  ] as const)(
+    '%s reports a 500 as a known-unreliable endpoint, not an internal error',
+    async (tool, args) => {
+      const { text } = await failWith500(tool, { ...args });
+
+      expect(text).toContain('500');
+      expect(text).toMatch(/KNOWN TO BE UNRELIABLE IN PRACTICE/);
+      // The generic advice this replaces is the actively misleading part: on this
+      // endpoint the arguments do correlate, and there is a working alternative.
+      expect(text).not.toContain('This is not a problem with your arguments');
+      expect(text).toContain('lumics_list_devices');
+      expect(text).toContain('lumics_get_device_metrics');
+      // A 500 is not an absence of data, and must not be reported as one.
+      expect(text).toMatch(/NOT evidence that this company, module or metric has no data/);
+    },
+  );
+
+  it.each([
+    ['lumics_get_company_metrics', { moduleType: 'snmp', properties: PROPS }],
+    ['lumics_summarize_company_metrics', { moduleType: 'snmp', properties: PROPS }],
+  ] as const)('%s fails fast on a 500 rather than spending attempts on it', async (tool, args) => {
+    const { calls } = await failWith500(tool, { ...args });
+
+    // One request to the metric endpoint. A 500 has never been in
+    // RETRYABLE_STATUSES, and the error now says so instead of claiming the
+    // server "already retried where safe".
+    const metricCalls = calls.filter((call) => call.path.startsWith('/metrics/'));
+    expect(metricCalls).toHaveLength(1);
+  });
+
+  it('leaves a 500 from the device-scoped endpoint on the generic guidance', async () => {
+    // §12.3 is the endpoint that works. A 500 there is a genuine surprise and
+    // the generic mapping is the right thing to say about it.
+    const { text } = await failWith500('lumics_get_device_metrics', {
+      deviceId: TEST_DEVICE_ID,
+      moduleType: 'snmp',
+      properties: PROPS,
+    });
+
+    expect(text).toContain('This is not a problem with your arguments');
+    expect(text).not.toMatch(/KNOWN TO BE UNRELIABLE/);
+  });
+
+  it('leaves a 500 from a non-metric endpoint on the generic guidance', async () => {
+    const fetcher = recordFetch(errorResponse(500));
+    const sleeper = recordSleep();
+    const harness = await connect(makeConfig(), {
+      clientOptions: { fetchImpl: fetcher.fetchImpl, sleep: sleeper.sleep },
+    });
+    try {
+      const called = await harness.call('lumics_list_devices', {});
+      expect(called.isError).toBe(true);
+      const block = called.content[0];
+      const text = block?.type === 'text' ? block.text : '';
+      expect(text).toContain('This is not a problem with your arguments');
+      expect(text).not.toMatch(/KNOWN TO BE UNRELIABLE/);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('still retries a transient 503 on the company-scoped endpoint', async () => {
+    // The fail-fast is about 500 specifically. Capping attempts on this endpoint
+    // would also disable the retries that cover genuinely transient statuses,
+    // which is a control this change must not weaken.
+    const fetcher = recordFetch([errorResponse(503), jsonResponse(SERIES)]);
+    const sleeper = recordSleep();
+    const harness = await connect(makeConfig(), {
+      clientOptions: { fetchImpl: fetcher.fetchImpl, sleep: sleeper.sleep },
+    });
+    try {
+      const called = await harness.call('lumics_get_company_metrics', {
+        moduleType: 'snmp',
+        properties: PROPS,
+      });
+      expect(called.isError).not.toBe(true);
+      expect(fetcher.calls).toHaveLength(2);
+    } finally {
+      await harness.close();
+    }
   });
 });

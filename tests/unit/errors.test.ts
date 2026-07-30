@@ -19,6 +19,10 @@ import {
   LumicsInputError,
   type LumicsErrorCode,
 } from '../../src/api/errors.js';
+import {
+  COMPANY_METRIC_500_CORRELATED_PARAMS,
+  COMPANY_METRIC_500_SERVED_PARAMS,
+} from '../../src/constants.js';
 import { clearRegisteredSecrets, registerSecret, REDACTED } from '../../src/util/redact.js';
 
 interface StatusCase {
@@ -137,6 +141,138 @@ describe('LumicsApiError.fromStatus maps every documented status of spec section
     });
     expect(error.retryAfterMs).toBe(2_000);
     expect(error.attempts).toBe(3);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// spec §12.5 M12 — a 500 from the company-scoped metric endpoint is not generic
+// ---------------------------------------------------------------------------
+
+/**
+ * The generic 500 guidance tells a model two things that are true everywhere
+ * else in this API and false on spec §12.1/§12.2: that its arguments are
+ * irrelevant to the failure, and that reporting the failure is all that is left.
+ * Measured on 2026-07-30 (spec §12.5 M12), the 500s from that endpoint tracked
+ * specific query parameters while other parameters and a minimal query were
+ * served, and the device-scoped endpoints answered the same tenant in one to two
+ * seconds.
+ *
+ * These tests pin both halves: the endpoint-aware guidance fires where it was
+ * measured, and **nowhere else** — a 500 from any other path, and any other
+ * status from this path, keeps spec §3's mapping untouched.
+ */
+describe('a 500 from the company-scoped metric endpoint carries endpoint-aware guidance (spec section 12.5 M12)', () => {
+  const COMPANY_METRICS = `GET /metrics/companies/${'a'.repeat(24)}/modules/snmp`;
+  const SUMMARIZE = `${COMPANY_METRICS}/summarize`;
+  const DEVICE_METRICS = `GET /metrics/devices/${'b'.repeat(24)}/modules/snmp`;
+
+  it.each([COMPANY_METRICS, SUMMARIZE])(
+    'names the endpoint as known-unreliable rather than as a flat internal error on "%s"',
+    (operation) => {
+      const error = LumicsApiError.fromStatus(500, { operation });
+
+      // Still a 500 and still classified as one: the taxonomy does not change.
+      expect(error.code).toBe('server_error');
+      expect(error.status).toBe(500);
+
+      expect(error.message).toMatch(/KNOWN TO BE UNRELIABLE IN PRACTICE/);
+      expect(error.message).toContain('spec section 12.5 M12');
+      // The generic claim that is wrong here must not survive.
+      expect(error.message).not.toContain('This is not a problem with your arguments');
+      expect(error.message).toMatch(/YOUR ARGUMENTS DO CORRELATE WITH THIS FAILURE/);
+    },
+  );
+
+  it.each([COMPANY_METRICS, SUMMARIZE])(
+    'names the parameters that correlated and the ones that were served on "%s"',
+    (operation) => {
+      const error = LumicsApiError.fromStatus(500, { operation });
+
+      for (const param of COMPANY_METRIC_500_CORRELATED_PARAMS) {
+        expect(error.message).toContain(param);
+      }
+      for (const param of COMPANY_METRIC_500_SERVED_PARAMS) {
+        expect(error.message).toContain(param);
+      }
+      // Not overstated: §12.1 is intermittent, not dead, and a minimal query was
+      // served. A model told "this is broken" abandons a tool that still works.
+      expect(error.message).toMatch(/intermittent and query-dependent rather than dead/);
+      expect(error.message).toContain('No cause has been established');
+    },
+  );
+
+  it.each([COMPANY_METRICS, SUMMARIZE])(
+    'routes the model to the device-scoped tools by name from "%s"',
+    (operation) => {
+      const error = LumicsApiError.fromStatus(500, { operation });
+
+      expect(error.message).toContain('lumics_list_devices');
+      expect(error.message).toContain('lumics_get_device_metrics');
+      expect(error.message).toContain('lumics_get_device_item_metrics');
+      expect(error.message).toMatch(/one to two seconds/);
+      // And the disclosure that stops a failure being reported as an absence.
+      expect(error.message).toMatch(/NOT evidence that this company, module or metric has no data/);
+    },
+  );
+
+  it('says the /summarize half has never returned at all, and only for /summarize', () => {
+    const summarize = LumicsApiError.fromStatus(500, { operation: SUMMARIZE });
+    expect(summarize.message).toMatch(/NEVER returned at all/);
+    expect(summarize.message).toContain('90 seconds');
+
+    const perItem = LumicsApiError.fromStatus(500, { operation: COMPANY_METRICS });
+    expect(perItem.message).not.toMatch(/NEVER returned at all/);
+  });
+
+  /**
+   * The retry decision, asserted rather than described. A 500 has never been in
+   * `RETRYABLE_STATUSES`, so the client already fails fast; what changes here is
+   * the flag, which used to say the opposite of both the behaviour and the advice.
+   */
+  it('is marked not retryable, and says the call was not retried', () => {
+    const error = LumicsApiError.fromStatus(500, { operation: COMPANY_METRICS });
+    expect(error.retryable).toBe(false);
+    expect(error.message).toMatch(/did NOT retry/);
+  });
+
+  it('leaves a 500 from the device-scoped metric endpoints entirely alone', () => {
+    const error = LumicsApiError.fromStatus(500, { operation: DEVICE_METRICS });
+
+    // The endpoint that works keeps the generic mapping, flag and all.
+    expect(error.message).toContain('This is not a problem with your arguments');
+    expect(error.message).not.toMatch(/KNOWN TO BE UNRELIABLE/);
+    expect(error.retryable).toBe(true);
+  });
+
+  it.each(['GET /companies/c/devices', 'GET /companies/c/metrics/summaries/snmp'])(
+    'leaves a 500 from "%s" on the generic guidance',
+    (operation) => {
+      const error = LumicsApiError.fromStatus(500, { operation });
+      expect(error.message).toContain('This is not a problem with your arguments');
+      expect(error.message).not.toMatch(/KNOWN TO BE UNRELIABLE/);
+      expect(error.retryable).toBe(true);
+    },
+  );
+
+  it('leaves every other status on this path mapped exactly as spec section 3 says', () => {
+    // M12 is a finding about 500 and nothing else. A 400 here is still a 400:
+    // widening the endpoint-awareness to other statuses would be inventing a
+    // measurement.
+    const badRequest = LumicsApiError.fromStatus(400, { operation: COMPANY_METRICS });
+    expect(badRequest.code).toBe('bad_request');
+    expect(badRequest.message).toContain('Do not retry the identical call');
+    expect(badRequest.message).not.toMatch(/KNOWN TO BE UNRELIABLE/);
+
+    const notFound = LumicsApiError.fromStatus(404, { operation: SUMMARIZE });
+    expect(notFound.message).not.toMatch(/KNOWN TO BE UNRELIABLE/);
+  });
+
+  it('does not fire on an operation that is not a method-and-path pair', () => {
+    // Tools build their own operation strings (`PATCH device <id>`), so the
+    // matcher must not guess when there is no path to match.
+    const error = LumicsApiError.fromStatus(500, { operation: 'PATCH device abc' });
+    expect(error.message).toContain('This is not a problem with your arguments');
+    expect(error.retryable).toBe(true);
   });
 });
 

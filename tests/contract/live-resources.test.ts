@@ -325,8 +325,32 @@ describe.skipIf(!RUNNABLE)('live contract: spec 5 — collectors', () => {
 // ---------------------------------------------------------------------------
 
 describe.skipIf(!RUNNABLE)('live contract: spec 6.4 — componenttypes', () => {
+  /**
+   * The composition rule this case asserts is **not** §6.4's.
+   *
+   * §6.4 documents `id` as `<module>_<group>_<type>`, and the 2026-07-30 (02) run
+   * failed on it: `snmp_common_ups_upsbatteries` carries all four fields, so the
+   * documented rule would have made its id `snmp_common_ups`. That is not a
+   * one-off — the same catalogue has 6 ids with four underscore-separated
+   * segments and 41 with two and no `type` at all — so the two-part concatenation
+   * is simply not a rule this API honours, and asserting it fails a run over a
+   * documentation defect that is already recorded (spec §6.4, §12.5 M4).
+   *
+   * What *is* true, and is what a consumer can rely on, is the **prefix**
+   * relationship: an id begins `<module>_<group>_` and, when `type` is present,
+   * the remainder starts with `type`. That is asserted here; the vendor's rule is
+   * recorded as broken in the spec rather than enforced against the API.
+   *
+   * No product code depends on the broken rule: the server copies a
+   * `componenttypes` id verbatim into the `:component` path segment and never
+   * composes one. The rule it *does* bear on is the `itemType` construction rule
+   * in spec §12.5 M3 — §6.5 `filePath` module/group joined to `data.itemType`
+   * with `_` — which was inferred from a single example (`snmp_common_cpu`) and
+   * is still **unvalidated**; if ids can carry a fourth segment here, that rule
+   * may be incomplete in the same way. See the §12.5 M3 note in the spec.
+   */
   it(
-    'ASSERT: componenttypes entries carry id, module and group, and compose id from them',
+    'ASSERT: componenttypes entries carry id, module and group, and id is prefixed by them',
     // Synchronous: the catalogue was fetched once during discovery and reused.
     (ctx) => {
       const types = fx().componentTypes;
@@ -334,11 +358,12 @@ describe.skipIf(!RUNNABLE)('live contract: spec 6.4 — componenttypes', () => {
         unverifiable(
           ctx,
           '6.4',
-          'componenttypes returns objects of the form {id: "<module>_<group>_<type>", module, group, type}',
+          'componenttypes returns objects of the form {id, module, group, type} whose id begins "<module>_<group>_"',
           'this tenant returned no component types at all',
         );
       }
 
+      let fourSegment = 0;
       for (const type of types) {
         // `type` is deliberately NOT required here: spec §12.5 M4 measured 41 of
         // 246 entries without it, and the case below owns that claim. The other
@@ -350,18 +375,39 @@ describe.skipIf(!RUNNABLE)('live contract: spec 6.4 — componenttypes', () => {
             typeof type.group === 'string',
           `a component type came back missing one of id, module or group (keys: ${keysOf(type).join(',')}). lumics_list_component_types and every :component path argument depend on those three; spec section 6.4 documents a fourth, "type", which the 2026-07-30 run found to be conditional (spec section 14 defect 20) and which the following case measures.`,
         ).toBe(true);
+        if (
+          typeof type.id !== 'string' ||
+          typeof type.module !== 'string' ||
+          typeof type.group !== 'string'
+        ) {
+          continue;
+        }
+        const prefix = `${type.module}_${type.group}_`;
+        expect(
+          type.id.startsWith(prefix),
+          `a componenttypes id does not begin with its own "<module>_<group>_": id "${type.id}" against module/group prefix "${prefix}". spec section 6.4 documents the stronger rule id === "<module>_<group>_<type>", which the 2026-07-30 (02) run REFUTED (snmp_common_ups_upsbatteries has all four fields and four segments), so what is asserted here is the prefix relationship that survived it. Component type ids are what a caller passes as :component, so if even the prefix has stopped holding, lumics_list_component_types output can no longer be related to its module and group at all. Report this.`,
+        ).toBe(true);
         if (typeof type.type === 'string') {
+          const remainder = type.id.slice(prefix.length);
+          // Underscore-delimited containment, not equality and not a fixed
+          // position: `snmp_common_ups_upsbatteries` (type `ups`) is the only
+          // four-segment form measured, and one example is not enough to claim
+          // the extra segment is always the *last* one. What it does establish is
+          // that `type` is one of the id's segments rather than a free string.
           expect(
-            type.id,
-            `spec section 6.4 documents id as "<module>_<group>_<type>"; this entry has all four fields and composes differently. Component type ids are what a caller passes as :component, so the composition rule matters.`,
-          ).toBe(`${type.module}_${type.group}_${type.type}`);
+            `_${remainder}_`.includes(`_${type.type}_`),
+            `a componenttypes id does not contain its own "type" field as a segment after "<module>_<group>_": id "${type.id}", type "${type.type}". spec section 6.4 documents id === "<module>_<group>_<type>", which the 2026-07-30 (02) run REFUTED — snmp_common_ups_upsbatteries has all four fields and a fourth segment the documented rule cannot express — so what is asserted here is the containment relationship that survived it. See the MEASURED note at spec section 6.4.`,
+          ).toBe(true);
+          if (remainder !== type.type) {
+            fourSegment += 1;
+          }
         }
       }
 
       recordAsserted(
         '6.4',
-        'componenttypes entries carry id, module and group, and where "type" is present id === module_group_type',
-        `${String(types.length)} type(s) checked`,
+        'a componenttypes id begins "<module>_<group>_" and, where "type" is present, continues with it — NOT the id === module_group_type composition spec section 6.4 documents (refuted 2026-07-30 run 02)',
+        `${String(types.length)} type(s) checked; ${String(fourSegment)} carried extra segment(s) beyond "type", which the documented composition rule cannot express (2026-07-30 run 02 measured 6 such ids of 246)`,
       );
     },
     TIMEOUT,

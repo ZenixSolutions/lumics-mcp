@@ -19,6 +19,11 @@
  * we capture a bounded, redacted snippet and move on.
  */
 
+import {
+  COMPANY_METRIC_500_CORRELATED_PARAMS,
+  COMPANY_METRIC_500_SERVED_PARAMS,
+  COMPANY_SCOPED_METRIC_PATH_PATTERN,
+} from '../constants.js';
 import { redactString, redactedMessage } from '../util/redact.js';
 
 /** Machine-readable classification, stable across releases. */
@@ -167,6 +172,90 @@ const STATUS_MAP: Readonly<Record<number, StatusMapping>> = {
   },
 };
 
+// ---------------------------------------------------------------------------
+// The one endpoint whose 500 means something more specific than "500"
+// ---------------------------------------------------------------------------
+
+/**
+ * The path half of an `operation`, which `LumicsClient.request` builds as
+ * `${method} ${path}`.
+ *
+ * A tool can also construct its own operation string (`PATCH device <id>`), so
+ * this returns `undefined` rather than guessing when the second token is not a
+ * path. Nothing below fires on `undefined`, which is the safe direction: the
+ * generic guidance is never wrong, only less specific.
+ */
+function pathOf(operation: string | undefined): string | undefined {
+  const parts = (operation ?? '').trim().split(/\s+/);
+  const candidate = parts[1];
+  return candidate !== undefined && candidate.startsWith('/') ? candidate : undefined;
+}
+
+/** True for spec §12.1 and §12.2 only. spec §12.3's device paths are excluded. */
+function isCompanyScopedMetricPath(operation: string | undefined): boolean {
+  const path = pathOf(operation);
+  return path !== undefined && COMPANY_SCOPED_METRIC_PATH_PATTERN.test(path);
+}
+
+/** True for spec §12.2 specifically — the half that has never been seen to answer. */
+function isSummarizePath(operation: string | undefined): boolean {
+  return isCompanyScopedMetricPath(operation) && pathOf(operation)?.endsWith('/summarize') === true;
+}
+
+/**
+ * What a 500 from spec §12.1 or §12.2 means, as opposed to what a 500 means
+ * anywhere else in this API.
+ *
+ * The generic 500 guidance says two things that are actively misleading here:
+ *
+ *  1. **"This is not a problem with your arguments."** On every other endpoint
+ *     that is the right thing to say. On this one it is the opposite of what was
+ *     measured (spec §12.5 M12): the 500s tracked specific query parameters, and
+ *     the same endpoint served the same tenant when those parameters were left
+ *     out. No mechanism has been established and none is claimed — but a model
+ *     told its arguments are irrelevant will not try the one change that has been
+ *     observed to work.
+ *  2. **"report the failure rather than reissuing the same call."** Reporting a
+ *     failure is right; stopping there is not, because there is a documented
+ *     alternative that answers the same question. The device-scoped endpoints
+ *     (spec §12.3) returned populated data in one to two seconds in every run,
+ *     and the vendor's own product does not use the company-scoped endpoint for
+ *     company-wide metrics at all.
+ *
+ * Deliberately **not** overstated. §12.1 is intermittent, not dead: a minimal
+ * query was served, and so were `interval=hour`, `interval=day`, `aggregate` and
+ * `alignTimeRange`. The text says what was observed, under which conditions, and
+ * offers the narrowed retry as a second option rather than declaring the tool
+ * useless.
+ */
+function companyMetricServerErrorGuidance(operation: string | undefined): string {
+  const correlated = COMPANY_METRIC_500_CORRELATED_PARAMS.join(', ');
+  const served = COMPANY_METRIC_500_SERVED_PARAMS.join(', ');
+  const summarize = isSummarizePath(operation)
+    ? ' This is the /summarize half (spec section 12.2), which is the worse of the two: across every live run it has NEVER returned at all — over 90 seconds, with and without itemType narrowing — so a failure from it says almost nothing about your query. Do not spend attempts tuning it.'
+    : '';
+
+  return (
+    'Lumics failed internally (500 Server Error) on the COMPANY-SCOPED metric endpoint (spec section 12.1/12.2). ' +
+    'THIS ENDPOINT IS KNOWN TO BE UNRELIABLE IN PRACTICE and this failure is not a surprise: measured against a ' +
+    'live tenant on 2026-07-30 (spec section 12.5 M12), it returned 500 on ordinary queries that carried a valid ' +
+    '"properties" value.' +
+    summarize +
+    ' UNLIKE a generic 500, YOUR ARGUMENTS DO CORRELATE WITH THIS FAILURE — do not read this as "nothing you can ' +
+    `change". The 500s coincided with ${correlated}; ${served} were served, as was a minimal query, so the endpoint ` +
+    'is intermittent and query-dependent rather than dead. No cause has been established; the correlation is what ' +
+    'was measured. This server did NOT retry the call, because a retry of an expensive query-dependent 500 spends ' +
+    'wall time to learn the same thing, and you should not reissue it unchanged either. WHAT TO DO INSTEAD, in ' +
+    'order of reliability: (1) GO DEVICE-SCOPED, which is the dependable path — the spec section 12.3 endpoints ' +
+    'returned populated data in one to two seconds in every run, so call lumics_list_devices to resolve the ' +
+    'devices you care about, then lumics_get_device_metrics for each one, or lumics_get_device_item_metrics for a ' +
+    'single component; it is more calls, and it is the path that works. (2) Or, since the endpoint is intermittent, ' +
+    'retry ONCE with the correlated parameters above dropped and interval=hour or interval=day. FINALLY: a 500 ' +
+    'here is NOT evidence that this company, module or metric has no data — nothing was measured either way — so ' +
+    'do not report an absence, a zero, or an empty estate on the strength of it.'
+  );
+}
+
 /** True when `status` is one of the ten codes spec §3 documents. */
 export function isDocumentedStatus(status: number): boolean {
   return Object.prototype.hasOwnProperty.call(STATUS_MAP, status);
@@ -232,7 +321,18 @@ export class LumicsApiError extends Error {
     },
   ): LumicsApiError {
     const mapped = STATUS_MAP[status];
+
+    // Endpoint-aware only where an endpoint has been measured behaving
+    // differently from the table, and only for the status that was measured.
+    // Everything else keeps spec §3's mapping exactly as it was: a 400 from this
+    // same path is still a 400, because nothing about §12.5 M12 concerns a 400.
+    const endpointSpecific =
+      status === 500 && isCompanyScopedMetricPath(options.operation)
+        ? companyMetricServerErrorGuidance(options.operation)
+        : undefined;
+
     const guidance =
+      endpointSpecific ??
       mapped?.guidance ??
       `Lumics returned HTTP ${String(status)}, which its documentation does not describe (spec section 3 lists only 200, 304, 400, 401, 403, 404, 409, 423, 429 and 500). Treat this as a transport or gateway fault, not as a result.`;
     const detail = options.bodySnippet ? ` Response body: ${options.bodySnippet}` : '';
@@ -243,7 +343,13 @@ export class LumicsApiError extends Error {
         status,
         code: mapped?.code ?? 'http_error',
         operation: options.operation,
-        retryable: mapped?.retryable ?? false,
+        // Fail fast, and say so in the flag as well as in the prose. The client
+        // has never retried a 500 (500 is absent from `RETRYABLE_STATUSES`), so
+        // this corrects metadata that already disagreed with behaviour — and on
+        // this endpoint the disagreement is load-bearing, because a caller acting
+        // on `retryable` would reissue an expensive call whose failure correlates
+        // with the very arguments it would send again.
+        retryable: endpointSpecific === undefined ? (mapped?.retryable ?? false) : false,
         ...(options.retryAfterMs === undefined ? {} : { retryAfterMs: options.retryAfterMs }),
         ...(options.attempts === undefined ? {} : { attempts: options.attempts }),
         ...(options.bodySnippet === undefined ? {} : { bodySnippet: options.bodySnippet }),

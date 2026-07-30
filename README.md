@@ -453,6 +453,42 @@ returns plural aliases and most of them are rejected with `400 Unknown component
 already returned. Lumics validates `itemType` **before** `properties`, so a wrong `itemType` hides a
 `properties` problem entirely: fix `itemType` first.
 
+### The company-scoped metric endpoint is unreliable; prefer the device-scoped tools
+
+`lumics_get_company_metrics` and `lumics_summarize_company_metrics` read
+`/api/v1/metrics/companies/...`, and that route did not answer dependably when it was measured
+against a production tenant on 2026-07-30 (spec §12.5 M12, §14 defect 25). What was observed:
+
+- **`lumics_get_company_metrics` returned HTTP 500 on ordinary queries** that carried a valid
+  `properties` value — `{"error":"Sorry, an error occurred. Please try again.","code":500}`. It
+  failed with `lastMetric`, `isMonitored`, `minIntervals` and `limit`, and with `interval=minute` and
+  `interval=fiveMin`. It **succeeded** with `interval=hour`, `interval=day`, `aggregate` and
+  `alignTimeRange`, and a minimal query returned 200 earlier the same day.
+- **`lumics_summarize_company_metrics` never returned at all** — over 90 seconds, with and without
+  `itemType` narrowing. That is the same finding as the slowness below, seen from the other side.
+- **The device-scoped tools worked throughout**, returning populated data in one to two seconds.
+- Browsing the vendor's own web application, a **company dashboard load issued 57 API calls,
+  including its "Top devices by CPU" and "Top devices by memory" widgets, and never once called
+  `/api/v1/metrics/companies/`.** The vendor's own product does not use this endpoint for
+  company-wide metrics.
+
+**This is intermittent and query-dependent, not a dead endpoint, and no cause has been established.**
+It is a correlation measured on one tenant on one day. Both tools are still registered and still
+work for some queries — the decision was to document this, not to withhold the capability.
+
+What to do with it:
+
+- **Prefer the device-scoped route for anything estate-wide.** List the devices you care about with
+  `lumics_list_devices`, then call `lumics_get_device_metrics` per device, or
+  `lumics_get_device_item_metrics` for one component. More calls, and it is the path that answered.
+- If you do use the company-scoped tools, **drop the parameters above** and prefer `interval=hour` or
+  `interval=day`.
+- **A 500 or a timeout there is not an absence of data.** The tool descriptions say so, and a 500 from
+  these two endpoints carries endpoint-specific guidance rather than the generic "this is not a
+  problem with your arguments" — because on this route the arguments do correlate with the failure.
+- The server does **not** retry a 500 here. It never has (500 is not in its retryable status set), and
+  the error now says so instead of implying a retry already happened.
+
 ### `lumics_summarize_company_metrics` is slow, and a timeout is not an empty result
 
 `metrics/.../summarize` aggregates every matching component in the company before it answers. It has
@@ -678,6 +714,16 @@ If the names are right and the rows are still empty, the metric may genuinely no
 those components. Confirm it in the Lumics UI before reporting it: the API gives no signal that
 distinguishes the two. See
 [Metric tools require a `properties` argument](#metric-tools-require-a-properties-argument-and-a-wrong-one-is-not-an-error).
+
+### A company metric call failed with a 500
+
+Expected, unfortunately. `/api/v1/metrics/companies/...` returned 500 on ordinary queries when it was
+measured, and the failures tracked specific parameters: drop `lastMetric`, `isMonitored`,
+`minIntervals` and `limit`, and use `interval=hour` or `interval=day` rather than `minute` or
+`fiveMin`. If it still fails, go device-scoped — `lumics_list_devices`, then
+`lumics_get_device_metrics` per device — which is the route that answered in every run. The failure is
+not evidence that the company has no data for that module. See
+[The company-scoped metric endpoint is unreliable](#the-company-scoped-metric-endpoint-is-unreliable-prefer-the-device-scoped-tools).
 
 ### A timestamp was rejected
 
