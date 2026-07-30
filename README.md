@@ -410,6 +410,67 @@ Consequences:
 - Some list endpoints (`component`, `componenttypes`, `deviceDefinitions/components`, and
   `metrics/summaries`) do not document even a `limit`.
 
+### Metric tools require a `properties` argument, and a wrong one is not an error
+
+`properties` is **required** on `lumics_get_company_metrics`, `lumics_summarize_company_metrics`,
+`lumics_get_device_metrics` and `lumics_get_device_item_metrics`. The vendor documentation calls it
+optional and is wrong: without it the API answers
+`400 "Must supply required component metrics as properties parameter"`, so those four tools cannot
+make a single successful call. It is required rather than defaulted because no metric name is
+correct for every module — a default would answer a question nobody asked. It stays optional on
+`lumics_get_metric_summary`, where it means something different (see below).
+
+**The syntax is `<TypeGroup>.<metric>`, comma-separated, no spaces** — `Calculated.cpu`, or
+`Calculated.cpu,Calculated.mem`. Type groups seen on live tenants are `Calculated`, `Rate` and
+`TimeTicks`; there is no `Counter` or `Gauge` group despite those being plausible SNMP type names.
+Property names are **tenant-specific**, so treat the examples as shapes rather than as a vocabulary.
+
+**To find legal names, call `lumics_get_metric_summary` with no `properties`** and read
+`data.<class>[].stats`: the outer keys are type groups and the inner keys are metric names, so
+joining them with a dot gives a value the other four tools accept. Two limits on that, both real:
+
+- it enumerates **device-scoped** names only, so a component-level name — an interface counter, say —
+  is discoverable from **no endpoint at all** and has to come from the Lumics UI or from someone who
+  already knows it;
+- its response key depends on the module (`devices` for `snmp`, `http_endpoints` for `http`), so read
+  whichever key is present rather than assuming `devices`.
+
+On `lumics_get_metric_summary` itself, `properties` **filters rather than projects**: supplying it
+drops items that do not carry the property instead of narrowing the items that do, and it has been
+observed emptying a response that was otherwise full. Leave it unset there unless you have a reason.
+
+**A name the API does not recognise is not rejected.** It returns HTTP 200 with the full row count
+and empty `stats` on every row, which reads exactly like "this metric has no data". This server
+rejects the worst form of it locally — a value in which no entry carries a `Group.` prefix — and
+detects the rest after the fact, disclosing in the response that the names may be wrong rather than
+letting an empty answer stand. See
+[A metric call returned rows but no values](#a-metric-call-returned-rows-but-no-values).
+
+One more thing about component selection: `itemType` takes the **singular** component id
+(`snmp_common_cpu`), which is **not** what `lumics_list_component_types` returns — that endpoint
+returns plural aliases and most of them are rejected with `400 Unknown component`. Build the id from
+`lumics_get_device_definition_components` instead, or copy the `type` field off a row a metric call
+already returned. Lumics validates `itemType` **before** `properties`, so a wrong `itemType` hides a
+`properties` problem entirely: fix `itemType` first.
+
+### `lumics_summarize_company_metrics` is slow, and a timeout is not an empty result
+
+`metrics/.../summarize` aggregates every matching component in the company before it answers. It has
+been measured taking **over 90 seconds without returning**, where the other metric endpoints answer
+the same module and window in one to two seconds. Nothing in the vendor documentation mentions this.
+
+This server gives that one endpoint a **three-minute deadline of its own** rather than the shared
+`LUMICS_TIMEOUT_MS`, and attempts it exactly **once** — three attempts at three minutes is nine
+minutes of silence, which from a client is indistinguishable from a hung server, and a retry cannot
+help an endpoint that is slow because of how much work it is doing. On a large tenant it can still
+time out. **A timeout there is a timeout, not evidence that there is no data**, and the error says
+so. Narrow it with `itemType`, a tighter `properties` or a shorter window, or use
+`lumics_get_company_metrics`, which reads the same module without the cross-component aggregation.
+
+Everything the vendor documents about this endpoint's response — its envelope, the `sum` semantics,
+the bucket shape — is **unverified against live behaviour**, because it never returned during the
+contract run.
+
 ### Metric endpoints require a resolution parameter
 
 All four metric-data endpoints require either `dataPoints` or `width` (`width` wins if both are
@@ -516,12 +577,23 @@ we cannot tell you where the ceiling is because Lumics does not say.
 - Identifier field names are inconsistent upstream: some responses return `id`, others `_id`, and
   component objects leak Mongoose internals (`__t`, `__v`).
 - No enumerations are published for `deviceType`, `role`, `moduleType`, or component `itemType`.
-  Discover them with the component-type and device-definition tools.
+  `lumics_list_component_types` is the lookup for the `componentType` key the component tools take,
+  but **not** for the metric tools' `itemType` — it returns plural aliases the metrics API rejects.
+  Build an `itemType` from `lumics_get_device_definition_components`, or copy the `type` field off a
+  row a metric call returned. Metric **property** names are enumerable from one endpoint only, and
+  only for device-scoped metrics — see
+  [Metric tools require a `properties` argument](#metric-tools-require-a-properties-argument-and-a-wrong-one-is-not-an-error).
 - IPAM address routes use singular `/ipsubnet/` for reads and plural `/ipsubnets/` for writes.
   This asymmetry is real in the vendor's route definitions, not a documentation typo, and the
   server sends each spelling as documented.
-- The vendor documentation may drift from live behaviour. Contract tests run against a live tenant
-  before each release to detect that; see [docs/RELEASE.md](./docs/RELEASE.md).
+- **The vendor documentation does drift from live behaviour, and has been measured doing so.** The
+  first contract run against a live tenant, on 2026-07-30, contradicted it in seven places, four of
+  them in the metric layer. Those measurements are recorded, dated and marked in
+  [`docs/reference/lumics-api-v1.md`](./docs/reference/lumics-api-v1.md) — §0 indexes them, §14
+  defects 17–23 carry the detail — with the vendor's original text left in place beside them, and the
+  decisions taken about them are in
+  [ADR-003](./docs/adr/ADR-003-metric-layer-live-contract-corrections.md). Contract tests run against
+  a live tenant before each release; see [docs/RELEASE.md](./docs/RELEASE.md).
 
 ### Release maturity
 
@@ -576,6 +648,36 @@ record is small enough that more of them fit, narrow the query, or ask for a hig
 
 The same applies to a metric response: shrink it with `properties`, `itemType`, `lastMetric` or a
 shorter window rather than with `limit`.
+
+### A metric call returned rows but no values
+
+The property names are probably wrong. This is the most likely explanation, and it is far more
+likely than the metric genuinely having no data.
+
+Lumics does not reject an unrecognised `properties` value. It answers **HTTP 200 with the full row
+count and an empty `stats` object on every row** — a successful, complete-looking, empty answer that
+is indistinguishable from a real absence of data except by inspection. This server inspects it: when
+the paths you asked for resolve on none of the returned rows, the response says the names may be
+malformed and does **not** present the result as a negative finding about your estate. Read that
+note as "nothing was measured", not as "nothing is being collected".
+
+What to check, in order:
+
+1. **Syntax.** Each entry must be `<TypeGroup>.<metric>` with no spaces — `Calculated.cpu`, not
+   `cpu`. A value with no dotted entry at all is refused locally before any request is made.
+2. **The type group.** If the note says the group never appeared in any row's `stats`, the group half
+   is wrong. `Calculated`, `Rate` and `TimeTicks` are what live tenants have shown; `Counter` and
+   `Gauge` do not exist.
+3. **The metric name.** If the note says the group came back but held no such metric, the name half is
+   wrong. Enumerate the real names with `lumics_get_metric_summary` called with no `properties`, and
+   read `data.<class>[].stats`.
+4. **`itemType`, if you passed one.** Lumics validates it before `properties`, and a wrong value fails
+   with `400 Unknown component` — which hides the properties problem rather than showing it.
+
+If the names are right and the rows are still empty, the metric may genuinely not be collected on
+those components. Confirm it in the Lumics UI before reporting it: the API gives no signal that
+distinguishes the two. See
+[Metric tools require a `properties` argument](#metric-tools-require-a-properties-argument-and-a-wrong-one-is-not-an-error).
 
 ### A timestamp was rejected
 

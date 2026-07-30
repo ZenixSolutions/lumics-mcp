@@ -45,6 +45,16 @@
  * is the only sanctioned source of a device id in this directory: it reads the
  * configured company's own device list, so ownership holds by construction.
  *
+ * **5. An endpoint that does not answer must not stop the run.** The 2026-07-30
+ * live run found that spec §12.2 `/summarize` exceeds 90 seconds and never
+ * returns (spec §12.5 M5, §14 defect 21). Left alone, that is the worst possible
+ * outcome for a release gate: the file hangs until vitest kills the case, and
+ * the operator gets a bare timeout that says nothing about which endpoint or
+ * why. {@link slowProbeApi} and {@link attemptWithin} exist for that case — a
+ * non-retrying client and a wall-clock budget, so a call that will not answer is
+ * reported as **slow, and the assumption behind it UNVERIFIED**, in a bounded
+ * amount of time.
+ *
  * **READ-ONLY, without exception.** Every call this suite makes is a GET. It
  * never touches `GET /me/token`, `POST /me/token` or `POST /me/token/revoke` —
  * the first two mint credentials and the third would revoke the operator's own
@@ -101,6 +111,51 @@ export function api(): { readonly client: LumicsClient; readonly config: LumicsC
     return { client: new LumicsClient(config), config };
   })();
   return cached;
+}
+
+/**
+ * A second client for endpoints measured **not to answer** (spec §12.5 M5).
+ *
+ * Two differences from {@link api}, both about bounding a call that will not
+ * return rather than about correctness:
+ *
+ * - **`maxAttempts: 1`.** The default client retries a timeout twice more with
+ *   backoff, so a single hung request occupies roughly three times
+ *   `LUMICS_TIMEOUT_MS` before it gives up. For an endpoint that never answers
+ *   that is pure waiting, and the retries happen *after* the suite has stopped
+ *   caring — see {@link attemptWithin}.
+ * - **`maxConcurrency: 1`.** Abandoned calls keep their permit until they abort.
+ *   Its own pool of one means an abandoned probe can never starve the main
+ *   client's pool and make an unrelated test look like it hung too.
+ *
+ * Same config, same credentials, same read-only rule. Use it *only* where an
+ * endpoint has been measured slow; everything else belongs on the shared client
+ * so the run stays inside one concurrency budget.
+ */
+let cachedSlowProbe: { readonly client: LumicsClient; readonly config: LumicsConfig } | undefined;
+
+export function slowProbeApi(): { readonly client: LumicsClient; readonly config: LumicsConfig } {
+  cachedSlowProbe ??= (() => {
+    const { config } = api();
+    return { client: new LumicsClient(config, { maxAttempts: 1, maxConcurrency: 1 }), config };
+  })();
+  return cachedSlowProbe;
+}
+
+/**
+ * Upper bound on how long the suite will wait for a slow endpoint, whatever
+ * `LUMICS_TIMEOUT_MS` says.
+ *
+ * The budget is normally the client's own timeout plus a little, so the client
+ * aborts first and the outcome is a clean `timeout` rather than an abandoned
+ * request. The cap matters when an operator has raised `LUMICS_TIMEOUT_MS`: a
+ * budget above the per-case vitest timeout would put us back where we started,
+ * with a bare "test timed out" and no finding.
+ */
+const MAX_SLOW_PROBE_BUDGET_MS = 45_000;
+
+export function slowProbeBudgetMs(): number {
+  return Math.min(api().config.timeoutMs + 5_000, MAX_SLOW_PROBE_BUDGET_MS);
 }
 
 /**
@@ -329,6 +384,23 @@ export type CallOutcome<T> =
       /** `undefined` for a transport failure, which is not an API answer at all. */
       readonly status: number | undefined;
       readonly code: string;
+      /**
+       * The error body, **for classification only** — read it with
+       * {@link outcomeMentions} and never print it.
+       *
+       * It exists because two different 400s are otherwise indistinguishable:
+       * spec §12.5 M3 records that `itemType` is validated *before* `properties`,
+       * so a bad `itemType` returns `400 Unknown component <value>` and hides the
+       * `400 "Must supply required component metrics as properties parameter"`
+       * that M1 is about. Status alone cannot tell those apart, and a suite that
+       * cannot tell them apart reports the wrong parameter as broken.
+       *
+       * It is already redacted and truncated by `LumicsApiError`, but it is still
+       * a server-authored string that can quote the request — which on these
+       * endpoints means a component id. So it is matched, never echoed:
+       * {@link describeOutcome} does not include it and no ledger entry may.
+       */
+      readonly body: string | undefined;
     };
 
 /**
@@ -344,14 +416,89 @@ export async function attempt<T>(call: Promise<T>): Promise<CallOutcome<T>> {
   } catch (error) {
     const status = readNumber(error, 'status');
     const code = readString(error, 'code') ?? 'unknown';
-    return { ok: false, status, code };
+    return { ok: false, status, code, body: readString(error, 'bodySnippet') };
   }
+}
+
+/**
+ * Did the API's error body mention this marker? Case-insensitive.
+ *
+ * The one sanctioned use of {@link CallOutcome.body}, and it returns a boolean so
+ * that what reaches the evidence report is "the rejection named `properties`",
+ * never the server's sentence. Pass a short, stable fragment of vendor wording
+ * (`properties parameter`, `unknown component`) — not a whole message, which
+ * would make the check brittle for no gain.
+ */
+export function outcomeMentions(outcome: CallOutcome<unknown>, marker: string): boolean {
+  if (outcome.ok || outcome.body === undefined) {
+    return false;
+  }
+  return outcome.body.toLowerCase().includes(marker.toLowerCase());
+}
+
+/**
+ * The code {@link attemptWithin} reports when the suite stopped waiting.
+ *
+ * Deliberately not `timeout`: that one is the *client's* abort, an API that was
+ * asked and did not answer in `LUMICS_TIMEOUT_MS`. This one means the suite gave
+ * up on its own budget and the request may still be in flight. Both are "no
+ * answer", and {@link isSlowOutcome} treats them together, but a report line
+ * that conflated them would misdescribe what was configured.
+ */
+export const SUITE_DEADLINE_CODE = 'suite_deadline_exceeded';
+
+/**
+ * {@link attempt} with a wall-clock budget, for endpoints measured not to answer.
+ *
+ * The underlying request is **not** cancelled — nothing here can cancel it, and
+ * the client's own `AbortSignal.timeout` will end it shortly. What this
+ * guarantees is that the *test* stops waiting, so a hung endpoint becomes a
+ * stated finding instead of a vitest timeout with no explanation. Use it with
+ * {@link slowProbeApi}, whose single-attempt client makes that abort prompt.
+ */
+export async function attemptWithin<T>(
+  call: Promise<T>,
+  budgetMs: number,
+): Promise<CallOutcome<T>> {
+  // `attempt` never rejects, so the losing side of the race cannot surface as an
+  // unhandled rejection after the test has moved on.
+  const guarded = attempt(call);
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  const deadline = new Promise<CallOutcome<T>>((resolve) => {
+    timer = setTimeout(
+      () => resolve({ ok: false, status: undefined, code: SUITE_DEADLINE_CODE, body: undefined }),
+      budgetMs,
+    );
+  });
+
+  try {
+    return await Promise.race([guarded, deadline]);
+  } finally {
+    if (timer !== undefined) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+/**
+ * Did this call fail to produce an answer *in time*, as opposed to being refused?
+ *
+ * A refusal is contract information. A timeout is not: it says the endpoint was
+ * too slow on this tenant at this moment, which is a finding about availability
+ * and a reason to mark whatever it was checking UNVERIFIED — never a reason to
+ * fail an assertion about the shape of a response nobody saw.
+ */
+export function isSlowOutcome(outcome: CallOutcome<unknown>): boolean {
+  return !outcome.ok && (outcome.code === 'timeout' || outcome.code === SUITE_DEADLINE_CODE);
 }
 
 /** `"HTTP 400 (bad_request)"` or `"transport failure (timeout)"`, for a report line. */
 export function describeOutcome(outcome: CallOutcome<unknown>): string {
   if (outcome.ok) {
     return 'accepted (HTTP 2xx)';
+  }
+  if (outcome.code === SUITE_DEADLINE_CODE) {
+    return 'NO ANSWER — the suite stopped waiting before the API replied';
   }
   return outcome.status === undefined
     ? `no API answer — transport failure (${outcome.code})`

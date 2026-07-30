@@ -71,6 +71,15 @@ interface Fixture {
   /** A component type that has at least one instance on this tenant. */
   readonly populatedType: string | undefined;
   readonly componentSample: readonly Record<string, unknown>[];
+  /**
+   * The raw §6.5 catalogue body, fetched once.
+   *
+   * Three cases read it — the documented array shape, the spec §12.5 M6 claim
+   * that it carries no metric property names, and the spec §12.5 M3 claim that
+   * it is where a usable `itemType` is constructed from. It was 386 KB on
+   * 2026-07-30, so it is fetched once and shared rather than three times.
+   */
+  readonly deviceDefinitions: unknown;
 }
 
 let fixture: Fixture | undefined;
@@ -118,7 +127,9 @@ beforeAll(async () => {
     }
   }
 
-  fixture = { componentTypes, populatedType, componentSample };
+  const deviceDefinitions = await client.get<unknown>(deviceDefinitionComponentsPath());
+
+  fixture = { componentTypes, populatedType, componentSample, deviceDefinitions };
 }, DISCOVERY_TIMEOUT);
 
 afterAll(() => {
@@ -315,7 +326,7 @@ describe.skipIf(!RUNNABLE)('live contract: spec 5 — collectors', () => {
 
 describe.skipIf(!RUNNABLE)('live contract: spec 6.4 — componenttypes', () => {
   it(
-    'ASSERT: componenttypes returns {id, module, group, type} with id composed of the other three',
+    'ASSERT: componenttypes entries carry id, module and group, and compose id from them',
     // Synchronous: the catalogue was fetched once during discovery and reused.
     (ctx) => {
       const types = fx().componentTypes;
@@ -329,23 +340,84 @@ describe.skipIf(!RUNNABLE)('live contract: spec 6.4 — componenttypes', () => {
       }
 
       for (const type of types) {
+        // `type` is deliberately NOT required here: spec §12.5 M4 measured 41 of
+        // 246 entries without it, and the case below owns that claim. The other
+        // three were present on every entry and are what lumics_list_component_types
+        // and the :component path argument are built on.
         expect(
           typeof type.id === 'string' &&
             typeof type.module === 'string' &&
-            typeof type.group === 'string' &&
-            typeof type.type === 'string',
-          `a component type came back missing one of the four documented string fields (keys: ${keysOf(type).join(',')}). lumics_list_component_types and every itemType argument depend on this shape.`,
+            typeof type.group === 'string',
+          `a component type came back missing one of id, module or group (keys: ${keysOf(type).join(',')}). lumics_list_component_types and every :component path argument depend on those three; spec section 6.4 documents a fourth, "type", which the 2026-07-30 run found to be conditional (spec section 14 defect 20) and which the following case measures.`,
         ).toBe(true);
-        expect(
-          type.id,
-          `spec section 6.4 documents id as "<module>_<group>_<type>"; this entry composes differently. Component type ids are what a caller passes as :component and as itemType, so the composition rule matters.`,
-        ).toBe(`${type.module}_${type.group}_${type.type}`);
+        if (typeof type.type === 'string') {
+          expect(
+            type.id,
+            `spec section 6.4 documents id as "<module>_<group>_<type>"; this entry has all four fields and composes differently. Component type ids are what a caller passes as :component, so the composition rule matters.`,
+          ).toBe(`${type.module}_${type.group}_${type.type}`);
+        }
       }
 
       recordAsserted(
         '6.4',
-        'componenttypes entries are {id, module, group, type} with id === module_group_type',
+        'componenttypes entries carry id, module and group, and where "type" is present id === module_group_type',
         `${String(types.length)} type(s) checked`,
+      );
+    },
+    TIMEOUT,
+  );
+
+  /**
+   * spec §12.5 M4 / §14 defect 20. §6.4 documents an unconditional four-field
+   * object; 41 of 246 entries had no `type` on 2026-07-30, and the rule observed
+   * was that `type` is present exactly when `id` has three or more
+   * underscore-separated segments.
+   *
+   * The **rule** is what is asserted. The counts are this tenant's catalogue and
+   * are recorded rather than asserted — a different tenant enables different
+   * modules, so pinning 41/246 would be pinning an estate, not a contract.
+   */
+  it(
+    'ASSERT: componenttypes omits "type" exactly when the id has fewer than three segments',
+    (ctx) => {
+      const claim =
+        'the "type" field of a componenttypes entry is present iff its id has three or more underscore-separated segments (measured 2026-07-30)';
+      const types = fx().componentTypes;
+      if (types.length === 0) {
+        unverifiable(ctx, '6.4', claim, 'this tenant returned no component types at all');
+      }
+
+      const withoutType = types.filter((type) => typeof type.type !== 'string');
+      const bySegments = new Map<number, number>();
+      const violations: string[] = [];
+      for (const type of types) {
+        const segments = typeof type.id === 'string' ? type.id.split('_').length : 0;
+        bySegments.set(segments, (bySegments.get(segments) ?? 0) + 1);
+        const hasType = typeof type.type === 'string';
+        if (hasType !== segments >= 3) {
+          // Component type ids are vendor catalogue vocabulary, not tenant data.
+          violations.push(
+            `${type.id} (${String(segments)} segment(s), type ${hasType ? 'present' : 'absent'})`,
+          );
+        }
+      }
+
+      expect(
+        violations.length,
+        `${String(violations.length)} componenttypes entr(ies) break the rule measured on 2026-07-30 — "type" present iff the id has three or more underscore-separated segments: ${violations.slice(0, 5).join('; ')}${violations.length > 5 ? ', ...' : ''}. spec section 6.4 documents "type" unconditionally and spec section 14 defect 20 records the exception; if the shape has changed again, both need re-dating. A consumer that reads "type" without checking is what this protects.`,
+      ).toBe(0);
+
+      const segmentReport = [...bySegments.entries()]
+        .sort(([a], [b]) => a - b)
+        .map(([segments, count]) => `${String(segments)} segment(s): ${String(count)}`)
+        .join(', ');
+      recordAsserted('6.4', claim, `${String(types.length)} type(s) checked; ${segmentReport}`);
+      recordObserved(
+        '6.4',
+        'how many entries omit the documented "type" field, and which modules they belong to (spec section 12.5 M4)',
+        withoutType.length === 0
+          ? `every one of this tenant's ${String(types.length)} component types carried "type" — the 2026-07-30 measurement (41 of 246 without it, across vmware, meraki, paloalto, hyperv, winrm, common, clearpass, cohesity, http, mongostat and pingtcp) is not reproduced on this catalogue, which enables a different set of modules`
+          : `${String(withoutType.length)} of ${String(types.length)} entries carry no "type", spanning module(s): ${[...new Set(withoutType.map((type) => type.module))].sort().join(', ')}`,
       );
     },
     TIMEOUT,
@@ -393,11 +465,11 @@ describe.skipIf(!RUNNABLE)('live contract: spec 6.4 — componenttypes', () => {
 describe.skipIf(!RUNNABLE)('live contract: spec 6.5 — system device definitions', () => {
   it(
     'ASSERT: the catalogue is reachable with no contextId and returns a bare array',
-    async () => {
-      const { client } = api();
-      // spec §13 Q2: this is the one genuinely system-scoped route — a literal
-      // `system` segment and no contextId anywhere in the path.
-      const response = await client.get<unknown>(deviceDefinitionComponentsPath());
+    // Synchronous: the catalogue was fetched once during discovery. spec §13 Q2
+    // — this is the one genuinely system-scoped route, a literal `system`
+    // segment and no contextId anywhere in the path.
+    () => {
+      const response = fx().deviceDefinitions;
       expect(
         Array.isArray(response),
         `spec section 6.5 documents a bare array of definition objects; the body was ${describeValue(response)}.`,
@@ -420,6 +492,96 @@ describe.skipIf(!RUNNABLE)('live contract: spec 6.5 — system device definition
           `entry keys: ${keysOf(sample).join(',')}; data keys: ${keysOf(data).join(',')}`,
         );
       }
+    },
+    TIMEOUT,
+  );
+
+  /**
+   * spec §12.5 M6 / §14 defect 22. §14 defect 14 sends a reader here for the
+   * enumerations the vendor never documented, and for metric **property** names
+   * that is wrong: this is the inventory schema. On 2026-07-30 the whole 386 KB
+   * payload contained zero occurrences of `Calculated` or `sysUpTime`.
+   *
+   * Asserted, not merely observed, because the consequence is severe: spec
+   * §12.5 M1 makes `properties` mandatory on four endpoints, so if this catalogue
+   * ever *did* carry property names it would be the only safe way to construct
+   * one, and the code that today discovers them from §12.4 (device-scoped only)
+   * should be changed. Either direction is a finding.
+   */
+  it(
+    'ASSERT: the catalogue carries inventory schema, not metric property names',
+    (ctx) => {
+      const claim =
+        'GET /system/deviceDefinitions/components carries no metric property names (measured 2026-07-30)';
+      const rows = records(fx().deviceDefinitions);
+      if (rows.length === 0) {
+        unverifiable(ctx, '6.5', claim, 'the catalogue returned no definition entries');
+      }
+
+      // Marker names, not tenant data: `Calculated` is a metric type group and
+      // `sysUpTime` an SNMP metric, both from the vendor's own §12.4 example.
+      // Serialised once and searched, because a property name could be nested at
+      // any depth and the claim is about the whole payload.
+      const serialised = JSON.stringify(rows);
+      const markers = ['Calculated', 'sysUpTime'] as const;
+      const found = markers.filter((marker) => serialised.includes(marker));
+
+      expect(
+        found,
+        `the device-definition catalogue now contains ${found.join(' and ')}. spec section 12.5 M6 measured it as the INVENTORY schema with no metric property names anywhere in 386 KB, which is why the contract suite discovers property names from section 12.4 instead — device-scoped only, and the sole enumeration path in the API. If metric properties now appear here, that is the missing enumeration (spec section 14 defect 14 and defect 22) and both the spec and the discovery in live-metrics.test.ts should be revisited. Report this.`,
+      ).toEqual([]);
+
+      const schemaFields = rows.filter((row) =>
+        isRecord(isRecord(row['data']) ? row['data']['schema'] : undefined),
+      );
+      recordAsserted(
+        '6.5',
+        claim,
+        `${String(rows.length)} definition(s) searched for the metric markers ${markers.join(', ')}: none present. ${String(schemaFields.length)} entr(ies) carry a data.schema, which holds CONFIGURATION fields (ifDescr, ifIndex, ifAlias and the like), not metrics`,
+      );
+    },
+    TIMEOUT,
+  );
+
+  /**
+   * spec §12.5 M3. The plural/singular split that makes a `componenttypes` id
+   * unusable as an `itemType` is visible in this payload alone:
+   * `data.componentAlias` is the plural §6.4 hands out, `data.itemType` the
+   * singular the metric endpoints accept. Recorded here; the rejection itself is
+   * asserted in `live-metrics.test.ts`, which is where the metric endpoints are.
+   */
+  it(
+    'OBSERVE: componentAlias is the plural of itemType, which is what makes M3 possible',
+    (ctx) => {
+      const claim =
+        'each definition carries both a singular data.itemType and a plural data.componentAlias (spec section 12.5 M3)';
+      const rows = records(fx().deviceDefinitions);
+      const withBoth = rows.filter((row) => {
+        const data = row['data'];
+        return (
+          isRecord(data) &&
+          typeof data['itemType'] === 'string' &&
+          typeof data['componentAlias'] === 'string'
+        );
+      });
+      if (withBoth.length === 0) {
+        unverifiable(
+          ctx,
+          '6.5',
+          claim,
+          `none of the ${String(rows.length)} definition(s) carried both data.itemType and data.componentAlias, so the two vocabularies cannot be compared from this endpoint — and spec section 12.5 M3's construction rule for a usable itemType has nothing to build from`,
+        );
+      }
+      const differing = withBoth.filter((row) => {
+        const data = row['data'] as Record<string, unknown>;
+        return data['itemType'] !== data['componentAlias'];
+      });
+
+      recordObserved(
+        '6.5',
+        'nothing in the docs says these two fields are different vocabularies; spec section 12.5 M3 measured 213 of 246 componenttypes ids rejected as itemType because of it',
+        `${String(withBoth.length)} of ${String(rows.length)} definition(s) carry both fields; they differ on ${String(differing.length)}. The metric endpoints accept <module>_<group>_<data.itemType>; GET componenttypes returns <module>_<group>_<data.componentAlias>`,
+      );
     },
     TIMEOUT,
   );

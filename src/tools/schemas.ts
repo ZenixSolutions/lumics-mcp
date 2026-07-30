@@ -24,6 +24,7 @@ import {
   IP_GROUP_TYPES,
   MAX_LIST_LIMIT,
   METRIC_INTERVALS,
+  METRIC_PROPERTY_TYPE_GROUPS,
   METRIC_SUM_PROPERTIES,
   OBJECT_ID_PATTERN,
 } from '../constants.js';
@@ -114,24 +115,106 @@ export const moduleTypeSchema = z
   );
 
 /**
- * spec §12.0: `itemType` is a component type string such as
- * `snmp_f5_f5pools`, or the literal `device` on the summaries endpoint.
+ * spec §12.0: `itemType` is a component type string.
+ *
+ * **The spec's own examples and `lumics_list_component_types` both hand out the
+ * wrong form.** The metrics API wants the *singular* component id — `snmp_common_cpu`
+ * — while spec §6.4 `componenttypes` returns *plural* aliases (`snmp_common_cpus`),
+ * and 213 of the 246 values it returns are rejected here with
+ * `400 Unknown component <value>`. The correct id is constructible from spec §6.5
+ * (`lumics_get_device_definition_components`): the module and group segments of
+ * `filePath` joined to the singular `data.itemType` with underscores, so
+ * `/components/snmp/common/Cpu.yml` plus `itemType: "cpu"` gives `snmp_common_cpu`.
+ * A §12.1 response row's own `type` field also carries the correct id.
+ *
+ * The description says all of this because a model has no other way to find out:
+ * the failure is a 400 with a message that names the value but not the rule, and
+ * `itemType` is validated *before* `properties`, so a wrong `itemType` masks a
+ * `properties` problem entirely.
  */
 export const itemTypeSchema = z
   .string()
   .trim()
   .min(1)
   .describe(
-    'Component type to restrict results to, e.g. "snmp_f5_f5pools" or "snmp_cisco_envmonfan". Use "device" to summarise device-level rather than component-level metrics. Discover valid values with lumics_list_component_types.',
+    'Component type id to restrict results to. It must be the SINGULAR component id the metrics API uses — "snmp_common_cpu", not "snmp_common_cpus" — or the literal "device" for device-level rather than component-level metrics. Do NOT take this value from lumics_list_component_types: that endpoint returns PLURAL aliases and most of them are rejected here with 400 "Unknown component" (e.g. "snmp_common_cpus", "cpus" and "cpu" all fail where "snmp_common_cpu" succeeds). Build the id from lumics_get_device_definition_components instead: take the module and group from an entry\'s "filePath" (/components/snmp/common/Cpu.yml gives snmp and common) and the singular "data.itemType" (cpu), and join the three with underscores — snmp_common_cpu. The "type" field on a row returned by lumics_get_company_metrics or lumics_get_device_metrics is also a correct id, so one unfiltered call is a way to discover them. Note that Lumics validates itemType BEFORE properties: a wrong value here returns 400 "Unknown component <value>" and hides any problem with your properties, so fix itemType first.',
   );
 
-/** spec §12.0: `properties` is a comma-separated list of metric property paths. */
+/**
+ * The `<TypeGroup>.<metric>` shape a metric property path has to have.
+ *
+ * Written as prose once because it appears in the schema error, in the property
+ * descriptions, and in the runtime disclosure in `./metrics.ts` — three places
+ * that must not drift apart.
+ */
+export const METRIC_PROPERTY_SYNTAX =
+  'Each entry must be written as "<TypeGroup>.<metric>" with no spaces, e.g. "Calculated.cpu", "TimeTicks.sysUpTime" or "Calculated.cpu,Calculated.mem". Type groups seen on live tenants are ' +
+  METRIC_PROPERTY_TYPE_GROUPS.join(', ') +
+  ' (there is no "Counter" or "Gauge" group). Use lumics_get_metric_summary to enumerate the legal names for a module: in its response, the outer keys of an item\'s "stats" are the type groups and the inner keys are the metric names, so join them with a dot.';
+
+/**
+ * True when at least one comma-separated entry looks like `Group.metric`.
+ *
+ * Deliberately the weakest check that still catches the measured trap. A bare
+ * name — `properties=cpu` — is not rejected by Lumics: it answers **200** with the
+ * full row count and every `stats` object empty, which reads as "this metric has
+ * no data" and is the single most dangerous behaviour on this API. Requiring
+ * *every* entry to carry a dot would be stronger, but nothing has established that
+ * no bare name is ever legal, so a value that pairs a dotted entry with a bare one
+ * is allowed through and left to the runtime disclosure in `./metrics.ts` to
+ * report. What is rejected is the case with no dotted entry at all, which has been
+ * measured to produce nothing but empty stats.
+ */
+function hasQualifiedProperty(value: string): boolean {
+  return value.split(',').some((entry) => {
+    const trimmed = entry.trim();
+    const dot = trimmed.indexOf('.');
+    return dot > 0 && dot < trimmed.length - 1;
+  });
+}
+
+/**
+ * spec §12.0 `properties` on the four metric-data endpoints (§12.1–§12.3).
+ *
+ * **Required, though the spec lists it optional.** All four answer
+ * `400 {"error":"Must supply required component metrics as properties parameter"}`
+ * without it, so every metric call this server made was failing. It is required
+ * here rather than defaulted because there is no metric name that is right for
+ * every module, and inventing one would answer a question nobody asked.
+ *
+ * The 400 gate upstream only checks that the parameter is present and non-empty —
+ * never that its value means anything — hence {@link hasQualifiedProperty}.
+ */
 export const metricPropertiesSchema = z
   .string()
   .trim()
   .min(1)
+  .refine(
+    hasQualifiedProperty,
+    `must name at least one metric as "<TypeGroup>.<metric>". A bare name like "cpu" is NOT rejected by Lumics: it answers 200 with the full row count and empty stats on every row, which reads as "no data exists" when in fact nothing was asked for. ${METRIC_PROPERTY_SYNTAX}`,
+  )
   .describe(
-    'Comma-separated metric property paths to include, e.g. "status" or "aggr-space-attributes.size-used" or "status,Integer.statusEnabledState". Narrowing this is the single most effective way to keep a metric response inside the output budget.',
+    `REQUIRED. Comma-separated metric property paths to read. ${METRIC_PROPERTY_SYNTAX} Omitting this returns 400 "Must supply required component metrics as properties parameter" — the Lumics documentation calls it optional and is wrong. An unrecognised name is NOT an error either: Lumics answers 200 with rows whose "stats" are empty, so a misspelled property looks exactly like a metric with no data. This server detects that case and says so, but getting the name right first is cheaper. Narrowing this is also the single most effective way to keep a metric response inside the output budget.`,
+  );
+
+/**
+ * spec §12.4 `properties`, which is a different parameter wearing the same name.
+ *
+ * Optional here, and it acts as a **filter** rather than as a projection: supplying
+ * it on a live tenant emptied a response that was otherwise full. So it is offered,
+ * but the description tells the caller to start without it — and
+ * `getMetricSummary` discloses it as the first suspect when the result is empty.
+ */
+export const metricSummaryPropertiesSchema = z
+  .string()
+  .trim()
+  .min(1)
+  .refine(
+    hasQualifiedProperty,
+    `must name at least one metric as "<TypeGroup>.<metric>". ${METRIC_PROPERTY_SYNTAX}`,
+  )
+  .describe(
+    `Optional metric property filter, comma-separated. ${METRIC_PROPERTY_SYNTAX} On THIS endpoint it behaves as a FILTER, not as a projection: supplying it has been observed to empty a response that was otherwise full, so start WITHOUT it — the unfiltered response is also how you discover which property names exist, and it is the only enumeration path this API has.`,
   );
 
 /** spec §12.0: `interval` overrides the rollup granularity. Exactly four values. */

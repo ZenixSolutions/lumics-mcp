@@ -108,6 +108,66 @@ and is finalised at tag time.
 - CI on every push to `main` and every pull request: typecheck, lint, format check, tests, build,
   secret scan, and a stdio startup smoke test on Node 20 and 22.
 
+### Changed
+
+Everything in this section comes from the first contract run against a live Lumics tenant, on
+2026-07-30, which contradicted the vendor documentation in the metric layer. The measurements are
+recorded in [`docs/reference/lumics-api-v1.md`](./docs/reference/lumics-api-v1.md) §0, §12.5 and §14
+defects 17–23; the decisions are
+[ADR-003](./docs/adr/ADR-003-metric-layer-live-contract-corrections.md).
+
+- **BREAKING (tool surface): `properties` is now a required argument** on
+  `lumics_get_company_metrics`, `lumics_summarize_company_metrics`, `lumics_get_device_metrics` and
+  `lumics_get_device_item_metrics`. Spec §12.0 marks it optional; the live API answers
+  `400 {"error":"Must supply required component metrics as properties parameter"}` without it, so
+  those four tools **could not make a single successful call at all** before this change. The break
+  is therefore real in form and removes a call shape that never worked. It is required rather than
+  defaulted because no metric name is correct for every module, and a default would turn every
+  unqualified request into a confident answer to a question nobody asked. The syntax is
+  `<TypeGroup>.<metric>`, comma-separated — `Calculated.cpu`. It stays **optional** on
+  `lumics_get_metric_summary` (spec §12.4), where it is genuinely optional upstream and acts as a
+  **filter** rather than a projection: supplying it returned `count: 0` on a live tenant, dropping
+  items rather than narrowing them.
+- **Local validation of `properties` that the captured API contract does not contain.** A value in
+  which no comma-separated entry carries a `Group.` prefix is rejected before any request is issued.
+  This is a deliberate deviation from `docs/reference/lumics-api-v1.md`, which `CLAUDE.md` otherwise
+  forbids, and it is justified by measurement rather than taste: an invalid `properties` value is
+  **not** rejected upstream. `properties=cpu` and `properties=bogusXYZ` both returned **HTTP 200 with
+  658 rows and an empty `stats` object on every one**, so the API cannot be relied on to reject the
+  value and the failure is invisible. The guard is deliberately the weakest one that still catches
+  that trap — a single qualified entry lets the whole value through, since nothing establishes that a
+  bare name is never legal.
+- **A new disclosure class for the same trap.** When rows come back but the requested property paths
+  resolve on none of them, the response says the property names may be malformed and states
+  explicitly that this is **not** a claim that no data exists. Where only some paths fail, it says the
+  returned rows are real and names which entries produced nothing, classifying each as an unqualified
+  name, a recognised group holding no such metric, or a group that never appeared — those need
+  different fixes. It fires only when there are rows to inspect. Without it, 658 rows of empty stats
+  under a successful tool result is a confident negative about the estate built on a typo.
+- **Discovery routing corrected.** `lumics_list_component_types` is no longer named as the route to a
+  metric tool's `itemType`: it returns **plural aliases**, and 213 of its 246 ids were rejected with
+  `400 Unknown component <value>` (`snmp_common_cpus` fails, `snmp_common_cpu` succeeds). The
+  singular id is built from `lumics_get_device_definition_components` — the module and group from an
+  entry's `filePath` joined to the singular `data.itemType` — or copied from the `type` field of a row
+  a metric call already returned. `lumics_get_metric_summary` is documented as the **only**
+  enumeration path for metric property names, with both of its limits stated: device-scoped names
+  only, and a module-dependent response key (`devices` for `snmp`, `http_endpoints` for `http`). It is
+  also now documented that Lumics validates `itemType` **before** `properties`, so a wrong `itemType`
+  hides a properties problem entirely.
+- **A per-request timeout override, and a three-minute deadline for
+  `lumics_summarize_company_metrics`.** That endpoint aggregates every matching component in the
+  company before answering and was measured **exceeding 90 seconds without returning**, where the
+  other metric endpoints answered the same module and window in one to two seconds — so under the
+  shared `LUMICS_TIMEOUT_MS` it could never succeed. The override applies to that one request, is set
+  by calling code and is **not a tool argument**, so a model cannot ask the server to hold a
+  connection open for minutes; an operator whose configured timeout is already higher keeps theirs.
+  The call is also capped at **one attempt**, because the deadline and the retry budget multiply:
+  three attempts at three minutes was nine minutes of silence, which from a client is
+  indistinguishable from a hung server, for retries that cannot help an endpoint that is slow because
+  of how much work it is doing. A per-request attempt budget can only ever **lower** the client-wide
+  one, never raise it. A `/summarize` timeout now carries its own guidance saying it was attempted
+  once deliberately, that **a timeout is not an empty result**, and what to narrow.
+
 ### Security
 
 - **The server reads no `.env` file.** An earlier build in this release cycle called Node's dotenv
@@ -204,7 +264,27 @@ and is finalised at tag time.
   `lumics_get_device_definition_components` and `lumics_get_metric_summary`. Each carries its own
   disclosure that the response is the entire set Lumics returned.
 - Ranking on `lumics_get_metric_summary` is performed locally, after the whole set has been fetched.
-  Narrowing `itemType`, `properties` or the window is the only way to reduce the response size.
+  Narrowing `itemType` or the window is the only safe way to reduce the response size — `properties`
+  filters items out on that endpoint rather than narrowing them.
+- **A component-level metric property name is discoverable from no endpoint at all.**
+  `lumics_get_metric_summary` enumerates real property names but only **device-scoped** ones, and
+  `lumics_get_device_definition_components` is the inventory schema and carries none. So an interface
+  counter such as `Calculated.ifInOctets` — found by probing — cannot be obtained from any documented
+  route, while `properties` is mandatory and a wrong value looks like success. Component-level metric
+  questions are answerable only when you already know the name, from the Lumics UI or from
+  institutional knowledge. This is a gap in the vendor API and this server cannot close it.
+- **`lumics_summarize_company_metrics` is slow and its response shape is unverified.** The endpoint
+  never returned during the contract run, so everything the vendor documents about it — the envelope,
+  the `sum` semantics, `type: "summed"`, `components`, the integer bucket `_id` — is unverified
+  against live behaviour. The three-minute deadline makes success possible; it does not make it
+  demonstrated. On a large tenant the call can still time out, and a timeout there is a timeout, not
+  evidence that no data exists.
+- **`lumics_get_metric_summary` does not support every module**, and fails non-JSON when it does not:
+  `snmp` and `http` answered 200, `ping` and `syslog` returned HTML error pages, `deviceConfigs`
+  returned 500. No per-module availability is documented anywhere.
+- **`lumics_list_component_types` does not always return `type`** — 41 of 246 entries omitted it,
+  present only when `id` has three or more underscore-separated segments, where spec §6.4 documents an
+  unconditional four-field object.
 - `lumics_update_component` renames a component and nothing else: spec §6.3 documents no writable
   field list, and its only documented example sets `name`.
 - Deleting an IP subnet or IP group has **undocumented cascade behaviour**. Lumics does not say

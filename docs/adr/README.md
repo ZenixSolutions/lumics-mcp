@@ -10,6 +10,7 @@ An ADR records a decision that has already been approved. It is not a proposal �
 |---|---|---|---|---|---|---|
 | [ADR-001](ADR-001-transport-and-distribution.md) | Transport and Distribution Architecture | Approved | 2026-07-29 | RFC-001 | — | — |
 | [ADR-002](ADR-002-security-posture-and-capability-reductions.md) | Security Posture and Capability Reductions | Approved | 2026-07-29 | RFC-001 | — | — |
+| [ADR-003](ADR-003-metric-layer-live-contract-corrections.md) | Metric Layer Corrections from the First Live Contract Run | Approved | 2026-07-30 | RFC-001 | — | — |
 
 Every ADR is also indexed in [`../DECISION_LOG.md`](../DECISION_LOG.md).
 

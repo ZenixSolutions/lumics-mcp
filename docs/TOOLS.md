@@ -26,6 +26,8 @@ This is a `0.x` release: **tool names and arguments may change before 1.0**, wit
   - [There is no pagination](#there-is-no-pagination)
   - [Time windows on metric tools](#time-windows-on-metric-tools)
   - [Metric resolution: `dataPoints`](#metric-resolution-datapoints)
+  - [Metric `properties`: required, and a wrong one is not an error](#metric-properties-required-and-a-wrong-one-is-not-an-error)
+  - [Metric `itemType`: the singular id, not the component-type id](#metric-itemtype-the-singular-id-not-the-component-type-id)
   - [`lumics_get_metric_summary` ranks locally](#lumics_get_metric_summary-ranks-locally)
   - [`companyId` defaults to `LUMICS_COMPANY_ID`](#companyid-defaults-to-lumics_company_id)
   - [`confirm` is not human-in-the-loop control](#confirm-is-not-human-in-the-loop-control)
@@ -276,6 +278,101 @@ resolution_ of a series, `limit` is a cap on the _number of result rows_.
 
 `lumics_get_metric_summary` accepts neither — its endpoint documents no resolution parameter at all.
 
+### Metric `properties`: required, and a wrong one is not an error
+
+Spec §12.0 marks `properties` optional. **The live API requires it** on §12.1, §12.2 and both §12.3
+endpoints: without it they answer
+`400 {"error":"Must supply required component metrics as properties parameter"}`. This was measured
+on 2026-07-30 and is recorded as spec §14 defect 17; the decision to make the argument required is
+[ADR-003](./adr/ADR-003-metric-layer-live-contract-corrections.md) decision 1. So it is **required**
+on `lumics_get_company_metrics`, `lumics_summarize_company_metrics`, `lumics_get_device_metrics` and
+`lumics_get_device_item_metrics`, and **optional** on `lumics_get_metric_summary`, where the
+parameter is genuinely optional upstream and means something different.
+
+It is required rather than defaulted because no metric name is correct for every module. A default
+would make every unqualified call a well-formed answer to a question the caller did not ask.
+
+**Syntax:** `<TypeGroup>.<metric>`, comma-separated, no spaces — `Calculated.cpu`,
+`Calculated.cpu,Calculated.mem`. Type groups observed on live tenants are `Calculated`, `Rate` and
+`TimeTicks`. `Counter` and `Gauge` were confirmed **absent**, so do not offer them on the strength of
+being plausible SNMP type names. Names are **tenant-specific**: nothing here is an API vocabulary.
+
+#### A wrong value returns 200, not an error
+
+The 400 above tests **presence only, never validity**. Measured on the same run (spec §14 defect 18):
+
+| Sent                                                      | Result                                                 |
+| --------------------------------------------------------- | ------------------------------------------------------ |
+| `properties=cpu` (bare name, no group)                    | **200**, 658 rows, every `stats` `{}`                  |
+| `properties=bogusXYZ`                                     | **200**, identical                                     |
+| `properties=Rate.ifInOctets` (group real, metric unknown) | **200**, `stats` echoes the group empty: `{"Rate":{}}` |
+| unrecognised group                                        | **200**, no `stats` key on the row at all              |
+
+A typo therefore produces a successful, fully-formed, empty answer that is indistinguishable from a
+metric with no data. Two controls sit on that:
+
+- **A local guard, ahead of the API.** A `properties` value in which **no** comma-separated entry
+  carries an interior dot — a `Group.metric` shape, so neither `cpu` nor `.cpu` nor `Calculated.`
+  counts — is rejected before any request is issued, with an error naming the syntax. This is a
+  constraint the captured spec does not contain — a deliberate deviation, recorded as
+  [D-0010](./DECISION_LOG.md) — because the API cannot be relied on to reject the value itself. It is
+  deliberately the **weakest** guard that still catches the measured trap: one qualified entry lets
+  the whole value through, so `Calculated.cpu,status` is accepted, since nothing establishes that a
+  bare name is never legal.
+- **A runtime disclosure, after the response.** When rows come back but the requested paths resolve on
+  **none** of them, the response says the property names may be malformed and explicitly says this is
+  **not** a statement that no data exists. Where only some paths fail, it says the rows are real and
+  names which entries produced nothing. Each unresolved entry is classified — no `<Group>.` prefix, a
+  recognised group holding no such metric, or a group that never appeared — because those need
+  different fixes. The note fires only when there are rows to inspect; over an empty result it would
+  be a guess, and the absent-series note already covers that case.
+
+#### Finding legal property names
+
+`lumics_get_metric_summary` called **with no `properties`** is the only enumeration path this API
+has. Read `data.<class>[].stats`: outer keys are type groups, inner keys are metric names, and
+joining them with a dot gives a value the other four tools accept. Two limits, both load-bearing:
+
+- **Device-scoped names only.** A component-level property name — an interface counter such as
+  `Calculated.ifInOctets` — is discoverable from **no endpoint at all**. `deviceDefinitions/components`
+  does not carry metric property names; it is the inventory schema (spec §14 defect 22). That value
+  was found by probing. It is a vendor gap, not something this server can close, and it bounds what
+  the metric tools can answer about components: you can only ask for a name you already know.
+- **The response key depends on the module** — `devices` for `snmp`, `http_endpoints` for `http`. Read
+  whichever key arrives instead of looking up `devices`.
+
+On `lumics_get_metric_summary` itself, `properties` **filters rather than projects**: supplying
+`Calculated.cpu` returned `count: 0` — items lacking the property were dropped entirely, not returned
+with a narrowed `stats`. Asking for less there gets you fewer **items**, not smaller ones. Start
+without it.
+
+### Metric `itemType`: the singular id, not the component-type id
+
+`itemType` takes the **singular** component id the metrics API uses — `snmp_common_cpu` — or the
+literal `device` for device-level metrics. **`lumics_list_component_types` is not the route to it.**
+That endpoint (spec §6.4) returns the **plural alias**, and 213 of its 246 ids were rejected by the
+metric endpoints with `400 Unknown component <value>` (spec §14 defect 19): `snmp_common_cpus` fails
+where `snmp_common_cpu` succeeds, and `cpus` and `cpu` both fail too. Nothing in the vendor
+documentation distinguishes the two vocabularies.
+
+Two ways to get a value that works:
+
+- **Build it from `lumics_get_device_definition_components`** (spec §6.5): take the module and group
+  out of an entry's `filePath` (`/components/snmp/common/Cpu.yml` → `snmp`, `common`) and join them to
+  the singular `data.itemType` (`cpu`) with underscores → `snmp_common_cpu`. `data.componentAlias` is
+  the plural form §6.4 returns.
+- **Copy it off a result.** Every row returned by `lumics_get_company_metrics` or
+  `lumics_get_device_metrics` carries a `type` field holding the correct singular id, so one
+  unfiltered call is a working discovery path.
+
+**Lumics validates `itemType` before `properties`.** A call with a bad `itemType` and a bad (or
+missing) `properties` returns `400 Unknown component <value>` and the properties error never
+surfaces — so a caller debugging a properties problem against a wrong `itemType` will chase the wrong
+parameter. Fix `itemType` first.
+
+`componentType` on the component tools is a different argument and **does** come from
+`lumics_list_component_types`. The two are not interchangeable.
+
 ### `lumics_get_metric_summary` ranks locally
 
 The `metrics/summaries` endpoint's own vendor description advertises "top X lists of devices", and
@@ -503,7 +600,10 @@ pools. Two things govern this whole group.
 `<module>_<group>_<type>` key such as `cisco_ast_devices`, and the vendor documents no enumeration
 anywhere (spec §14 defect 14). A wrong key returns a 404 that is indistinguishable from "this type
 has no members". `lumics_list_component_types` exists for exactly that lookup — call it first and
-copy a value verbatim.
+copy a value verbatim. It is the lookup for `componentType` **only**: its ids are not valid as a
+metric tool's `itemType` (spec §14 defect 19), and neither it nor
+`lumics_get_device_definition_components` enumerates metric _property_ names (defect 22, which
+corrects defect 14 on that point).
 
 **Three of these five endpoints accept no `limit`.** See
 [There is no pagination](#there-is-no-pagination); each affected tool carries its own completeness
@@ -584,9 +684,19 @@ created by discovery, so renaming one changes its label in Lumics and does not t
 
 **Returns** an array of `{id, module, group, type}`, e.g.
 `{"id":"cisco_ast_devices","module":"cisco","group":"ast","type":"devices"}`. Cheap and small.
+**`type` is not always present**: 41 of 246 entries omitted it on the measured tenant, and the rule
+observed is that it appears only when `id` has three or more underscore-separated segments (spec §14
+defect 20). Spec §6.4 documents an unconditional four-field object. Treat `type` as optional; `id`,
+`module` and `group` were present on every entry.
 
-This is the lookup tool for the rest of the group: `id` is what `componentType` and the metric
-tools' `itemType` take, and `module` is what `moduleType` takes.
+This is the lookup tool for the component tools: `id` is what `componentType` takes, and `module` is
+what `moduleType` takes.
+
+**It is _not_ the lookup for the metric tools' `itemType`.** The ids here are **plural aliases**, and
+213 of the 246 were rejected by the metric endpoints with `400 Unknown component <value>` (spec §14
+defect 19) — `snmp_common_cpus` fails where `snmp_common_cpu` succeeds. See
+[Metric `itemType`](#metric-itemtype-the-singular-id-not-the-component-type-id) for where a usable
+value comes from.
 
 ### `lumics_get_device_definition_components`
 
@@ -608,6 +718,17 @@ tools' `itemType` take, and `module` is what `moduleType` takes.
 This is Lumics platform metadata, not tenant data: identical for every company, describing every
 type the product supports rather than the types this tenant uses. It is large. If all you need is a
 valid component type key for this tenant, call `lumics_list_component_types` instead.
+
+**This is where a metric `itemType` comes from.** Take the module and group out of an entry's
+`filePath` (`/components/snmp/common/Cpu.yml` → `snmp`, `common`) and join them to the singular
+`data.itemType` (`cpu`) with underscores → `snmp_common_cpu`. `data.componentAlias` is the plural
+form `lumics_list_component_types` returns and the metrics API rejects.
+
+**It carries no metric property names.** `data.schema` holds _configuration_ fields — `ifDescr`,
+`ifIndex`, `ifAlias` — not metrics: across the whole 386 kB payload there were zero occurrences of
+`Calculated` or `sysUpTime` (spec §14 defect 22, correcting defect 14). To find a metric property
+name, use [`lumics_get_metric_summary`](#this-is-the-only-way-to-enumerate-metric-property-names),
+which is the only endpoint that enumerates them and does so for device-scoped metrics only.
 
 ---
 
@@ -1186,9 +1307,18 @@ rather than merely annotated `destructiveHint`.
 ## Metrics — spec §12
 
 Five tools, one per endpoint in spec §12 — note that §12.3 documents two. Read
-[Time windows](#time-windows-on-metric-tools), [Metric resolution](#metric-resolution-datapoints) and
+[Time windows](#time-windows-on-metric-tools), [Metric resolution](#metric-resolution-datapoints),
+[Metric `properties`](#metric-properties-required-and-a-wrong-one-is-not-an-error),
+[Metric `itemType`](#metric-itemtype-the-singular-id-not-the-component-type-id) and
 [`lumics_get_metric_summary` ranks locally](#lumics_get_metric_summary-ranks-locally) before using
-any of them; those three behaviours apply across the group and are not repeated per tool.
+any of them; those five behaviours apply across the group and are not repeated per tool.
+
+**The vendor documentation is wrong about this group in four measured ways.** `properties` is
+required, not optional; an invalid `properties` value is accepted with HTTP 200 and empty stats;
+`lumics_list_component_types` ids are not `itemType` values; and `/summarize` is orders of magnitude
+slower than its siblings. All four were measured against a live tenant on 2026-07-30 and are recorded
+as spec §14 defects 17–21. What was decided about them is
+[ADR-003](./adr/ADR-003-metric-layer-live-contract-corrections.md).
 
 All five are **Read**, so all five are available under `LUMICS_READ_ONLY=1`. Two of them —
 `lumics_get_device_metrics` and `lumics_get_device_item_metrics` — additionally require
@@ -1197,24 +1327,29 @@ All five are **Read**, so all five are available under `LUMICS_READ_ONLY=1`. Two
 ### The shared metric argument set
 
 Four of the five tools take this set (spec §12.0). Per-tool tables below name only their own path
-arguments and any deviation.
+arguments, `properties`, and any deviation.
 
-| Argument         | Type    | Required | Default                | Constraints and notes                                                                                                                                       |
-| ---------------- | ------- | -------- | ---------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `lookback`       | string  | Optional | `1h`                   | `<integer><unit>`, unit `m`/`h`/`d`. Mutually exclusive with `from`. Span > 0 and ≤ 366 days                                                                |
-| `from`           | string  | Optional | `to` minus `lookback`  | ISO-8601. Mutually exclusive with `lookback`                                                                                                                |
-| `to`             | string  | Optional | now                    | ISO-8601                                                                                                                                                    |
-| `dataPoints`     | integer | Optional | **`60`** (always sent) | 1–5000. Number of points across the window. The API requires this or `width`; `width` is not exposed                                                        |
-| `interval`       | enum    | Optional | Lumics chooses         | `minute`, `fiveMin`, `hour`, `day`. Overrides the rollup granularity. Leave unset unless you have a reason                                                  |
-| `minIntervals`   | integer | Optional | 40 (Lumics' default)   | 1–10000. How many intervals must fall in the window for a rollup collection to be eligible. Lower it if a short window returns nothing                      |
-| `aggregate`      | boolean | Optional | —                      | On-the-fly aggregation, so points are rollups matching the requested resolution rather than raw samples                                                     |
-| `alignTimeRange` | boolean | Optional | —                      | Snap the window to hour/day/month boundaries. Lumics then returns data for the **snapped** window; the response notes state the effective one               |
-| `properties`     | string  | Optional | all properties         | Comma-separated metric property paths, e.g. `status` or `aggr-space-attributes.size-used`. **The single most effective way to keep a response small**       |
-| `lastMetric`     | boolean | Optional | —                      | Return only the most recent matching metric. Use this for "what is the current status" — far cheaper than fetching a series                                 |
-| `isMonitored`    | boolean | Optional | —                      | Restrict to components Lumics actively monitors, which filters out empty results                                                                            |
-| `limit`          | integer | Optional | **none sent**          | 1–1000. A cap on result **rows**, not resolution. Unlike the list tools this has **no default**: nothing is sent unless you ask for it. See below           |
-| `itemType`       | string  | Optional | all types              | Component type to restrict to, e.g. `snmp_f5_f5pools`; or the literal `device` for device-level metrics. Discover values with `lumics_list_component_types` |
-| `fields`         | array   | Optional | all fields             | ≤ 50 top-level names                                                                                                                                        |
+**One argument in it is required: `properties`.** Spec §12.0 marks it optional and the live API
+rejects the call without it. Read
+[Metric `properties`](#metric-properties-required-and-a-wrong-one-is-not-an-error) before using any
+of these four tools — a wrong value there is not an error, it is a successful empty answer.
+
+| Argument         | Type    | Required     | Default                | Constraints and notes                                                                                                                                                                                                                         |
+| ---------------- | ------- | ------------ | ---------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `lookback`       | string  | Optional     | `1h`                   | `<integer><unit>`, unit `m`/`h`/`d`. Mutually exclusive with `from`. Span > 0 and ≤ 366 days                                                                                                                                                  |
+| `from`           | string  | Optional     | `to` minus `lookback`  | ISO-8601. Mutually exclusive with `lookback`                                                                                                                                                                                                  |
+| `to`             | string  | Optional     | now                    | ISO-8601                                                                                                                                                                                                                                      |
+| `dataPoints`     | integer | Optional     | **`60`** (always sent) | 1–5000. Number of points across the window. The API requires this or `width`; `width` is not exposed                                                                                                                                          |
+| `interval`       | enum    | Optional     | Lumics chooses         | `minute`, `fiveMin`, `hour`, `day`. Overrides the rollup granularity. Leave unset unless you have a reason                                                                                                                                    |
+| `minIntervals`   | integer | Optional     | 40 (Lumics' default)   | 1–10000. How many intervals must fall in the window for a rollup collection to be eligible. Lower it if a short window returns nothing                                                                                                        |
+| `aggregate`      | boolean | Optional     | —                      | On-the-fly aggregation, so points are rollups matching the requested resolution rather than raw samples                                                                                                                                       |
+| `alignTimeRange` | boolean | Optional     | —                      | Snap the window to hour/day/month boundaries. Lumics then returns data for the **snapped** window; the response notes state the effective one                                                                                                 |
+| `properties`     | string  | **Required** | —                      | Comma-separated `<TypeGroup>.<metric>` paths, e.g. `Calculated.cpu`. Optional on `lumics_get_metric_summary` only. A wrong value is **not** an error — see [Metric `properties`](#metric-properties-required-and-a-wrong-one-is-not-an-error) |
+| `lastMetric`     | boolean | Optional     | —                      | Return only the most recent matching metric. Use this for "what is the current status" — far cheaper than fetching a series                                                                                                                   |
+| `isMonitored`    | boolean | Optional     | —                      | Restrict to components Lumics actively monitors, which filters out empty results                                                                                                                                                              |
+| `limit`          | integer | Optional     | **none sent**          | 1–1000. A cap on result **rows**, not resolution. Unlike the list tools this has **no default**: nothing is sent unless you ask for it. See below                                                                                             |
+| `itemType`       | string  | Optional     | all types              | The **singular** component id, e.g. `snmp_common_cpu`, or the literal `device`. **Not** a `lumics_list_component_types` id — see [Metric `itemType`](#metric-itemtype-the-singular-id-not-the-component-type-id)                              |
+| `fields`         | array   | Optional     | all fields             | ≤ 50 top-level names                                                                                                                                                                                                                          |
 
 Not exposed on any metric tool: `componentQuery`, `filters` and `width`. See
 [Deliberate omissions](#deliberate-omissions).
@@ -1263,11 +1398,12 @@ effective one describes the data.
 - **Endpoint:** `GET /metrics/companies/:companyId/modules/:moduleType` (spec §12.1)
 - **Gating:** none
 
-| Argument                         | Type   | Required     | Default             | Constraints                                                                                                                                              |
-| -------------------------------- | ------ | ------------ | ------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `moduleType`                     | string | **Required** | —                   | Polling module name, e.g. `snmp`, `ping`, `netapp`. No fixed list is documented; discover from a device's `modules` map or `lumics_list_component_types` |
-| `companyId`                      | string | Optional     | `LUMICS_COMPANY_ID` | 24-char hex ObjectId                                                                                                                                     |
-| _the shared metric argument set_ |        | Optional     | see above           | `sum` is **not** accepted here                                                                                                                           |
+| Argument                     | Type   | Required     | Default             | Constraints                                                                                                                                                                                                       |
+| ---------------------------- | ------ | ------------ | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `moduleType`                 | string | **Required** | —                   | Polling module name, e.g. `snmp`, `ping`, `netapp`. No fixed list is documented; discover from a device's `modules` map or the `module` field of a `lumics_list_component_types` row                              |
+| `properties`                 | string | **Required** | —                   | `<TypeGroup>.<metric>`, comma-separated — `Calculated.cpu`. Omitting it is a 400; a wrong value is a 200 with empty stats. See [Metric `properties`](#metric-properties-required-and-a-wrong-one-is-not-an-error) |
+| `companyId`                  | string | Optional     | `LUMICS_COMPANY_ID` | 24-char hex ObjectId                                                                                                                                                                                              |
+| _the rest of the shared set_ |        | Optional     | see above           | `sum` is **not** accepted here                                                                                                                                                                                    |
 
 **Returns** the `data` array from the metric envelope: one row per item per time bucket, each with
 `_id`, `item`, `type`, `timeMs` and a `stats` map (type bucket → property → value, with `status`
@@ -1284,12 +1420,13 @@ rather than a series. For a total or average across components instead of a row 
 - **Endpoint:** `GET /metrics/companies/:companyId/modules/:moduleType/summarize` (spec §12.2)
 - **Gating:** none
 
-| Argument                         | Type   | Required     | Default                   | Constraints                                                                                                                                                                                                |
-| -------------------------------- | ------ | ------------ | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `moduleType`                     | string | **Required** | —                         | Polling module name                                                                                                                                                                                        |
-| `companyId`                      | string | Optional     | `LUMICS_COMPANY_ID`       | 24-char hex ObjectId                                                                                                                                                                                       |
-| `sum`                            | enum   | Optional     | average across components | `min`, `max` or `avg`. **A property NAME, not a boolean.** Its presence switches the cross-component reduction from average to sum; its value picks the per-component rollup property that feeds the total |
-| _the shared metric argument set_ |        | Optional     | see above                 | —                                                                                                                                                                                                          |
+| Argument                     | Type   | Required     | Default                   | Constraints                                                                                                                                                                                                |
+| ---------------------------- | ------ | ------------ | ------------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `moduleType`                 | string | **Required** | —                         | Polling module name                                                                                                                                                                                        |
+| `properties`                 | string | **Required** | —                         | As on `lumics_get_company_metrics`. Required here too, despite spec §12.0                                                                                                                                  |
+| `companyId`                  | string | Optional     | `LUMICS_COMPANY_ID`       | 24-char hex ObjectId                                                                                                                                                                                       |
+| `sum`                        | enum   | Optional     | average across components | `min`, `max` or `avg`. **A property NAME, not a boolean.** Its presence switches the cross-component reduction from average to sum; its value picks the per-component rollup property that feeds the total |
+| _the rest of the shared set_ |        | Optional     | see above                 | —                                                                                                                                                                                                          |
 
 **Returns** the `data` array: one row per **time bucket** rather than per component, each with an
 integer bucket `_id`, `type`, `timeMs`, `count` and `countAggDocs` describing the bucket, and `stats`.
@@ -1299,17 +1436,38 @@ Two things to carry into any answer built on this: **buckets with no data are om
 than returned as zero**, so do not read a gap as a zero; and if a short window returns nothing,
 lower `minIntervals` — that is how the vendor's own example gets buckets out of a ten-hour range.
 
+**This endpoint is slow, in a different class from the rest of the group.** It aggregates every
+matching component in the company before it answers, and was measured taking **over 90 seconds
+without returning at all** where §12.1 and §12.3 answered the same module and window in one to two
+seconds (spec §14 defect 21). Nothing in the vendor documentation mentions cost, scale or timeout on
+it. This server therefore gives it a **three-minute deadline of its own** instead of the shared
+`LUMICS_TIMEOUT_MS` — or the configured timeout, whichever is larger — and attempts it **exactly
+once**: three attempts at three minutes is nine minutes of silence, which from a client reads as a
+hung server, and a retry cannot help an endpoint that is slow because of how much work it is doing.
+
+On a large tenant it can still time out. **A timeout there is a timeout, not an empty result**, and
+the error says so in as many words along with what to make smaller: `itemType` first (it is the
+strongest lever, since the cost is the number of components aggregated), then a narrower
+`properties`, then a shorter window — or `lumics_get_company_metrics`, which reads the same module
+without the cross-component aggregation. Do not report an absence of data on the strength of it.
+
+Because the endpoint never returned during the contract run, **everything the vendor documents about
+its response is unverified against live behaviour**: the envelope, the `sum` semantics, `type:
+"summed"`, `components`, and the integer bucket `_id`. Treat any answer built on this tool's response
+shape as unexercised.
+
 ### `lumics_get_device_metrics`
 
 - **Class:** Read
 - **Endpoint:** `GET /metrics/devices/:id/modules/:moduleType` (spec §12.3)
 - **Gating:** requires `LUMICS_COMPANY_ID` — see below
 
-| Argument                         | Type   | Required     | Default   | Constraints                                      |
-| -------------------------------- | ------ | ------------ | --------- | ------------------------------------------------ |
-| `deviceId`                       | string | **Required** | —         | 24-char hex ObjectId; from `lumics_list_devices` |
-| `moduleType`                     | string | **Required** | —         | Polling module name                              |
-| _the shared metric argument set_ |        | Optional     | see above | `sum` is **not** accepted here                   |
+| Argument                     | Type   | Required     | Default   | Constraints                                      |
+| ---------------------------- | ------ | ------------ | --------- | ------------------------------------------------ |
+| `deviceId`                   | string | **Required** | —         | 24-char hex ObjectId; from `lumics_list_devices` |
+| `moduleType`                 | string | **Required** | —         | Polling module name                              |
+| `properties`                 | string | **Required** | —         | As on `lumics_get_company_metrics`               |
+| _the rest of the shared set_ |        | Optional     | see above | `sum` is **not** accepted here                   |
 
 **No `companyId`** — this path has no company segment, so the device id addresses the request on its
 own. The company pin still applies: this server reads the device inside `LUMICS_COMPANY_ID` first and
@@ -1329,12 +1487,13 @@ unset for a series. For one specific component, or the device's own device-level
 - **Endpoint:** `GET /metrics/devices/:id/modules/:moduleType/:item` (spec §12.3)
 - **Gating:** requires `LUMICS_COMPANY_ID` — see below
 
-| Argument                         | Type   | Required     | Default   | Constraints                                                                                                                                                 |
-| -------------------------------- | ------ | ------------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `deviceId`                       | string | **Required** | —         | 24-char hex ObjectId of the device that owns the item                                                                                                       |
-| `moduleType`                     | string | **Required** | —         | Polling module name                                                                                                                                         |
-| `itemId`                         | string | **Required** | —         | 24-char hex ObjectId. **Pass the device's own id for device-level metrics** (CPU, memory, uptime), or a component id for one interface, fan, pool or volume |
-| _the shared metric argument set_ |        | Optional     | see above | Neither `sum` nor `itemType` is accepted — the item is already identified                                                                                   |
+| Argument                     | Type   | Required     | Default   | Constraints                                                                                                                                                 |
+| ---------------------------- | ------ | ------------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `deviceId`                   | string | **Required** | —         | 24-char hex ObjectId of the device that owns the item                                                                                                       |
+| `moduleType`                 | string | **Required** | —         | Polling module name                                                                                                                                         |
+| `itemId`                     | string | **Required** | —         | 24-char hex ObjectId. **Pass the device's own id for device-level metrics** (CPU, memory, uptime), or a component id for one interface, fan, pool or volume |
+| `properties`                 | string | **Required** | —         | As on `lumics_get_company_metrics`. Required on this endpoint too — the single-item read is no exception                                                    |
+| _the rest of the shared set_ |        | Optional     | see above | Neither `sum` nor `itemType` is accepted — the item is already identified                                                                                   |
 
 **No `companyId`**, and the same device-ownership check as `lumics_get_device_metrics`: the device is
 read inside `LUMICS_COMPANY_ID` before any metric request, one extra round trip, and the tool is not
@@ -1356,8 +1515,8 @@ checking one thing.
 | --------------- | ------- | ------------ | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
 | `moduleType`    | string  | **Required** | —                   | Polling module name                                                                                                                                                                                        |
 | `companyId`     | string  | Optional     | `LUMICS_COMPANY_ID` | 24-char hex ObjectId                                                                                                                                                                                       |
-| `itemType`      | string  | Optional     | all types           | `device` for device-level summaries, or a component type for component-level ones                                                                                                                          |
-| `properties`    | string  | Optional     | all properties      | Comma-separated metric property paths                                                                                                                                                                      |
+| `itemType`      | string  | Optional     | all types           | `device` for device-level summaries, or a **singular** component id for component-level ones — see [Metric `itemType`](#metric-itemtype-the-singular-id-not-the-component-type-id)                         |
+| `properties`    | string  | Optional     | no filter           | Comma-separated `<TypeGroup>.<metric>` paths. **Optional here, and a filter rather than a projection** — start without it. See below                                                                       |
 | `lookback`      | string  | Optional     | `1h`                | As in the shared set                                                                                                                                                                                       |
 | `from`, `to`    | string  | Optional     | see shared set      | ISO-8601 with an explicit zone, as in the shared set                                                                                                                                                       |
 | `sortBy`        | string  | Optional     | no sort             | 1–200 characters. Dot-separated path to the numeric value to rank by, resolved against the item and then inside its `stats` — e.g. `Calculated.cpu.avg`. **Applied by this server**                        |
@@ -1383,5 +1542,34 @@ a hundred rows — with a note giving the cap and the number dropped.
 Notes on every response state that the endpoint accepts no limit or pagination of any kind, that what
 follows is therefore the full matching set, that `topN`/`sortBy` were applied locally afterwards, how
 many items had no numeric value at the `sortBy` path, and Lumics' own `count` so you can see when
-fewer rows are visible than were summarised. Narrowing `itemType`, `properties` or the window is the
-only way to make the response smaller.
+fewer rows are visible than were summarised. Narrowing `itemType` or the window is the only safe way
+to make the response smaller — narrowing `properties` here removes **items**, not detail.
+
+#### This is the only way to enumerate metric property names
+
+Called with **no `properties`**, this tool is the sole discovery path for the values the other four
+metric tools require. Read `data.<class>[].stats`: the outer keys are metric type groups
+(`Calculated`, `Rate`, `TimeTicks`) and the inner keys are metric names, so joining them with a dot
+gives a `properties` value the other tools accept.
+
+Two limits, both of which bound what the metric group can do:
+
+- **Device-scoped names only.** Spec §6.5 `deviceDefinitions/components` carries no metric property
+  names — it is the inventory schema, holding configuration fields such as `ifDescr` and `ifIndex`
+  (spec §14 defect 22). So a **component-level** property name, e.g. `Calculated.ifInOctets` on an
+  interface, is discoverable from **no endpoint at all**; the one known example was found by probing.
+  It has to come from the Lumics UI or from someone who already knows it. This is a gap in the vendor
+  API, not something this server can close.
+- **The response key is module-dependent** — `devices` for `snmp`, `http_endpoints` for `http`. This
+  tool returns the array directly when one class comes back, naming the class in a note, so the
+  variation is visible rather than silently assumed away.
+
+And note the parameter's different meaning here. On the other four tools `properties` **projects**;
+on this one it **filters** — supplying `Calculated.cpu` returned `count: 0`, because items that do
+not carry the property are dropped from the result entirely rather than returned with a narrowed
+`stats`. If a response is unexpectedly empty and you passed `properties`, that is the first suspect.
+
+Module coverage is also partial and undocumented: `snmp` and `http` answered 200, `ping` and `syslog`
+returned **HTML error pages** rather than JSON, and `deviceConfigs` returned 500 (spec §14 defect 23).
+An HTML body is not a documented response for any endpoint in this API, so a non-JSON failure on this
+route is possible and is surfaced as an error rather than parsed.

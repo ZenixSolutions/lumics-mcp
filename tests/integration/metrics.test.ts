@@ -20,8 +20,10 @@
 import { describe, expect, it } from 'vitest';
 import {
   DEFAULT_LIST_LIMIT,
+  DEFAULT_MAX_ATTEMPTS,
   DEFAULT_METRIC_DATA_POINTS,
   METRIC_INTERVALS,
+  METRIC_SUMMARIZE_TIMEOUT_MS,
   METRIC_SUM_PROPERTIES,
 } from '../../src/constants.js';
 import {
@@ -31,8 +33,11 @@ import {
   TEST_DEVICE_ID,
 } from '../helpers/config.js';
 import {
+  errorResponse,
   jsonResponse,
   recordFetch,
+  recordSleep,
+  timeoutFetch,
   type FetchRecorder,
   type RecordedCall,
 } from '../helpers/fetch.js';
@@ -43,8 +48,17 @@ import type { LumicsConfig } from '../../src/config.js';
 const C = TEST_COMPANY_ID;
 const HOUR_MS = 3_600_000;
 
+/**
+ * A `properties` value that is both REQUIRED (live finding 1: the four
+ * metric-data endpoints answer 400 without it) and well-formed (live finding 2:
+ * an ill-formed one returns 200 with empty stats). Every fixture below carries a
+ * matching `Calculated.cpu` stat, so the silent-empty disclosure stays quiet
+ * except in the tests that are specifically about it.
+ */
+const PROPS = 'Calculated.cpu';
+
 const SERIES = {
-  data: [{ time: 1_785_000_000_000, stats: { status: { avg: 1 } } }],
+  data: [{ time: 1_785_000_000_000, stats: { Calculated: { cpu: { avg: 1 } } } }],
   from: '2026-07-29T11:00:00.000Z',
   to: '2026-07-29T12:00:00.000Z',
   timeIncrement: 60_000,
@@ -60,22 +74,27 @@ const DATA_ENDPOINTS: readonly {
 }[] = [
   {
     tool: 'lumics_get_company_metrics',
-    args: { moduleType: 'snmp' },
+    args: { moduleType: 'snmp', properties: PROPS },
     path: `/metrics/companies/${C}/modules/snmp`,
   },
   {
     tool: 'lumics_summarize_company_metrics',
-    args: { moduleType: 'snmp' },
+    args: { moduleType: 'snmp', properties: PROPS },
     path: `/metrics/companies/${C}/modules/snmp/summarize`,
   },
   {
     tool: 'lumics_get_device_metrics',
-    args: { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
+    args: { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: PROPS },
     path: `/metrics/devices/${TEST_DEVICE_ID}/modules/snmp`,
   },
   {
     tool: 'lumics_get_device_item_metrics',
-    args: { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', itemId: TEST_COMPONENT_ID },
+    args: {
+      deviceId: TEST_DEVICE_ID,
+      moduleType: 'snmp',
+      properties: PROPS,
+      itemId: TEST_COMPONENT_ID,
+    },
     path: `/metrics/devices/${TEST_DEVICE_ID}/modules/snmp/${TEST_COMPONENT_ID}`,
   },
 ];
@@ -202,7 +221,7 @@ describe('dataPoints is sent by default on all four metric-data endpoints (spec 
   it('never exposes width, which would silently override dataPoints', async () => {
     const { call } = await metricExchange(
       'lumics_get_company_metrics',
-      { moduleType: 'snmp', width: 1_920 },
+      { moduleType: 'snmp', properties: PROPS, width: 1_920 },
       SERIES,
     );
     expect(call.url.searchParams.has('width')).toBe(false);
@@ -212,6 +231,7 @@ describe('dataPoints is sent by default on all four metric-data endpoints (spec 
   it.each([0, -1, 5_001, 1.5])('rejects a dataPoints of %s locally', async (dataPoints) => {
     const { calls } = await failingMetricExchange('lumics_get_company_metrics', {
       moduleType: 'snmp',
+      properties: PROPS,
       dataPoints,
     });
     expect(calls).toHaveLength(0);
@@ -226,7 +246,7 @@ describe('sum is a string enum on summarize (spec section 12.2)', () => {
   it.each(METRIC_SUM_PROPERTIES)('sends sum=%s verbatim', async (sum) => {
     const { call, notes } = await metricExchange(
       'lumics_summarize_company_metrics',
-      { moduleType: 'snmp', sum },
+      { moduleType: 'snmp', properties: PROPS, sum },
       SERIES,
     );
     expect(call.query.sum).toBe(sum);
@@ -242,6 +262,7 @@ describe('sum is a string enum on summarize (spec section 12.2)', () => {
   ])('rejects a sum of %s before spending a request', async (_label, sum) => {
     const { calls } = await failingMetricExchange('lumics_summarize_company_metrics', {
       moduleType: 'snmp',
+      properties: PROPS,
       sum,
     });
     expect(calls).toHaveLength(0);
@@ -250,7 +271,7 @@ describe('sum is a string enum on summarize (spec section 12.2)', () => {
   it('omits sum entirely when it was not asked for, and says the result is an AVERAGE', async () => {
     const { call, notes } = await metricExchange(
       'lumics_summarize_company_metrics',
-      { moduleType: 'snmp' },
+      { moduleType: 'snmp', properties: PROPS },
       SERIES,
     );
     expect(call.url.searchParams.has('sum')).toBe(false);
@@ -276,7 +297,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   it('sends fromMs and toMs as epoch milliseconds derived from a lookback', async () => {
     const { call } = await metricExchange(
       'lumics_get_company_metrics',
-      { moduleType: 'snmp', lookback: '6h' },
+      { moduleType: 'snmp', properties: PROPS, lookback: '6h' },
       SERIES,
     );
     const fromMs = Number(call.query.fromMs);
@@ -291,7 +312,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   it('defaults to a one-hour window, matching the API default', async () => {
     const { call, notes } = await metricExchange(
       'lumics_get_company_metrics',
-      { moduleType: 'snmp' },
+      { moduleType: 'snmp', properties: PROPS },
       SERIES,
     );
     expect(Number(call.query.toMs) - Number(call.query.fromMs)).toBe(HOUR_MS);
@@ -301,7 +322,12 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   it('converts an ISO-8601 from/to pair, so a model never computes epoch ms', async () => {
     const { call } = await metricExchange(
       'lumics_get_company_metrics',
-      { moduleType: 'snmp', from: '2026-07-28T00:00:00Z', to: '2026-07-29T00:00:00Z' },
+      {
+        moduleType: 'snmp',
+        properties: PROPS,
+        from: '2026-07-28T00:00:00Z',
+        to: '2026-07-29T00:00:00Z',
+      },
       SERIES,
     );
     expect(call.query.fromMs).toBe(String(Date.UTC(2026, 6, 28)));
@@ -318,7 +344,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
         minIntervals: 10,
         aggregate: true,
         alignTimeRange: false,
-        properties: 'status,Integer.statusEnabledState',
+        properties: 'Calculated.cpu,TimeTicks.sysUpTime',
         lastMetric: true,
         isMonitored: true,
         limit: 25,
@@ -332,7 +358,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
       minIntervals: '10',
       aggregate: 'true',
       alignTimeRange: 'false',
-      properties: 'status,Integer.statusEnabledState',
+      properties: 'Calculated.cpu,TimeTicks.sysUpTime',
       lastMetric: 'true',
       isMonitored: 'true',
       limit: '25',
@@ -343,19 +369,19 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   it('omits every optional parameter the caller did not set', async () => {
     const { call } = await metricExchange(
       'lumics_get_company_metrics',
-      { moduleType: 'snmp' },
+      { moduleType: 'snmp', properties: PROPS },
       SERIES,
     );
-    // Only the three the server always sends: the window and the resolution.
+    // Only the window, the resolution, and the caller's required `properties`.
     // `limit` is NOT among them — see the metric-row-cap block below.
-    expect(Object.keys(call.query).sort()).toEqual(['dataPoints', 'fromMs', 'toMs']);
+    expect(Object.keys(call.query).sort()).toEqual(['dataPoints', 'fromMs', 'properties', 'toMs']);
     expect(call.query.limit).toBeUndefined();
   });
 
   it.each(METRIC_INTERVALS)('accepts the documented interval %s', async (interval) => {
     const { call } = await metricExchange(
       'lumics_get_company_metrics',
-      { moduleType: 'snmp', interval },
+      { moduleType: 'snmp', properties: PROPS, interval },
       SERIES,
     );
     expect(call.query.interval).toBe(interval);
@@ -364,6 +390,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   it('rejects an undocumented interval', async () => {
     const { calls } = await failingMetricExchange('lumics_get_company_metrics', {
       moduleType: 'snmp',
+      properties: PROPS,
       interval: 'week',
     });
     expect(calls).toHaveLength(0);
@@ -384,6 +411,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   it('rejects a from/lookback conflict rather than guessing', async () => {
     const { calls, text } = await failingMetricExchange('lumics_get_company_metrics', {
       moduleType: 'snmp',
+      properties: PROPS,
       from: '2026-07-28T00:00:00Z',
       lookback: '6h',
     });
@@ -394,6 +422,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   it('rejects a garbage lookback at the schema, before the time layer sees it', async () => {
     const { calls } = await failingMetricExchange('lumics_get_company_metrics', {
       moduleType: 'snmp',
+      properties: PROPS,
       lookback: 'last week',
     });
     expect(calls).toHaveLength(0);
@@ -402,6 +431,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   it('rejects a reversed window', async () => {
     const { calls, text } = await failingMetricExchange('lumics_get_company_metrics', {
       moduleType: 'snmp',
+      properties: PROPS,
       from: '2026-07-29T00:00:00Z',
       to: '2026-07-28T00:00:00Z',
     });
@@ -418,7 +448,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   it('returns the data array, not the envelope', async () => {
     const { payload } = await metricExchange(
       'lumics_get_device_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: PROPS },
       SERIES,
     );
     expect(payload).toEqual(SERIES.data);
@@ -427,7 +457,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   it('reports the window Lumics actually served, which alignTimeRange can change', async () => {
     const { notes } = await metricExchange(
       'lumics_get_device_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', alignTimeRange: true },
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: PROPS, alignTimeRange: true },
       SERIES,
     );
     expect(notes).toContain('EFFECTIVE RESULT:');
@@ -440,7 +470,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   it('reads an epoch-millisecond envelope window as well as an ISO one', async () => {
     const { notes } = await metricExchange(
       'lumics_get_device_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: PROPS },
       { data: [], fromMs: Date.UTC(2026, 6, 29, 11), toMs: Date.UTC(2026, 6, 29, 12) },
     );
     expect(notes).toContain('covers 2026-07-29T11:00:00.000Z to 2026-07-29T12:00:00.000Z');
@@ -449,7 +479,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   it('omits the effective-window note when the envelope carries no metadata', async () => {
     const { notes } = await metricExchange(
       'lumics_get_device_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: PROPS },
       { data: [] },
     );
     expect(notes).toContain('WINDOW AND RESOLUTION:');
@@ -459,7 +489,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   it('treats an absent body as an empty series rather than failing', async () => {
     const { payload } = await metricExchange(
       'lumics_get_device_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: PROPS },
       null,
     );
     expect(payload).toEqual([]);
@@ -468,7 +498,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   it('treats a missing data key as an empty series', async () => {
     const { payload } = await metricExchange(
       'lumics_get_device_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: PROPS },
       { from: '2026-07-29T11:00:00.000Z' },
     );
     expect(payload).toEqual([]);
@@ -480,7 +510,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   ])('surfaces %s as documented drift', async (_label, response) => {
     const { text } = await failingMetricExchange(
       'lumics_get_device_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: PROPS },
       response,
     );
     expect(text).toContain('invalid_response');
@@ -489,7 +519,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   it('surfaces a non-array data field as drift', async () => {
     const { text } = await failingMetricExchange(
       'lumics_get_device_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: PROPS },
       { data: { nope: true } },
     );
     expect(text).toContain('documented as an array');
@@ -530,6 +560,7 @@ describe('lumics_get_device_item_metrics has a deliberately reduced surface', ()
       {
         deviceId: TEST_DEVICE_ID,
         moduleType: 'snmp',
+        properties: PROPS,
         itemId: TEST_COMPONENT_ID,
         itemType: 'snmp_f5_f5pools',
       },
@@ -541,7 +572,7 @@ describe('lumics_get_device_item_metrics has a deliberately reduced surface', ()
   it('takes the device id as the item id for device-level metrics', async () => {
     const { call } = await metricExchange(
       'lumics_get_device_item_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', itemId: TEST_DEVICE_ID },
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: PROPS, itemId: TEST_DEVICE_ID },
       SERIES,
     );
     expect(call.path).toBe(`/metrics/devices/${TEST_DEVICE_ID}/modules/snmp/${TEST_DEVICE_ID}`);
@@ -584,7 +615,7 @@ describe('metric tools never cap a series the caller did not ask to cap (finding
   it('discloses that no cap was applied, and how a budget trim would differ', async () => {
     const { notes } = await metricExchange(
       'lumics_get_company_metrics',
-      { moduleType: 'snmp' },
+      { moduleType: 'snmp', properties: PROPS },
       SERIES,
     );
     expect(notes).toContain('ROW COUNT:');
@@ -597,7 +628,7 @@ describe('metric tools never cap a series the caller did not ask to cap (finding
   it('describes an explicit cap as SERIES truncation, not as inventory completeness', async () => {
     const { notes } = await metricExchange(
       'lumics_get_company_metrics',
-      { moduleType: 'snmp', limit: 25 },
+      { moduleType: 'snmp', properties: PROPS, limit: 25 },
       SERIES,
     );
     expect(notes).toContain('ROW COUNT:');
@@ -641,12 +672,12 @@ describe('metric tools never cap a series the caller did not ask to cap (finding
     const many = {
       data: Array.from({ length: 200 }, (_unused, index) => ({
         time: 1_785_000_000_000 + index * 60_000,
-        stats: { status: { avg: index, blob: 'x'.repeat(80) } },
+        stats: { Calculated: { cpu: { avg: index }, blob: 'x'.repeat(80) } },
       })),
     };
     const { text } = await metricExchange(
       'lumics_get_company_metrics',
-      { moduleType: 'snmp' },
+      { moduleType: 'snmp', properties: PROPS },
       many,
       {
         config: makeConfig({ maxOutputChars: 2_000 }),
@@ -1206,5 +1237,688 @@ describe('no metric tool ever fabricates pagination', () => {
     const { text, call } = await metricExchange(tool, args, response);
     expectNoFabricatedPagination(text);
     expectNoFabricatedQueryParams(call);
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live finding 1: `properties` is REQUIRED on four of the five endpoints
+// ---------------------------------------------------------------------------
+
+/**
+ * `docs/reference/lumics-api-v1.md` lists `properties` as optional on every
+ * metric endpoint, having been transcribed from vendor documentation. The first
+ * live contract run found otherwise: §12.1, §12.2 and both §12.3 endpoints answer
+ * `400 {"error":"Must supply required component metrics as properties parameter"}`
+ * without it, so every metric call this server made was failing outright.
+ *
+ * §12.4 is genuinely optional, and there `properties` means something else
+ * entirely — a filter, not a projection — so it is deliberately left alone.
+ */
+describe('properties is required on the metric-data endpoints (live finding 1)', () => {
+  it.each(DATA_ENDPOINTS.map((entry) => [entry.tool, entry] as const))(
+    '%s refuses a call with no properties, before any request is issued',
+    async (_name, entry: (typeof DATA_ENDPOINTS)[number]) => {
+      const { properties: _dropped, ...withoutProperties } = entry.args;
+      const { text, calls } = await failingMetricExchange(entry.tool, withoutProperties);
+
+      expect(text).toContain('properties');
+      // Nothing reached the wire — not even the device ownership pre-read, since
+      // the schema rejects the arguments before the handler runs. A 400 round
+      // trip for a parameter we know is required is a wasted turn.
+      expect(calls).toHaveLength(0);
+    },
+  );
+
+  it.each(DATA_ENDPOINTS.map((entry) => [entry.tool, entry] as const))(
+    '%s marks properties required in its published input schema',
+    async (_name, entry: (typeof DATA_ENDPOINTS)[number]) => {
+      const harness = await connect(makeConfig(), {
+        clientOptions: { fetchImpl: recordFetch(jsonResponse(SERIES)).fetchImpl },
+      });
+      try {
+        const schema = harness.tool(entry.tool)?.inputSchema as {
+          required?: string[];
+          properties?: Record<string, { description?: string }>;
+        };
+        expect(schema.required ?? []).toContain('properties');
+        // And the description says why, so a model does not have to learn it
+        // from a 400 whose message names a parameter it thought was optional.
+        expect(schema.properties?.properties?.description).toContain('REQUIRED');
+        expect(schema.properties?.properties?.description).toContain(
+          'Must supply required component metrics as properties parameter',
+        );
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+
+  it('leaves properties optional on the summaries endpoint, where it really is', async () => {
+    const { call } = await metricExchange(
+      'lumics_get_metric_summary',
+      { moduleType: 'snmp' },
+      { data: { devices: [] } },
+    );
+    expect(call.url.searchParams.has('properties')).toBe(false);
+
+    const harness = await connect(makeConfig(), {
+      clientOptions: { fetchImpl: recordFetch(jsonResponse({ data: { devices: [] } })).fetchImpl },
+    });
+    try {
+      const required = (
+        harness.tool('lumics_get_metric_summary')?.inputSchema as {
+          required?: string[];
+        }
+      ).required;
+      expect(required ?? []).not.toContain('properties');
+    } finally {
+      await harness.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live finding 2: an invalid `properties` returns 200 with empty stats
+// ---------------------------------------------------------------------------
+
+/**
+ * The most dangerous behaviour on this API, and the reason this module exists in
+ * the shape it does.
+ *
+ * The upstream 400 gate checks only that `properties` is **present and
+ * non-empty** — never that it means anything. `properties=cpu` returned 200 with
+ * 658 rows and `stats: {}` on every one; `properties=bogusXYZ` returned exactly
+ * the same. So a model asks for CPU, receives a clean success with no numbers in
+ * it, and reports "no CPU data available" — a confident negative about a
+ * customer's estate, produced by a malformed parameter.
+ *
+ * Two defences, tested separately here:
+ *
+ *  1. a schema guard that rejects a `properties` with no `Group.metric` entry at
+ *     all, which is the measured form of the trap; and
+ *  2. a runtime check of what came back against what was asked for, which catches
+ *     the forms the schema cannot see — an unknown metric inside a real group, or
+ *     a group that does not exist.
+ */
+describe('a properties value with no Group.metric entry is rejected locally (live finding 2)', () => {
+  it.each(['cpu', 'bogusXYZ', 'cpu,mem', '.cpu', 'Calculated.'])(
+    'rejects %s without spending a request',
+    async (properties) => {
+      const { text, calls } = await failingMetricExchange('lumics_get_company_metrics', {
+        moduleType: 'snmp',
+        properties,
+      });
+      // The error has to teach the syntax, because the API's own answer to this
+      // value is a 200 that teaches nothing.
+      expect(text).toContain('<TypeGroup>.<metric>');
+      expect(text).toContain('Calculated.cpu');
+      expect(calls).toHaveLength(0);
+    },
+  );
+
+  it('rejects it on the summaries endpoint too', async () => {
+    const { calls } = await failingMetricExchange('lumics_get_metric_summary', {
+      moduleType: 'snmp',
+      properties: 'cpu',
+    });
+    expect(calls).toHaveLength(0);
+  });
+
+  it('is deliberately weak: one qualified entry is enough to let the value through', async () => {
+    // No bare name has been PROVEN illegal, only measured useless, so a value
+    // that pairs a qualified entry with a bare one is sent verbatim and left to
+    // the runtime disclosure below. Rejecting it would be this server inventing
+    // a rule the API has not stated.
+    const { call } = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp', properties: 'Calculated.cpu,mem' },
+      SERIES,
+    );
+    expect(call.query.properties).toBe('Calculated.cpu,mem');
+  });
+});
+
+describe('rows that carry none of the requested properties are disclosed (live finding 2)', () => {
+  /** A row shaped like a real one, with whatever `stats` the case needs. */
+  const row = (stats?: unknown) => ({
+    _id: '777777777777777777777777',
+    item: '888888888888888888888888',
+    type: 'snmp_common_cpu',
+    timeMs: 1_785_000_000_000,
+    ...(stats === undefined ? {} : { stats }),
+  });
+
+  const BANNER = 'PROPERTY NAMES MAY BE WRONG';
+
+  it.each(DATA_ENDPOINTS.map((entry) => [entry.tool, entry] as const))(
+    '%s says so rather than letting the result read as "no data"',
+    async (_name, entry: (typeof DATA_ENDPOINTS)[number]) => {
+      const { notes } = await metricExchange(
+        entry.tool,
+        { ...entry.args, properties: 'Calculated.cpu' },
+        { data: [row({}), row({}), row({})] },
+      );
+
+      expect(notes).toContain(BANNER);
+      expect(notes).toContain('THIS IS NOT A STATEMENT THAT NO DATA EXISTS');
+      expect(notes).toContain('3 row(s)');
+      // The three things the disclosure has to carry.
+      expect(notes).toContain('<TypeGroup>.<metric>');
+      expect(notes).toContain('lumics_get_metric_summary');
+      expect(notes).toMatch(/Do NOT tell the user/);
+      // And it must not read as a finding about the estate.
+      expect(notes).toContain('does not support any of that');
+    },
+  );
+
+  it('distinguishes a recognised group with an unknown metric from a group that does not exist', async () => {
+    // Measured: `Rate.ifInOctets` echoed the group back empty — `{"Rate":{}}`.
+    const recognised = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp', properties: 'Rate.ifInOctets' },
+      { data: [row({ Rate: {} })] },
+    );
+    expect(recognised.notes).toContain('the type group came back but held no such metric');
+    expect(recognised.notes).not.toContain('never appeared in any row');
+
+    // Measured: an unrecognised group produces no such key at all.
+    const unrecognised = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp', properties: 'Bogus.cpu' },
+      { data: [row({ Calculated: { cpu: { avg: 3 } } })] },
+    );
+    expect(unrecognised.notes).toContain("its type group never appeared in any row's stats");
+    expect(unrecognised.notes).not.toContain('held no such metric');
+  });
+
+  it('calls out the strongest signal: not one row carried a stats key at all', async () => {
+    const { notes } = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp', properties: 'Bogus.cpu' },
+      { data: [row(), row()] },
+    );
+    expect(notes).toContain('NOT ONE row carried a "stats" key at all');
+  });
+
+  it('names an unqualified entry as the exact measured form of the trap', async () => {
+    // Reachable only alongside a qualified entry, which is what the schema guard
+    // leaves through — so the runtime check is what catches it.
+    const { notes } = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp', properties: 'Calculated.cpu,cpu' },
+      { data: [row({})] },
+    );
+    expect(notes).toContain('carries no "<TypeGroup>." prefix');
+  });
+
+  it('does not flag an unqualified entry that Lumics did answer', async () => {
+    // The premise of the weak schema guard: no bare name has been PROVEN illegal.
+    // If one turns up keyed inside a real group, the response is honest and this
+    // server must not tell the model its own successful call was malformed.
+    const { notes } = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp', properties: 'Calculated.cpu,status' },
+      { data: [row({ Calculated: { cpu: { avg: 1 }, status: { avg: 0 } } })] },
+    );
+    expect(notes).not.toContain(BANNER);
+    expect(notes).not.toContain('SOME PROPERTIES RETURNED NO VALUES');
+  });
+
+  it('reports a partial miss as partial, without impugning the values that did arrive', async () => {
+    const { notes } = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp', properties: 'Calculated.cpu,Calculated.nosuch' },
+      { data: [row({ Calculated: { cpu: { avg: 42 } } })] },
+    );
+    expect(notes).toContain('SOME PROPERTIES RETURNED NO VALUES');
+    expect(notes).toContain('Calculated.nosuch');
+    expect(notes).toContain('can be read normally');
+    // The total-failure banner would overstate this.
+    expect(notes).not.toContain(BANNER);
+  });
+
+  it('stays silent when every requested property resolved', async () => {
+    const { notes } = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp', properties: 'Calculated.cpu,Calculated.mem' },
+      { data: [row({ Calculated: { cpu: { avg: 1 }, mem: { avg: 2 } } })] },
+    );
+    expect(notes).not.toContain(BANNER);
+    expect(notes).not.toContain('SOME PROPERTIES RETURNED NO VALUES');
+  });
+
+  it('treats presence on ANY row as resolved, so a mixed estate is not a false alarm', async () => {
+    // A company-wide query legitimately returns components that do not carry the
+    // metric next to ones that do. Calling that a naming failure would train the
+    // model to ignore the disclosure.
+    const { notes } = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp', properties: 'Calculated.cpu' },
+      { data: [row({}), row({ Calculated: { cpu: { avg: 1 } } }), row({})] },
+    );
+    expect(notes).not.toContain(BANNER);
+  });
+
+  it('says nothing about property names when the series is genuinely empty', async () => {
+    // No rows means no evidence either way, and `absentSeriesNote` already owns
+    // the cases where the emptiness came from the transport. A "your names may be
+    // wrong" note here would be a guess.
+    const { notes } = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp', properties: 'Calculated.cpu' },
+      { data: [] },
+    );
+    expect(notes).not.toContain(BANNER);
+    expect(notes).not.toContain('SOME PROPERTIES RETURNED NO VALUES');
+  });
+
+  it('bounds the note when many properties are unresolved', async () => {
+    const many = Array.from({ length: 9 }, (_unused, index) => `Calculated.p${String(index)}`);
+    const { notes } = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp', properties: many.join(',') },
+      { data: [row({})] },
+    );
+    expect(notes).toContain('and 3 more');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live finding 3: itemType is the SINGULAR component id
+// ---------------------------------------------------------------------------
+
+/**
+ * `lumics_list_component_types` (spec §6.4) returns PLURAL aliases and 213 of the
+ * 246 values it returns are rejected by the metrics API: `snmp_common_cpus`,
+ * `cpus` and `cpu` all answer `400 Unknown component`, while `snmp_common_cpu`
+ * answers 200. Every metric tool used to send the model to that endpoint for this
+ * argument, which is a route to a 400 by construction.
+ */
+describe('itemType routes the model to the singular component id (live finding 3)', () => {
+  const TOOLS_WITH_ITEM_TYPE = [
+    'lumics_get_company_metrics',
+    'lumics_summarize_company_metrics',
+    'lumics_get_device_metrics',
+    'lumics_get_metric_summary',
+  ] as const;
+
+  it.each(TOOLS_WITH_ITEM_TYPE)(
+    '%s describes how to build the id, and from where',
+    async (tool) => {
+      const harness = await connect(makeConfig(), {
+        clientOptions: { fetchImpl: recordFetch(jsonResponse(SERIES)).fetchImpl },
+      });
+      try {
+        const description =
+          (
+            harness.tool(tool)?.inputSchema as {
+              properties?: Record<string, { description?: string }>;
+            }
+          ).properties?.itemType?.description ?? '';
+
+        expect(description).toContain('SINGULAR');
+        expect(description).toContain('snmp_common_cpu');
+        // The endpoint the id is actually constructible from (spec §6.5).
+        expect(description).toContain('lumics_get_device_definition_components');
+        expect(description).toContain('filePath');
+        expect(description).toContain('data.itemType');
+        // A bare "device" remains valid.
+        expect(description).toContain('"device"');
+        // And the ordering trap: a wrong itemType masks a properties problem.
+        expect(description).toContain('validates itemType BEFORE properties');
+
+        // It must no longer send the model to the plural-alias endpoint for this.
+        expect(description).toContain('Do NOT take this value from lumics_list_component_types');
+        expect(description).not.toContain('Discover valid values with lumics_list_component_types');
+      } finally {
+        await harness.close();
+      }
+    },
+  );
+
+  it('points at a metric response as a second discovery source', async () => {
+    const harness = await connect(makeConfig(), {
+      clientOptions: { fetchImpl: recordFetch(jsonResponse(SERIES)).fetchImpl },
+    });
+    try {
+      const description = harness.tool('lumics_get_company_metrics')?.description ?? '';
+      expect(description).toContain('"type" field');
+      expect(description).toContain('singular component id');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('the summaries "nothing matched" note no longer blames the wrong endpoint', async () => {
+    const { notes } = await metricExchange(
+      'lumics_get_metric_summary',
+      { moduleType: 'snmp', itemType: 'snmp_common_cpus' },
+      { data: {}, count: 0 },
+    );
+    expect(notes).toContain('NO ITEMS:');
+    expect(notes).toContain('lumics_get_device_definition_components');
+    expect(notes).toContain('SINGULAR');
+    // It must not state a negative about the estate as the leading explanation.
+    expect(notes).not.toContain('so nothing matched this module');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live finding 4: the only property-name enumeration path is §12.4
+// ---------------------------------------------------------------------------
+
+/**
+ * `/system/deviceDefinitions/components` is the inventory schema and carries no
+ * metric names at all — zero hits for `Calculated` or `sysUpTime` across 386 kB.
+ * The only enumeration path is this endpoint's own `stats` keys, and it has two
+ * limits that a consumer who does not know them will get wrong.
+ */
+describe('lumics_get_metric_summary is documented as the property-name enumerator (live finding 4)', () => {
+  it('says how to read legal properties values out of its response', async () => {
+    const harness = await connect(makeConfig(), {
+      clientOptions: { fetchImpl: recordFetch(jsonResponse({ data: { devices: [] } })).fetchImpl },
+    });
+    try {
+      const description = harness.tool('lumics_get_metric_summary')?.description ?? '';
+
+      expect(description).toContain('data.<class>[].stats');
+      expect(description).toContain('type groups');
+      // The two caveats.
+      expect(description).toContain('DEVICE-scoped');
+      expect(description).toContain('http_endpoints');
+      // And that its own `properties` is a filter, not a projection.
+      expect(description).toContain('filters the result rather than projecting it');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('discloses the filter semantics on every call that sends properties', async () => {
+    const { notes } = await metricExchange(
+      'lumics_get_metric_summary',
+      { moduleType: 'snmp', properties: 'Calculated.cpu' },
+      { data: { devices: [{ id: 'a', stats: { Calculated: { cpu: { avg: 1 } } } }] }, count: 1 },
+    );
+    // Said even though rows came back: a filtered-but-non-empty response is the
+    // more dangerous case, because it looks complete.
+    expect(notes).toContain('PROPERTIES IS A FILTER HERE');
+    expect(notes).toContain('narrower than');
+  });
+
+  it('names properties as the first suspect when a filtered call comes back empty', async () => {
+    const { notes } = await metricExchange(
+      'lumics_get_metric_summary',
+      { moduleType: 'snmp', properties: 'Calculated.cpu' },
+      { data: {}, count: 0 },
+    );
+    expect(notes).toContain('MOST LIKELY CAUSE');
+    expect(notes).toContain('Re-run this call with no "properties" at all');
+  });
+
+  it('stays quiet about the filter when no properties was sent', async () => {
+    const { notes } = await metricExchange(
+      'lumics_get_metric_summary',
+      { moduleType: 'snmp' },
+      { data: { devices: [] } },
+    );
+    expect(notes).not.toContain('PROPERTIES IS A FILTER HERE');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live finding 5: /summarize needs a deadline of its own
+// ---------------------------------------------------------------------------
+
+describe('summarize gets a much larger timeout than the other metric tools (live finding 5)', () => {
+  /** Record the deadline handed to `AbortSignal.timeout()` on each request. */
+  function withTimeoutSpy<T>(body: () => Promise<T>): Promise<{ result: T; deadlines: number[] }> {
+    const deadlines: number[] = [];
+    const original = AbortSignal.timeout.bind(AbortSignal);
+    AbortSignal.timeout = (ms: number) => {
+      deadlines.push(ms);
+      return original(ms);
+    };
+    return body()
+      .then((result) => ({ result, deadlines }))
+      .finally(() => {
+        AbortSignal.timeout = original;
+      });
+  }
+
+  it('sends a deadline of minutes, not the configured 5 seconds', async () => {
+    const { deadlines } = await withTimeoutSpy(async () =>
+      metricExchange(
+        'lumics_summarize_company_metrics',
+        { moduleType: 'snmp', properties: PROPS },
+        SERIES,
+        { config: makeConfig({ timeoutMs: 5_000 }) },
+      ),
+    );
+    // Measured: the endpoint exceeded 90 seconds without returning.
+    expect(deadlines).toHaveLength(1);
+    expect(deadlines[0]).toBeGreaterThanOrEqual(120_000);
+  });
+
+  it('leaves the fast metric endpoints on the configured timeout', async () => {
+    const { deadlines } = await withTimeoutSpy(async () =>
+      metricExchange(
+        'lumics_get_company_metrics',
+        { moduleType: 'snmp', properties: PROPS },
+        SERIES,
+        {
+          config: makeConfig({ timeoutMs: 5_000 }),
+        },
+      ),
+    );
+    expect(deadlines).toEqual([5_000]);
+  });
+
+  it('never shortens a deadline an operator deliberately made longer', async () => {
+    const { deadlines } = await withTimeoutSpy(async () =>
+      metricExchange(
+        'lumics_summarize_company_metrics',
+        { moduleType: 'snmp', properties: PROPS },
+        SERIES,
+        { config: makeConfig({ timeoutMs: 250_000 }) },
+      ),
+    );
+    expect(deadlines).toEqual([250_000]);
+  });
+
+  it('warns in its description that it is slow and can still time out', async () => {
+    const harness = await connect(makeConfig(), {
+      clientOptions: { fetchImpl: recordFetch(jsonResponse(SERIES)).fetchImpl },
+    });
+    try {
+      const description = harness.tool('lumics_summarize_company_metrics')?.description ?? '';
+      expect(description).toContain('SLOW');
+      expect(description).toContain('90 seconds');
+      expect(description).toContain('can still time out');
+      // And that a timeout is not evidence of an empty estate.
+      expect(description).toContain('NOT evidence that there is no data');
+    } finally {
+      await harness.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Live finding 5, follow-up: the deadline multiplies with the retry budget
+// ---------------------------------------------------------------------------
+
+/**
+ * The deadline above and the attempt budget are two numbers that multiply.
+ *
+ * `/summarize` holds a three-minute deadline, a timeout on a GET is retryable,
+ * and `DEFAULT_MAX_ATTEMPTS` is 3 — so before the per-request attempt cap, a
+ * `/summarize` against an endpoint that never answers cost 3 x 180s ~ 9 minutes
+ * before it reported anything. From inside an MCP client that is a hung server,
+ * and the retries buy nothing: an endpoint that did not answer in three minutes
+ * is not suffering a transient fault, and attempts two and three pay the same
+ * three minutes to learn the same thing.
+ *
+ * These tests measure the budget rather than trusting it, and they measure it in
+ * the only two units that matter — how many requests went out, and what deadline
+ * each one carried. Nothing here waits: `fetchImpl` rejects the way
+ * `AbortSignal.timeout()` does and `sleep` is recorded, never performed.
+ */
+describe('a timing-out summarize costs one deadline, not three (live finding 5, follow-up)', () => {
+  interface TimeoutRun {
+    readonly deadlines: number[];
+    readonly calls: readonly RecordedCall[];
+    readonly delays: readonly number[];
+    readonly text: string;
+  }
+
+  /**
+   * Drive a metric tool against a transport that always times out, recording
+   * every deadline handed to `AbortSignal.timeout()`, every request, and every
+   * backoff the client asked to sleep.
+   */
+  async function runAgainstTimeout(
+    tool: string,
+    args: Record<string, unknown>,
+    config: LumicsConfig = makeConfig({ timeoutMs: 5_000 }),
+  ): Promise<TimeoutRun> {
+    const fetcher = timeoutFetch();
+    const sleeper = recordSleep();
+    const deadlines: number[] = [];
+    const original = AbortSignal.timeout.bind(AbortSignal);
+    AbortSignal.timeout = (ms: number) => {
+      deadlines.push(ms);
+      return original(ms);
+    };
+
+    const harness = await connect(config, {
+      clientOptions: { fetchImpl: fetcher.fetchImpl, sleep: sleeper.sleep },
+    });
+    try {
+      const called = await harness.call(tool, args);
+      expect(called.isError, `${tool} was expected to time out`).toBe(true);
+      const block = called.content[0];
+      return {
+        deadlines,
+        calls: fetcher.calls,
+        delays: sleeper.delays,
+        text: block?.type === 'text' ? block.text : '',
+      };
+    } finally {
+      AbortSignal.timeout = original;
+      await harness.close();
+    }
+  }
+
+  it('makes exactly one attempt and waits one deadline, not three', async () => {
+    const run = await runAgainstTimeout('lumics_summarize_company_metrics', {
+      moduleType: 'snmp',
+      properties: PROPS,
+    });
+
+    expect(run.calls).toHaveLength(1);
+    expect(run.deadlines).toEqual([METRIC_SUMMARIZE_TIMEOUT_MS]);
+    // The number this test exists to hold down: total wall time the server can
+    // spend before it reports the timeout. One deadline, not DEFAULT_MAX_ATTEMPTS
+    // of them plus backoff between each.
+    expect(run.deadlines.reduce((total, ms) => total + ms, 0)).toBe(METRIC_SUMMARIZE_TIMEOUT_MS);
+    expect(run.deadlines.reduce((total, ms) => total + ms, 0)).toBeLessThan(
+      METRIC_SUMMARIZE_TIMEOUT_MS * DEFAULT_MAX_ATTEMPTS,
+    );
+    expect(run.delays).toHaveLength(0);
+  });
+
+  it('tells the model the endpoint is slow, how long it waited, and what to try instead', async () => {
+    const { text } = await runAgainstTimeout('lumics_summarize_company_metrics', {
+      moduleType: 'snmp',
+      properties: PROPS,
+    });
+
+    // How long was actually waited, and that it was one attempt.
+    expect(text).toContain(`${String(METRIC_SUMMARIZE_TIMEOUT_MS)}ms`);
+    expect(text).toContain('1 attempt(s)');
+    // That the endpoint is known to be slow, so this is not a surprise fault.
+    expect(text).toMatch(/known to be slow/i);
+    // The claim that actually protects the user: a timeout is not an absence of
+    // data. A model that reads this as "no data" reports an empty estate.
+    expect(text).toMatch(/NOT an empty result|not evidence/i);
+    expect(text).toContain('do NOT report');
+    // And the four things worth trying, including the fast endpoint.
+    expect(text).toContain('itemType');
+    expect(text).toContain('properties');
+    expect(text).toMatch(/shorten the window/i);
+    expect(text).toContain('lumics_get_company_metrics');
+  });
+
+  it('leaves a non-timeout failure alone: a 400 does not get "narrow the request" advice', async () => {
+    // The enrichment is timeout-only on purpose. A malformed "properties" is a
+    // 400, the request was never too large, and telling the model to shorten its
+    // window would send it to fix something that is not broken.
+    const fetcher = recordFetch(errorResponse(400, 'properties is malformed'));
+    const sleeper = recordSleep();
+    const harness = await connect(makeConfig(), {
+      clientOptions: { fetchImpl: fetcher.fetchImpl, sleep: sleeper.sleep },
+    });
+    try {
+      const called = await harness.call('lumics_summarize_company_metrics', {
+        moduleType: 'snmp',
+        properties: PROPS,
+      });
+      expect(called.isError).toBe(true);
+      const block = called.content[0];
+      const text = block?.type === 'text' ? block.text : '';
+
+      expect(text).toContain('400');
+      expect(text).not.toMatch(/known to be slow/i);
+      expect(text).not.toContain('NOT AN EMPTY RESULT');
+      // The cap still applies: a 400 was never retryable, so this is one call.
+      expect(fetcher.calls).toHaveLength(1);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('leaves the fast metric endpoints retrying a timeout exactly as before', async () => {
+    const run = await runAgainstTimeout('lumics_get_company_metrics', {
+      moduleType: 'snmp',
+      properties: PROPS,
+    });
+
+    // Unchanged: §12.1 answers in one to two seconds, so its retries are cheap
+    // and the transient faults they cover are real.
+    expect(run.calls).toHaveLength(DEFAULT_MAX_ATTEMPTS);
+    expect(run.deadlines).toEqual([5_000, 5_000, 5_000]);
+    expect(run.delays).toHaveLength(DEFAULT_MAX_ATTEMPTS - 1);
+  });
+
+  it('leaves the fast metric endpoints retrying a transient 503 exactly as before', async () => {
+    const fetcher = recordFetch([errorResponse(503), jsonResponse(SERIES)]);
+    const sleeper = recordSleep();
+    const harness = await connect(makeConfig(), {
+      clientOptions: { fetchImpl: fetcher.fetchImpl, sleep: sleeper.sleep },
+    });
+    try {
+      const called = await harness.call('lumics_get_company_metrics', {
+        moduleType: 'snmp',
+        properties: PROPS,
+      });
+      expect(called.isError).not.toBe(true);
+      expect(fetcher.calls).toHaveLength(2);
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('still honours a LUMICS_TIMEOUT_MS an operator raised above the summarize deadline', async () => {
+    const run = await runAgainstTimeout(
+      'lumics_summarize_company_metrics',
+      { moduleType: 'snmp', properties: PROPS },
+      makeConfig({ timeoutMs: 250_000 }),
+    );
+
+    // The cap bounds attempts, not the deadline: an operator who deliberately
+    // raised LUMICS_TIMEOUT_MS above the summarize override still gets their
+    // value, and still gets it exactly once.
+    expect(run.deadlines).toEqual([250_000]);
+    expect(run.calls).toHaveLength(1);
+    expect(run.text).toContain('250000ms');
   });
 });

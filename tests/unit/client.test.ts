@@ -363,6 +363,83 @@ describe('retry policy', () => {
   });
 });
 
+/**
+ * The per-request attempt cap (`RequestOptions.maxAttempts`).
+ *
+ * It exists for one endpoint — spec §12.2 `/summarize`, which also carries the
+ * per-request `timeoutMs` override — and the two multiply: without a cap, a
+ * request granted a three-minute deadline and three attempts can consume nine
+ * minutes before it reports anything, which from inside an MCP client is
+ * indistinguishable from a hung server.
+ *
+ * The direction of the cap is the property that matters most here. It may only
+ * *lower* the client-wide budget. A per-request option that could raise it would
+ * be a way to multiply load on an API that documents 429 without documenting any
+ * limit, and the concurrency gate would not save us — it bounds requests in
+ * flight, not requests in total.
+ */
+describe('per-request attempt cap', () => {
+  it('stops a retryable status after one attempt when the request caps itself at 1', async () => {
+    const fetcher = recordFetch(errorResponse(503));
+    const { client, delays } = makeClient(fetcher);
+
+    const error = await captureApiError(client.get('/devices', { maxAttempts: 1 }));
+    expect(fetcher.calls).toHaveLength(1);
+    expect(delays).toHaveLength(0);
+    expect(error.attempts).toBe(1);
+  });
+
+  it('stops a timing-out GET after one attempt: the expensive case the cap is for', async () => {
+    const fetcher = timeoutFetch();
+    const { client, delays } = makeClient(fetcher);
+
+    const error = await captureApiError(
+      client.get('/metrics/summarize', { timeoutMs: 180_000, maxAttempts: 1 }),
+    );
+    expect(error.code).toBe('timeout');
+    // One deadline's worth of waiting, not three. Without the cap this GET is
+    // retryable and would have burned 3 x 180s before reporting anything.
+    expect(fetcher.calls).toHaveLength(1);
+    expect(delays).toHaveLength(0);
+    expect(error.attempts).toBe(1);
+    expect(error.message).toContain('180000ms');
+  });
+
+  it('never raises the budget above the client-wide cap', async () => {
+    const fetcher = recordFetch(errorResponse(503));
+    const { client } = makeClient(fetcher, { maxAttempts: 2 });
+
+    await expect(client.get('/devices', { maxAttempts: 10 })).rejects.toBeInstanceOf(
+      LumicsApiError,
+    );
+    // Two, the client-wide budget — not the ten the request asked for.
+    expect(fetcher.calls).toHaveLength(2);
+  });
+
+  it('clamps a nonsensical per-request cap of 0 up to one attempt', async () => {
+    const fetcher = recordFetch(jsonResponse({ ok: true }));
+    const { client } = makeClient(fetcher);
+    await expect(client.get('/devices', { maxAttempts: 0 })).resolves.toEqual({ ok: true });
+    expect(fetcher.calls).toHaveLength(1);
+  });
+
+  it('leaves a request that sets no cap on the client-wide budget', async () => {
+    const fetcher = recordFetch(errorResponse(503));
+    const { client } = makeClient(fetcher);
+    await expect(client.get('/devices')).rejects.toBeInstanceOf(LumicsApiError);
+    expect(fetcher.calls).toHaveLength(DEFAULT_MAX_ATTEMPTS);
+  });
+
+  it('still allows 423 Locked exactly one retry when the cap permits it', async () => {
+    const fetcher = recordFetch(errorResponse(423));
+    const { client } = makeClient(fetcher, { maxAttempts: 5 });
+
+    const error = await captureApiError(client.get('/devices/x', { maxAttempts: 2 }));
+    expect(error.code).toBe('locked');
+    expect(fetcher.calls).toHaveLength(2);
+  });
+});
+
 describe('retry safety for non-idempotent verbs', () => {
   it.each(['post', 'patch', 'delete'] as const)(
     'never retries a %s on a network error: the request may already have been applied',
@@ -871,4 +948,75 @@ describe('timeout enforcement', () => {
     expect(error.code).toBe('timeout');
     expect(error.message).toContain('timed out after 1000ms');
   }, 10_000);
+
+  /**
+   * Live finding 5. spec §12.2 `/summarize` was measured taking over 90 seconds
+   * without returning, against one to two seconds for every other metric
+   * endpoint, so under the shared 30-second default `lumics_summarize_company_metrics`
+   * could not succeed at all. The fix is a per-request override rather than a
+   * larger global default, because a larger global default would make every other
+   * tool wait three minutes to discover an unreachable host.
+   */
+  describe('per-request timeout override (live finding 5)', () => {
+    /** Capture the deadline `AbortSignal.timeout()` was actually given. */
+    function timeoutSpy(): { readonly restore: () => void; readonly deadlines: number[] } {
+      const deadlines: number[] = [];
+      const original = AbortSignal.timeout.bind(AbortSignal);
+      AbortSignal.timeout = (ms: number) => {
+        deadlines.push(ms);
+        return original(ms);
+      };
+      return { restore: () => (AbortSignal.timeout = original), deadlines };
+    }
+
+    it('uses the configured timeout when no override is supplied', async () => {
+      const spy = timeoutSpy();
+      try {
+        const client = new LumicsClient(makeConfig({ timeoutMs: 5_000 }), {
+          fetchImpl: recordFetch(jsonResponse([])).fetchImpl,
+        });
+        await client.get('/devices');
+        expect(spy.deadlines).toEqual([5_000]);
+      } finally {
+        spy.restore();
+      }
+    });
+
+    it('honours a longer per-request timeout', async () => {
+      const spy = timeoutSpy();
+      try {
+        const client = new LumicsClient(makeConfig({ timeoutMs: 5_000 }), {
+          fetchImpl: recordFetch(jsonResponse([])).fetchImpl,
+        });
+        await client.get('/metrics', { timeoutMs: 180_000 });
+        expect(spy.deadlines).toEqual([180_000]);
+      } finally {
+        spy.restore();
+      }
+    });
+
+    it('reports the deadline that actually applied, not the configured one', async () => {
+      const fetchImpl = (async (_input: Parameters<typeof fetch>[0], init?: RequestInit) =>
+        await new Promise<Response>((_resolve, reject) => {
+          init?.signal?.addEventListener('abort', () => {
+            const error = new Error('The operation was aborted due to timeout');
+            error.name = 'TimeoutError';
+            reject(error);
+          });
+        })) as typeof fetch;
+
+      const client = new LumicsClient(makeConfig({ timeoutMs: 30_000 }), {
+        fetchImpl,
+        sleep: () => Promise.resolve(),
+        maxAttempts: 1,
+      });
+
+      const error = await captureApiError(client.get('/metrics', { timeoutMs: 50 }));
+      expect(error.code).toBe('timeout');
+      // The message a model reads must name the budget this request had, or the
+      // advice it gives ("raise LUMICS_TIMEOUT_MS") is about the wrong number.
+      expect(error.message).toContain('timed out after 50ms');
+      expect(error.message).not.toContain('30000ms');
+    }, 10_000);
+  });
 });

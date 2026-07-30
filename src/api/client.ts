@@ -47,6 +47,46 @@ export interface RequestOptions {
   readonly body?: unknown;
   /** Longest error-body snippet to keep for diagnosis. */
   readonly maxErrorBodyChars?: number;
+  /**
+   * Override `LUMICS_TIMEOUT_MS` for this one request.
+   *
+   * For the endpoint whose *documented* work is genuinely long, not as a way to
+   * paper over a slow network: spec §12.2 `/summarize` aggregates every matching
+   * component in a company and was measured exceeding 90 seconds, so under the
+   * shared default it could never return (see `METRIC_SUMMARIZE_TIMEOUT_MS`).
+   *
+   * Callers set it, models cannot: it is not a tool argument anywhere, so a model
+   * cannot ask this server to hold a connection open for minutes.
+   *
+   * It multiplies with retries — a timeout on a GET is retryable — so a caller
+   * that raises this should normally lower {@link RequestOptions.maxAttempts} in
+   * the same breath, or the worst case is the product of the two.
+   */
+  readonly timeoutMs?: number;
+  /**
+   * Cap the attempt budget for this one request. **Lowers the client-wide
+   * `maxAttempts`; it can never raise it.**
+   *
+   * That direction is the whole safety property. A per-request option able to
+   * raise the budget would be a way to multiply load against an API that
+   * documents 429 without documenting any limit (RFC-001 assumption A2), and the
+   * concurrency gate would not catch it: the gate bounds requests in flight, not
+   * requests in total.
+   *
+   * It exists for the request that also sets {@link RequestOptions.timeoutMs},
+   * because the two multiply. spec §12.2 `/summarize` holds a three-minute
+   * deadline, and three attempts at three minutes is nine minutes of silence
+   * before anything is reported — which from inside an MCP client reads as a hung
+   * server, for retries that cannot help, because an endpoint that did not answer
+   * in three minutes is not suffering a transient fault. See
+   * `METRIC_SUMMARIZE_MAX_ATTEMPTS`, which records why the cap is on attempts
+   * rather than on one retry class.
+   *
+   * A cap of 1 disables retrying entirely for that request, including for the
+   * documented transient statuses. Set it only where a retry is known to be
+   * expensive and useless; everything else should keep the shared budget.
+   */
+  readonly maxAttempts?: number;
 }
 
 export interface LumicsClientOptions {
@@ -135,13 +175,14 @@ export class LumicsClient {
     // only. Never the full URL — a URL can carry credentials in its query.
     const operation = `${method} ${path}`;
     const url = this.buildUrl(path, options.query);
+    const maxAttempts = this.attemptBudget(options.maxAttempts);
     const release = await this.gate.acquire();
 
     try {
       let lockedRetries = 0;
       let lastError: LumicsApiError | undefined;
 
-      for (let attempt = 1; attempt <= this.maxAttempts; attempt += 1) {
+      for (let attempt = 1; attempt <= maxAttempts; attempt += 1) {
         const outcome = await this.attempt<T>(method, url, operation, options, attempt);
 
         if (outcome.kind === 'success') {
@@ -157,11 +198,11 @@ export class LumicsClient {
             throw outcome.error;
           }
           lockedRetries += 1;
-        } else if (!this.shouldRetry(method, outcome, attempt)) {
+        } else if (!this.shouldRetry(method, outcome, attempt, maxAttempts)) {
           throw outcome.error;
         }
 
-        if (attempt >= this.maxAttempts) {
+        if (attempt >= maxAttempts) {
           throw outcome.error;
         }
 
@@ -169,7 +210,7 @@ export class LumicsClient {
         logger.warn('retrying lumics request', {
           operation,
           attempt,
-          maxAttempts: this.maxAttempts,
+          maxAttempts,
           status: outcome.error.status,
           code: outcome.error.code,
           delayMs,
@@ -196,6 +237,10 @@ export class LumicsClient {
     attempt: number,
   ): Promise<Attempt<T>> {
     let response: Response;
+    // Per-request override, or the configured default. Reported in the timeout
+    // error too, so the message names the deadline that actually applied rather
+    // than the one in the environment.
+    const timeoutMs = options.timeoutMs ?? this.config.timeoutMs;
 
     try {
       response = await this.fetchImpl(url, {
@@ -203,14 +248,14 @@ export class LumicsClient {
         headers: this.buildHeaders(options.body !== undefined),
         // spec §2/§4: all bodies are JSON. Callers pass plain objects.
         ...(options.body === undefined ? {} : { body: JSON.stringify(options.body) }),
-        signal: AbortSignal.timeout(this.config.timeoutMs),
+        signal: AbortSignal.timeout(timeoutMs),
         redirect: 'error',
       });
     } catch (cause) {
       if (isAbortLike(cause)) {
         return {
           kind: 'failure',
-          error: LumicsApiError.timeout(operation, this.config.timeoutMs, attempt, cause),
+          error: LumicsApiError.timeout(operation, timeoutMs, attempt, cause),
         };
       }
       return {
@@ -258,7 +303,7 @@ export class LumicsClient {
       if (isAbortLike(cause)) {
         return {
           kind: 'failure',
-          error: LumicsApiError.timeout(operation, this.config.timeoutMs, attempt, cause),
+          error: LumicsApiError.timeout(operation, timeoutMs, attempt, cause),
         };
       }
       return {
@@ -286,8 +331,30 @@ export class LumicsClient {
     }
   }
 
-  private shouldRetry(method: HttpMethod, outcome: Failure, attempt: number): boolean {
-    if (attempt >= this.maxAttempts) {
+  /**
+   * The attempt budget in force for one request: the client-wide value, unless
+   * the request asked for fewer.
+   *
+   * `Math.min` and not `??`, so a per-request value can only ever tighten the
+   * budget — an operator who configured a smaller `maxAttempts` keeps it, and a
+   * caller cannot buy itself extra attempts. `Math.max(1, ...)` mirrors the
+   * constructor: a 0 or a negative is a caller mistake, and the honest reading of
+   * it is "one attempt", not "never issue the request".
+   */
+  private attemptBudget(requested: number | undefined): number {
+    if (requested === undefined) {
+      return this.maxAttempts;
+    }
+    return Math.max(1, Math.min(this.maxAttempts, requested));
+  }
+
+  private shouldRetry(
+    method: HttpMethod,
+    outcome: Failure,
+    attempt: number,
+    maxAttempts: number,
+  ): boolean {
+    if (attempt >= maxAttempts) {
       return false;
     }
 

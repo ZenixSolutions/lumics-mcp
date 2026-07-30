@@ -45,10 +45,15 @@ const VALID_ARGS: Readonly<Record<string, Record<string, unknown>>> = {
   lumics_get_ipaddress: { ipSubnetId: TEST_SUBNET_ID, ipAddressId: '4'.repeat(24) },
   lumics_get_ipgroup: { ipGroupId: '5'.repeat(24) },
   lumics_get_component: { componentType: 'cisco_ast_devices', componentId: '6'.repeat(24) },
-  lumics_get_device_metrics: { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
+  lumics_get_device_metrics: {
+    deviceId: TEST_DEVICE_ID,
+    moduleType: 'snmp',
+    properties: 'Calculated.cpu',
+  },
   lumics_get_device_item_metrics: {
     deviceId: TEST_DEVICE_ID,
     moduleType: 'snmp',
+    properties: 'Calculated.cpu',
     itemId: '6'.repeat(24),
   },
   lumics_list_ipaddresses: { ipSubnetId: TEST_SUBNET_ID },
@@ -102,13 +107,13 @@ describe('a free-form segment is encoded, and the URL still lands where it shoul
     [
       'lumics_get_device_metrics moduleType',
       'lumics_get_device_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: TRAVERSAL },
+      { deviceId: TEST_DEVICE_ID, moduleType: TRAVERSAL, properties: 'Calculated.cpu' },
       '/modules/',
     ],
     [
       'lumics_get_company_metrics moduleType',
       'lumics_get_company_metrics',
-      { moduleType: TRAVERSAL },
+      { moduleType: TRAVERSAL, properties: 'Calculated.cpu' },
       '/metrics/companies/',
     ],
     [

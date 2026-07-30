@@ -65,6 +65,72 @@ export const DEFAULT_METRIC_DATA_POINTS = 60;
 /** spec §12.0: `minIntervals` defaults to 40 server-side; documented for parity. */
 export const METRIC_MIN_INTERVALS_DEFAULT = 40;
 
+/**
+ * The metric `properties` type groups a live tenant actually answers to.
+ *
+ * spec §12 documents `properties` as "a comma separated list of properties" and
+ * gives bare examples such as `status`, which is wrong: the live API wants
+ * `<TypeGroup>.<metric>` — `Calculated.cpu`, `TimeTicks.sysUpTime`. These three
+ * groups were observed answering; `Counter` and `Gauge`, which the vendor
+ * documentation implies, were confirmed absent.
+ *
+ * **This list is illustrative, not exhaustive, and nothing validates against it.**
+ * It exists to put concrete legal values in a tool description, because the only
+ * enumeration path for real metric names is spec §12.4
+ * (`lumics_get_metric_summary`, whose `stats` keys are the groups and metrics).
+ * Validating against it would reject a group this tenant happens not to use.
+ */
+export const METRIC_PROPERTY_TYPE_GROUPS = ['Calculated', 'Rate', 'TimeTicks'] as const;
+
+/**
+ * Timeout for spec §12.2 `/summarize`, which is in a different class of slow from
+ * every other endpoint in this API.
+ *
+ * §12.1 and §12.3 answer in one to two seconds. `/summarize` was measured taking
+ * **more than 90 seconds without returning at all** on a modest tenant — it
+ * aggregates every matching component in the company before it answers — so under
+ * {@link DEFAULT_TIMEOUT_MS} the tool could not succeed, ever. This is a per-request
+ * override rather than a change to the default: raising the default would make
+ * every other tool wait three minutes to discover an unreachable host.
+ *
+ * It is deliberately not the maximum. A caller whose `LUMICS_TIMEOUT_MS` is
+ * already higher keeps theirs (`Math.max`), and the tool description states plainly
+ * that a large tenant can still exceed this.
+ */
+export const METRIC_SUMMARIZE_TIMEOUT_MS = 180_000;
+
+/**
+ * Attempt budget for spec §12.2 `/summarize`. One attempt: no retry, of anything.
+ *
+ * {@link METRIC_SUMMARIZE_TIMEOUT_MS} and the retry budget multiply, and nobody
+ * noticed the product. A timeout on a GET is retryable and `DEFAULT_MAX_ATTEMPTS`
+ * is 3, so a `/summarize` against an endpoint that never answers cost
+ * `3 x 180s ~ 9 minutes` before it reported anything. From inside an MCP client
+ * that is indistinguishable from a hung server, and the retries buy nothing: an
+ * endpoint that did not answer in three minutes is not suffering a transient
+ * fault, and attempts two and three pay the same three minutes to learn the same
+ * thing.
+ *
+ * The narrower fix — keep the budget for status codes, refuse it only for a
+ * timeout — was considered and rejected. Its premise is that a status-code retry
+ * is cheap because a 429 or a 503 comes back in milliseconds, and on every other
+ * endpoint in this API that premise holds. It does not hold here: the retryable
+ * statuses this endpoint is *most* likely to produce are 502 and 504 from an
+ * intermediary that gave up waiting on the aggregation, those arrive only after
+ * that intermediary's own multi-second deadline, and they repeat deterministically
+ * because the next attempt asks for exactly the same expensive work. That leaves
+ * 429 as the only genuinely cheap, genuinely transient case, and 429 is the one
+ * the concurrency gate already exists to avoid.
+ *
+ * So the cap is on attempts rather than on a retry class: one number, one meaning,
+ * and a worst case of one deadline for *every* failure mode rather than for one of
+ * them. What the model loses is an automatic retry it can perform itself — and a
+ * tool call it re-issues is visible and interruptible, which nine silent minutes
+ * are not. The error it gets says so; see `summarizeTimeoutGuidance` in
+ * `src/tools/metrics.ts`.
+ */
+export const METRIC_SUMMARIZE_MAX_ATTEMPTS = 1;
+
 // ---------------------------------------------------------------------------
 // Client behaviour
 // ---------------------------------------------------------------------------

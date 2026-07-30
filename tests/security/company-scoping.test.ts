@@ -143,11 +143,22 @@ describe('an explicit companyId cannot silently retarget another tenant (finding
  * (spec §7.2) and pins on that before the metric read is issued.
  */
 describe('the pin covers the device-scoped metric tools too (finding H5, second pass)', () => {
+  /** `properties` is required on the metric-data endpoints — see metrics.test.ts. */
+  const METRIC_PROPERTIES = 'Calculated.cpu';
+
   const DEVICE_METRIC_CALLS: readonly (readonly [string, Record<string, unknown>])[] = [
-    ['lumics_get_device_metrics', { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' }],
+    [
+      'lumics_get_device_metrics',
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: METRIC_PROPERTIES },
+    ],
     [
       'lumics_get_device_item_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', itemId: TEST_COMPONENT_ID },
+      {
+        deviceId: TEST_DEVICE_ID,
+        moduleType: 'snmp',
+        properties: METRIC_PROPERTIES,
+        itemId: TEST_COMPONENT_ID,
+      },
     ],
   ];
 
@@ -257,6 +268,7 @@ describe('the pin covers the device-scoped metric tools too (finding H5, second 
       const called = await callWith(fetcher, 'lumics_get_device_metrics', {
         deviceId: TEST_DEVICE_ID,
         moduleType: 'snmp',
+        properties: METRIC_PROPERTIES,
       });
 
       expect(called.isError).toBe(true);

@@ -11,6 +11,35 @@
  * every parameter these endpoints take; all of them are typed below, and the four
  * that are withheld are withheld for a stated reason.
  *
+ * Three further facts come from the first live contract run against a real tenant
+ * and contradict `docs/reference/lumics-api-v1.md`, which was transcribed from
+ * vendor documentation that is wrong in these specific ways:
+ *
+ *  A. **`properties` is REQUIRED** on §12.1, §12.2 and both §12.3 endpoints, not
+ *     optional as documented. Without it they answer
+ *     `400 {"error":"Must supply required component metrics as properties parameter"}`,
+ *     so every metric call this server made was failing. On §12.4 it stays optional
+ *     and means something else — a filter, not a projection.
+ *  B. **An invalid `properties` value returns HTTP 200 with empty stats.** The 400
+ *     gate checks only that the parameter is present and non-empty, never that it
+ *     is meaningful, so `properties=cpu` and `properties=bogusXYZ` both return the
+ *     full row count with `stats: {}` on every row. A model reads that as "no CPU
+ *     data available" and reports a confident negative about the estate. Nothing
+ *     upstream distinguishes it from a real absence, so this module does:
+ *     {@link propertyCoverageNote} inspects the returned rows against the requested
+ *     paths and says plainly when rows came back carrying no requested values.
+ *     `./schemas.ts` also rejects a `properties` with no `Group.metric` entry at all.
+ *  C. **§12.2 `/summarize` is in a different class of slow** — over 90 seconds
+ *     without returning, against one to two seconds for §12.1 and §12.3 — so it
+ *     gets `METRIC_SUMMARIZE_TIMEOUT_MS` as a per-request override and says in its
+ *     description that it can still time out. It also gets
+ *     `METRIC_SUMMARIZE_MAX_ATTEMPTS`, because that deadline and the retry budget
+ *     multiply: a timeout on a GET is retryable, so without a cap a `/summarize`
+ *     that never answers cost three deadlines — nine minutes of silence — for
+ *     retries that could not succeed. One attempt, and a timeout carries
+ *     {@link SUMMARIZE_TIMEOUT_GUIDANCE} so the model does not read it as an empty
+ *     estate.
+ *
  * Four facts from spec §12 shape every tool here, each of them a prototype defect:
  *
  *  1. **`dataPoints` or `width` is REQUIRED** on the four metric-data endpoints,
@@ -68,6 +97,8 @@ import {
   DEFAULT_METRIC_DATA_POINTS,
   MAX_LIST_LIMIT,
   METRIC_MIN_INTERVALS_DEFAULT,
+  METRIC_SUMMARIZE_MAX_ATTEMPTS,
+  METRIC_SUMMARIZE_TIMEOUT_MS,
 } from '../constants.js';
 import type {
   Device,
@@ -84,10 +115,12 @@ import {
   isMonitoredSchema,
   itemTypeSchema,
   lastMetricSchema,
+  METRIC_PROPERTY_SYNTAX,
   metricDataPointsSchema,
   metricIntervalSchema,
   metricPropertiesSchema,
   metricSumSchema,
+  metricSummaryPropertiesSchema,
   moduleTypeSchema,
   objectIdSchema,
   timeRangeShape,
@@ -162,10 +195,17 @@ const metricResolutionShape = {
 
 /**
  * Result-selection controls shared by the four metric-data endpoints.
+ *
+ * `properties` is **required**, which is the one place this shape departs from
+ * the captured spec: §12.0 lists it optional and all four endpoints 400 without
+ * it (see fact A in the module comment). It is required rather than defaulted
+ * because no metric name is right for every module, so a default would silently
+ * answer a question the caller did not ask.
+ *
  * `componentQuery` and `filters` are absent by design — ADR-002 decision 3.
  */
 const metricSelectionShape = {
-  properties: metricPropertiesSchema.optional(),
+  properties: metricPropertiesSchema,
   lastMetric: lastMetricSchema,
   isMonitored: isMonitoredSchema,
   limit: metricLimitSchema,
@@ -205,6 +245,8 @@ interface MetricRequest {
   readonly dataPointsDefaulted: boolean;
   /** The row cap the caller asked for, or `undefined` when none was sent. */
   readonly limit: number | undefined;
+  /** The `properties` value sent, kept so the response can be checked against it. */
+  readonly properties: string | undefined;
 }
 
 /**
@@ -233,6 +275,7 @@ function buildMetricRequest(args: MetricQueryArgs): MetricRequest {
     dataPoints,
     dataPointsDefaulted: args.dataPoints === undefined,
     limit: args.limit,
+    properties: args.properties,
     query: {
       // spec §12.0: epoch milliseconds, produced by ../util/time.js so the model
       // never computes them.
@@ -407,6 +450,198 @@ function absentSeriesNote(
   );
 }
 
+// ---------------------------------------------------------------------------
+// The 200-with-empty-stats trap (fact B in the module comment)
+// ---------------------------------------------------------------------------
+
+/**
+ * What the returned rows say about one requested property path.
+ *
+ *  - `present` — at least one row carried a value at `<group>.<metric>` inside
+ *    `stats`. The path resolved; nothing to disclose.
+ *  - `group-empty` — the type group came back, but empty (`{"Rate":{}}`) or without
+ *    this metric in it. That is what a *recognised* group with an *unknown* metric
+ *    name produces upstream.
+ *  - `group-missing` — no row carried this group under `stats` at all, which is what
+ *    an *unrecognised* type group produces: the group simply never appears.
+ *  - `unqualified` — the entry carried no `<Group>.` prefix. This is the exact form
+ *    measured returning 658 rows with `stats: {}` on every one of them.
+ *
+ * The three failing states are distinguished because they need different fixes,
+ * and because "the group is missing entirely" and "the group is there but empty"
+ * are the only evidence available about *which half* of the name is wrong.
+ */
+type PropertyStatus = 'present' | 'group-empty' | 'group-missing' | 'unqualified';
+
+interface PropertyOutcome {
+  /** The entry exactly as the caller wrote it. */
+  readonly raw: string;
+  readonly status: PropertyStatus;
+}
+
+/** Split a `properties` value into entries, dropping empties from stray commas. */
+function parseRequestedProperties(properties: string): readonly string[] {
+  return properties
+    .split(',')
+    .map((entry) => entry.trim())
+    .filter((entry) => entry.length > 0);
+}
+
+/** The `stats` maps of the rows that carry one, in order. */
+function statsOf(points: readonly MetricDataPoint[]): readonly Record<string, unknown>[] {
+  const maps: Record<string, unknown>[] = [];
+  for (const point of points) {
+    if (isRecord(point.stats)) {
+      maps.push(point.stats);
+    }
+  }
+  return maps;
+}
+
+/**
+ * Classify one requested property path against every row's `stats`.
+ *
+ * "Present on any row" is the bar, not "present on every row": a company-wide
+ * query legitimately returns components that do not carry the metric alongside
+ * ones that do, and calling that a naming failure would be its own false alarm.
+ */
+function classifyProperty(
+  entry: string,
+  stats: readonly Record<string, unknown>[],
+): PropertyStatus {
+  const dot = entry.indexOf('.');
+  if (dot <= 0 || dot >= entry.length - 1) {
+    // An unqualified name can still be *found*, if Lumics happens to key a metric
+    // that way inside some group — so look before concluding.
+    for (const map of stats) {
+      for (const group of Object.values(map)) {
+        if (isRecord(group) && group[entry] !== undefined) {
+          return 'present';
+        }
+      }
+    }
+    return 'unqualified';
+  }
+
+  const group = entry.slice(0, dot);
+  const metric = entry.slice(dot + 1);
+  let groupSeen = false;
+
+  for (const map of stats) {
+    const bucket = map[group];
+    if (bucket === undefined) {
+      continue;
+    }
+    groupSeen = true;
+    if (isRecord(bucket) && bucket[metric] !== undefined) {
+      return 'present';
+    }
+  }
+
+  return groupSeen ? 'group-empty' : 'group-missing';
+}
+
+/** The per-entry half of the disclosure: what each unresolved path looked like. */
+function describeUnresolved(outcome: PropertyOutcome): string {
+  switch (outcome.status) {
+    case 'unqualified':
+      return `"${outcome.raw}" carries no "<TypeGroup>." prefix — this is the exact form measured returning rows with empty stats`;
+    case 'group-empty':
+      return `"${outcome.raw}" — the type group came back but held no such metric, which is what a recognised group with an unknown metric name produces`;
+    case 'group-missing':
+      return `"${outcome.raw}" — its type group never appeared in any row's stats, which is what an unrecognised type group produces`;
+    case 'present':
+      return `"${outcome.raw}"`;
+  }
+}
+
+/** Cap on how many unresolved entries are spelled out, so the note stays bounded. */
+const MAX_UNRESOLVED_DETAILED = 6;
+
+function listUnresolved(unresolved: readonly PropertyOutcome[]): string {
+  const shown = unresolved.slice(0, MAX_UNRESOLVED_DETAILED).map(describeUnresolved).join('; ');
+  const hidden = unresolved.length - MAX_UNRESOLVED_DETAILED;
+  return hidden > 0 ? `${shown}; and ${String(hidden)} more` : shown;
+}
+
+/**
+ * Disclose the API's silent-200 failure: rows came back, but not the values asked
+ * for.
+ *
+ * **This is the most important disclosure in the module.** Every other empty
+ * result here is empty because the transport or the estate made it so; this one is
+ * empty because the *request* was malformed, and the API accepted it anyway. A
+ * model that receives 658 rows of `{"stats":{}}` under a successful tool result
+ * concludes "there is no CPU data for these devices" and tells the user so. That
+ * is a confident negative built on a typo, and it is exactly the failure mode
+ * `CLAUDE.md` is organised against.
+ *
+ * Returns `undefined` when there is nothing to say:
+ *
+ *  - **no rows at all.** A genuinely empty series makes no claim about property
+ *    names — there were no stats to look in — and `absentSeriesNote` already covers
+ *    the cases where the emptiness came from the transport. Saying "your property
+ *    names may be wrong" over an empty array would be a guess.
+ *  - **every requested path resolved somewhere.** Nothing is wrong.
+ *
+ * Otherwise it distinguishes total failure (nothing resolved: the response
+ * establishes nothing at all about these metrics) from partial (some resolved: the
+ * data present is trustworthy, the gaps are suspect).
+ */
+function propertyCoverageNote(
+  properties: string | undefined,
+  points: readonly MetricDataPoint[],
+): string | undefined {
+  if (properties === undefined || points.length === 0) {
+    return undefined;
+  }
+
+  const entries = parseRequestedProperties(properties);
+  if (entries.length === 0) {
+    return undefined;
+  }
+
+  const stats = statsOf(points);
+  const outcomes: PropertyOutcome[] = entries.map((raw) => ({
+    raw,
+    status: classifyProperty(raw, stats),
+  }));
+  const unresolved = outcomes.filter((outcome) => outcome.status !== 'present');
+  if (unresolved.length === 0) {
+    return undefined;
+  }
+
+  const rows = `${String(points.length)} row(s)`;
+  const discovery = ` ${METRIC_PROPERTY_SYNTAX} Re-run this call once the names are right. Two caveats on that enumeration: it surfaces DEVICE-scoped metric names only, so a component-level name is discoverable from no endpoint at all; and its response key depends on the module ("devices" for snmp, "http_endpoints" for http), so read whichever key is present rather than assuming "devices".`;
+
+  if (unresolved.length === entries.length) {
+    const noStatsAtAll =
+      stats.length === 0
+        ? ' NOT ONE row carried a "stats" key at all, which is the strongest form of this signal.'
+        : '';
+    return (
+      `PROPERTY NAMES MAY BE WRONG — THIS IS NOT A STATEMENT THAT NO DATA EXISTS: Lumics returned ${rows} for this query ` +
+      `but none of them carried a value for ANY of the properties you asked for (${listUnresolved(unresolved)}).${noStatsAtAll} ` +
+      'The Lumics API does not reject an unrecognised property name: it answers 200 with the full row count and empty ' +
+      '"stats" objects, so a misspelled or wrongly-formed name is indistinguishable from a metric that genuinely has ' +
+      'no data — except by the check this server just ran. Do NOT tell the user that this metric is unavailable, that ' +
+      'the devices are not reporting it, that CPU/memory/whatever "has no data", or anything else that reads as a ' +
+      'negative finding about the estate: this response does not support any of that.' +
+      discovery
+    );
+  }
+
+  return (
+    `SOME PROPERTIES RETURNED NO VALUES: of the ${String(entries.length)} propert(ies) requested, ` +
+    `${String(unresolved.length)} produced no value on any of the ${rows} returned (${listUnresolved(unresolved)}). ` +
+    'The rows below are real and the properties that did resolve can be read normally. The ones that did not may ' +
+    'simply be absent on these components — but an unrecognised property name produces exactly the same silent ' +
+    'result, because Lumics answers 200 with empty stats rather than rejecting the name. Do not report the missing ' +
+    'ones as "not collected" or "no data" without checking the spelling first.' +
+    discovery
+  );
+}
+
 /** One note covering the requested window, the resolution sent, and what came back. */
 function metricSeriesNotes(request: MetricRequest, series: MetricSeriesResult): string[] {
   const { meta } = series;
@@ -419,9 +654,17 @@ function metricSeriesNotes(request: MetricRequest, series: MetricSeriesResult): 
       : '.');
 
   // The absence disclosure leads, because it is the one note that changes what
-  // the rest of the response means.
+  // the rest of the response means. The property-coverage disclosure follows it
+  // for the same reason and cannot collide with it: it says nothing at all when
+  // there are no rows, which is every case `absentSeriesNote` fires on.
   const absent = absentSeriesNote(series.absence, 'series');
   const notes = absent === undefined ? [] : [absent];
+
+  const coverage = propertyCoverageNote(request.properties, series.points);
+  if (coverage !== undefined) {
+    notes.push(coverage);
+  }
+
   notes.push(requested, metricRowCapNote(request.limit));
 
   const effective = describeEffectiveWindow(meta);
@@ -587,7 +830,7 @@ const getCompanyMetrics = defineTool({
   title: 'Get company metrics per item',
   operation: 'read',
   description:
-    'Get metrics for every monitored component of one polling module across a whole Lumics company, returning a separate row per item per time bucket with its stats. Use this to answer "what does X look like across the estate" — for example the status of every F5 pool, or CPU on every switch. Two settings make the difference between a usable answer and a wall of numbers: set "properties" to just the metric paths you care about, and set lastMetric true when you want current values rather than a time series. The window defaults to the last 1 hour. A resolution is always sent because the Lumics API requires one; it defaults to 60 data points across the window unless you pass dataPoints. For a total or an average across components rather than a row per component, use lumics_summarize_company_metrics; for one device, use lumics_get_device_metrics.',
+    'Get metrics for every monitored component of one polling module across a whole Lumics company, returning a separate row per item per time bucket with its stats. Use this to answer "what does X look like across the estate" — for example the status of every F5 pool, or CPU on every switch. "properties" is REQUIRED and must name metrics as "<TypeGroup>.<metric>" (e.g. "Calculated.cpu"): the call fails without it, and an unrecognised name comes back as a successful but EMPTY result rather than an error — see the properties argument. Set lastMetric true when you want current values rather than a time series. The window defaults to the last 1 hour. A resolution is always sent because the Lumics API requires one; it defaults to 60 data points across the window unless you pass dataPoints. Each returned row carries a "type" field holding the singular component id, which is the correct value for itemType on a follow-up call. For a total or an average across components rather than a row per component, use lumics_summarize_company_metrics; for one device, use lumics_get_device_metrics.',
   inputSchema: {
     moduleType: moduleTypeSchema,
     companyId: companyIdSchema,
@@ -626,6 +869,60 @@ const getCompanyMetrics = defineTool({
 // ---------------------------------------------------------------------------
 
 /**
+ * What a model needs to know when `/summarize` runs out of time, over and above
+ * the generic transport advice `LumicsApiError.timeout` already carries.
+ *
+ * Three things, in order of how much damage getting them wrong does:
+ *
+ *  1. **A timeout is not an empty result.** This is the one that matters. The
+ *     generic message says the request timed out and stops there, and a model
+ *     that has just asked "how much aggregate space is the estate using" and
+ *     received a failure is one short step from answering "no data was found".
+ *     That is the silent-completeness failure this codebase is organised against,
+ *     arriving through the error path instead of the success path.
+ *  2. **Why there was only one attempt.** Otherwise the single attempt looks like
+ *     the retry policy failing to fire, and the natural response — reissue the
+ *     identical call — is exactly the nine minutes the cap exists to prevent.
+ *  3. **What to make smaller.** The generic advice ("a smaller limit, a shorter
+ *     time range, or fewer metric properties") is true but incomplete here: it
+ *     omits `itemType`, which is the single most effective lever on an endpoint
+ *     whose cost is the number of components it aggregates, and it omits the fast
+ *     §12.1 endpoint, which answers many of the same questions in seconds.
+ *
+ * The generic message is appended to, never replaced: it already names the
+ * deadline that actually applied and the attempt count, and both are facts this
+ * text then relies on.
+ */
+const SUMMARIZE_TIMEOUT_GUIDANCE =
+  'THIS ENDPOINT IS KNOWN TO BE SLOW (spec section 12.2): it aggregates every matching component in the company before it answers, has been measured taking over 90 seconds, and this server therefore gave it a deadline of its own rather than the shared LUMICS_TIMEOUT_MS — the duration above is the deadline that actually applied, and it elapsed. It was attempted ONCE and deliberately not retried: an endpoint that did not answer within that deadline is not suffering a transient fault, and further attempts would spend the same wait to learn the same thing, which from a client is indistinguishable from a hung server. THIS IS A TIMEOUT, NOT AN EMPTY RESULT. It is not evidence that this company, module or metric has no data — nothing was measured either way — so do NOT report an absence of data, a zero, or an empty estate on the strength of it. Make the work smaller and call again: pass itemType to aggregate one class of component instead of all of them, cut "properties" down to the single metric you actually need, or shorten the window (an hour rather than a day). Or use lumics_get_company_metrics (spec section 12.1), which reads the same module without the cross-component aggregation and answers in one to two seconds, at one row per component rather than one row per time bucket. Raising LUMICS_TIMEOUT_MS beyond this deadline is an operator change, and this server honours it.';
+
+/**
+ * Add {@link SUMMARIZE_TIMEOUT_GUIDANCE} to a `/summarize` timeout, or return
+ * `undefined` for anything else so the caller rethrows it untouched.
+ *
+ * Only `timeout` is enriched. A 400, a 404 or an unparseable body already carry
+ * the right guidance, and pasting "this endpoint is slow" onto a malformed
+ * `properties` value would send the model to narrow a request that was never too
+ * large. Every field of the original error is preserved — `attempts` in
+ * particular, which the text refers to.
+ */
+function summarizeTimeoutError(cause: unknown): LumicsApiError | undefined {
+  if (!(cause instanceof LumicsApiError) || cause.code !== 'timeout') {
+    return undefined;
+  }
+  return new LumicsApiError(`${cause.message} ${SUMMARIZE_TIMEOUT_GUIDANCE}`, {
+    code: cause.code,
+    // Not retryable *as issued*. The generic timeout is marked retryable because
+    // on a read a retry is usually right; here the whole point is that it is not,
+    // and a caller reading this flag must not conclude otherwise.
+    retryable: false,
+    ...(cause.operation === undefined ? {} : { operation: cause.operation }),
+    ...(cause.attempts === undefined ? {} : { attempts: cause.attempts }),
+    cause,
+  });
+}
+
+/**
  * spec §12.2 `GET /metrics/companies/:companyId/modules/:moduleType/summarize`.
  * The shared set **plus `sum`** — the one parameter unique to this endpoint.
  */
@@ -634,7 +931,7 @@ const summarizeCompanyMetrics = defineTool({
   title: 'Summarize company metrics into time buckets',
   operation: 'read',
   description:
-    'Aggregate one polling module\'s metrics across ALL matching components in a company into time buckets, giving one row per bucket rather than one row per component. Without "sum" the metrics are averaged across components; with "sum" they are added up, and the value of "sum" chooses which per-component rollup property ("min", "max" or "avg") feeds that total. Use this for estate-wide trends and totals — total aggregate space used, average CPU over the day. Each bucket also carries how many samples and component-documents it covers, and buckets with no data are omitted entirely rather than returned as zero, so do not read a gap as a zero. The window defaults to the last 1 hour and a resolution of 60 data points is sent unless you pass dataPoints. If a short window returns nothing, lower minIntervals. For a row per component instead, use lumics_get_company_metrics. This tool CANNOT rank or identify individual devices or components: every row it returns is a time bucket covering all of them at once, and no device name or id appears in the output. If the question is "which devices are highest", "top N devices" or anything else that needs a per-device answer, use lumics_get_metric_summary instead, which returns one row per item and supports sortBy and topN. Note the confusable name: this tool summarises over TIME, lumics_get_metric_summary summarises over ITEMS.',
+    'Aggregate one polling module\'s metrics across ALL matching components in a company into time buckets, giving one row per bucket rather than one row per component. Without "sum" the metrics are averaged across components; with "sum" they are added up, and the value of "sum" chooses which per-component rollup property ("min", "max" or "avg") feeds that total. Use this for estate-wide trends and totals — total aggregate space used, average CPU over the day. Each bucket also carries how many samples and component-documents it covers, and buckets with no data are omitted entirely rather than returned as zero, so do not read a gap as a zero. THIS ENDPOINT IS SLOW: it aggregates every matching component in the company before it answers, and has been measured taking over 90 seconds where the other metric endpoints take one or two. This server gives it a 3-minute deadline of its own and reports a timeout immediately rather than retrying, because a retry would spend another 3 minutes failing the same way. On a large tenant it can still time out — if it does, that is a timeout and NOT evidence that there is no data. Narrow it with itemType, a shorter window or a tighter "properties" before retrying, or use lumics_get_company_metrics, which is fast. "properties" is REQUIRED here too and must name metrics as "<TypeGroup>.<metric>". The window defaults to the last 1 hour and a resolution of 60 data points is sent unless you pass dataPoints. If a short window returns nothing, lower minIntervals. For a row per component instead, use lumics_get_company_metrics. This tool CANNOT rank or identify individual devices or components: every row it returns is a time bucket covering all of them at once, and no device name or id appears in the output. If the question is "which devices are highest", "top N devices" or anything else that needs a per-device answer, use lumics_get_metric_summary instead, which returns one row per item and supports sortBy and topN. Note the confusable name: this tool summarises over TIME, lumics_get_metric_summary summarises over ITEMS.',
   inputSchema: {
     moduleType: moduleTypeSchema,
     companyId: companyIdSchema,
@@ -650,10 +947,31 @@ const summarizeCompanyMetrics = defineTool({
     const companyId = context.resolveCompanyId(args.companyId);
     const request = buildMetricRequest(args);
     const operation = `GET company metrics summarize ${args.moduleType}`;
-    const response = await context.client.get<unknown>(
-      companyMetricsSummarizePath(companyId, args.moduleType),
-      { query: request.query },
-    );
+    let response: unknown;
+    try {
+      response = await context.client.get<unknown>(
+        companyMetricsSummarizePath(companyId, args.moduleType),
+        {
+          query: request.query,
+          // The one endpoint that needs its own deadline (module comment, fact C).
+          // `Math.max` rather than a plain assignment so an operator who has already
+          // raised LUMICS_TIMEOUT_MS above this keeps their value.
+          timeoutMs: Math.max(context.config.timeoutMs, METRIC_SUMMARIZE_TIMEOUT_MS),
+          // And the attempt cap that keeps that deadline from multiplying. Without
+          // it a timing-out summarize costs three deadlines — nine minutes of
+          // silence — for retries that cannot succeed. See
+          // METRIC_SUMMARIZE_MAX_ATTEMPTS for why the cap is on attempts rather
+          // than on one retry class.
+          maxAttempts: METRIC_SUMMARIZE_MAX_ATTEMPTS,
+        },
+      );
+    } catch (cause) {
+      const explained = summarizeTimeoutError(cause);
+      if (explained !== undefined) {
+        throw explained;
+      }
+      throw cause;
+    }
     const series = unwrapMetricSeries(response, operation);
 
     const notes = metricSeriesNotes(request, series);
@@ -690,7 +1008,7 @@ const getDeviceMetrics = defineTool({
   operation: 'read',
   requiresCompany: true,
   description:
-    'Get metrics for the components of a single device — every fan, interface, pool or volume the named module polls on it — returning a row per component per time bucket. This is the tool for "how is this device doing": pair it with lastMetric true and a narrow "properties" list for a current-status readout, or leave lastMetric unset for a series over the window. Restrict to one kind of component with itemType when a device has many. The window defaults to the last 1 hour and a resolution of 60 data points is sent unless you pass dataPoints. For one specific component, or for the device\'s own device-level metrics, use lumics_get_device_item_metrics.' +
+    'Get metrics for the components of a single device — every fan, interface, pool or volume the named module polls on it — returning a row per component per time bucket. This is the tool for "how is this device doing": pair it with lastMetric true and a narrow "properties" list for a current-status readout, or leave lastMetric unset for a series over the window. "properties" is REQUIRED and must name metrics as "<TypeGroup>.<metric>" (e.g. "Calculated.cpu"); a name Lumics does not recognise returns a successful but EMPTY result rather than an error. Restrict to one kind of component with itemType when a device has many, using the singular component id — and note that Lumics validates itemType before properties, so a wrong itemType hides a properties problem. The window defaults to the last 1 hour and a resolution of 60 data points is sent unless you pass dataPoints. For one specific component, or for the device\'s own device-level metrics, use lumics_get_device_item_metrics.' +
     DEVICE_PIN_DISCLOSURE,
   inputSchema: {
     deviceId: objectIdSchema.describe('Lumics device id. Get it from lumics_list_devices.'),
@@ -738,7 +1056,7 @@ const getDeviceItemMetrics = defineTool({
   operation: 'read',
   requiresCompany: true,
   description:
-    "Get metrics for exactly one item on a device: pass the device's own id as itemId for device-level metrics such as CPU, memory or uptime, or a component id for one interface, fan, pool or volume. This is the narrowest and cheapest metric read, and the right one for charting a single series or checking one thing. Results are returned as time buckets, typically carrying min, max and avg per property along with the owning device's id and name. The window defaults to the last 1 hour and a resolution of 60 data points is sent unless you pass dataPoints. Unlike the other metric tools this one takes no itemType, because the item is already identified." +
+    'Get metrics for exactly one item on a device: pass the device\'s own id as itemId for device-level metrics such as CPU, memory or uptime, or a component id for one interface, fan, pool or volume. This is the narrowest and cheapest metric read, and the right one for charting a single series or checking one thing. Results are returned as time buckets, typically carrying min, max and avg per property along with the owning device\'s id and name. "properties" is REQUIRED and must name metrics as "<TypeGroup>.<metric>" (e.g. "Calculated.cpu", "TimeTicks.sysUpTime"); an unrecognised name returns a successful but EMPTY result rather than an error, so read the properties argument before guessing at one. The window defaults to the last 1 hour and a resolution of 60 data points is sent unless you pass dataPoints. Unlike the other metric tools this one takes no itemType, because the item is already identified.' +
     DEVICE_PIN_DISCLOSURE,
   inputSchema: {
     deviceId: objectIdSchema.describe('Lumics device id that owns the item.'),
@@ -809,12 +1127,14 @@ const getMetricSummary = defineTool({
   title: 'Summarize metrics across devices',
   operation: 'read',
   description:
-    'Summarize one metric module across every device or component in a company that reports it, giving one row per item with its averaged and peak values over the window — the tool for "which devices have the highest CPU" or "what is memory doing estate-wide". Pass itemType "device" for device-level summaries, or a component type for component-level ones, and narrow "properties" to the metric paths you need. This endpoint has a much smaller parameter surface than the other metric tools: it accepts no resolution, interval, isMonitored, lastMetric or limit parameter of any kind, so Lumics always returns the entire matching set. The topN and sortBy arguments are therefore applied by this server AFTER fetching everything, not by Lumics, and the response says so. The window defaults to the last 1 hour. Note the confusable name: this tool summarises over ITEMS and returns no time series — one row per device or component, with values already reduced over the whole window. For an estate-wide total or average plotted over time, one row per time bucket and no per-item detail, use lumics_summarize_company_metrics instead.',
+    'Summarize one metric module across every device or component in a company that reports it, giving one row per item with its averaged and peak values over the window — the tool for "which devices have the highest CPU" or "what is memory doing estate-wide". Pass itemType "device" for device-level summaries, or a singular component id for component-level ones. THIS IS ALSO THE ONLY WAY TO DISCOVER LEGAL "properties" VALUES for the other metric tools: call it with no properties, then read data.<class>[].stats — the outer keys are metric type groups (Calculated, Rate, TimeTicks) and the inner keys are metric names, so joining them with a dot gives a value you can pass as "properties" to lumics_get_company_metrics, lumics_get_device_metrics, lumics_get_device_item_metrics or lumics_summarize_company_metrics. Two limits on that: it surfaces DEVICE-scoped metric names only, so a component-level name such as an interface counter is discoverable from no endpoint at all and has to come from the Lumics UI; and the response key varies by module ("devices" for snmp, "http_endpoints" for http), so read whichever key is present instead of assuming "devices". Note that "properties" behaves differently HERE than on the other metric tools — it filters the result rather than projecting it, and supplying it has been observed to empty an otherwise full response — so leave it unset unless you have a reason. This endpoint has a much smaller parameter surface than the other metric tools: it accepts no resolution, interval, isMonitored, lastMetric or limit parameter of any kind, so Lumics always returns the entire matching set. The topN and sortBy arguments are therefore applied by this server AFTER fetching everything, not by Lumics, and the response says so. The window defaults to the last 1 hour. Note the confusable name: this tool summarises over ITEMS and returns no time series — one row per device or component, with values already reduced over the whole window. For an estate-wide total or average plotted over time, one row per time bucket and no per-item detail, use lumics_summarize_company_metrics instead.',
   inputSchema: {
     moduleType: moduleTypeSchema,
     companyId: companyIdSchema,
     itemType: itemTypeSchema.optional(),
-    properties: metricPropertiesSchema.optional(),
+    // A different parameter with the same name: optional here, and a filter
+    // rather than a projection. See `metricSummaryPropertiesSchema`.
+    properties: metricSummaryPropertiesSchema.optional(),
     ...timeRangeShape,
     // Local ranking only. spec §12.4 documents no limit, top, sort or order
     // parameter on this endpoint, so nothing below is sent to Lumics.
@@ -881,6 +1201,20 @@ const getMetricSummary = defineTool({
           : ` Lumics reported count=${String(count)} item(s) summarised; if fewer appear below they were removed by this server's topN trim or by the output budget, not by the API.`),
     );
 
+    // Said whenever `properties` was sent, not only when the result came back
+    // empty: a filtered-down-but-non-empty response is the more dangerous of the
+    // two, because it looks complete. This endpoint's `properties` is not the
+    // projection the identically-named argument is on the other four tools.
+    if (args.properties !== undefined) {
+      notes.push(
+        `PROPERTIES IS A FILTER HERE: you passed properties="${args.properties}". On this endpoint (unlike the other ` +
+          'metric tools, where it selects which values to return) it restricts WHICH ITEMS come back, and supplying ' +
+          'it has been observed to empty an otherwise full response. The item list below is therefore narrower than ' +
+          "the company's real one, by an amount this server cannot measure. If you wanted a complete list, or you " +
+          'are using this call to discover which metric names exist, re-run it with no "properties".',
+      );
+    }
+
     const effective = describeEffectiveWindow(meta);
     if (effective !== undefined) {
       notes.push(effective);
@@ -924,12 +1258,23 @@ const getMetricSummary = defineTool({
     // `absentSeriesNote` above has already said the opposite.
     if (classNames.length === 0) {
       if (absence === 'none') {
+        // Deliberately no longer a flat "nothing matched". When `properties` was
+        // supplied, the measured behaviour of this endpoint makes the parameter
+        // itself the likeliest cause, so leading with "nothing matched" would be
+        // a confident negative about the estate produced by our own argument.
         notes.push(
           'NO ITEMS: the Lumics response contained no item-class arrays at all — its "data" object was present but ' +
-            'empty — so nothing matched this module, itemType and window. This is not an error and not a truncation. ' +
-            'Check the moduleType and itemType against lumics_list_component_types (itemType "device" for ' +
-            'device-level summaries), and widen the window; a module that is configured but has not polled inside the ' +
-            'window returns nothing here.',
+            'empty. This is not an error and not a truncation, but do not report it as "this company has no data for ' +
+            'this module" until the arguments below are ruled out.' +
+            (args.properties === undefined
+              ? ''
+              : ' MOST LIKELY CAUSE: you supplied "properties". On this endpoint it FILTERS the result rather than ' +
+                'projecting it, and supplying it has been observed to empty a response that was otherwise full. ' +
+                'Re-run this call with no "properties" at all before drawing any conclusion.') +
+            ' Check itemType: it must be the SINGULAR component id ("snmp_common_cpu", not the plural ' +
+            '"snmp_common_cpus" that lumics_list_component_types returns), or the literal "device" for device-level ' +
+            'summaries; build it from lumics_get_device_definition_components. Check the moduleType, and widen the ' +
+            'window — a module that is configured but has not polled inside the window returns nothing here.',
         );
       }
       return result({}, { notes });

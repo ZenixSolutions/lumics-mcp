@@ -207,14 +207,25 @@ describe('an absent body is reported honestly, not as a confirmed count (finding
 // The metric tools, spec §12 — where an empty result is a claim about the estate
 // ---------------------------------------------------------------------------
 
+/** Required on the four series endpoints; optional (and a filter) on §12.4. */
+const METRIC_PROPERTIES = 'Calculated.cpu';
+
 /** The four series endpoints (§12.1–§12.3) plus the summaries endpoint (§12.4). */
 const METRIC_READS: readonly (readonly [string, Record<string, unknown>])[] = [
-  ['lumics_get_company_metrics', { moduleType: 'snmp' }],
-  ['lumics_summarize_company_metrics', { moduleType: 'snmp' }],
-  ['lumics_get_device_metrics', { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' }],
+  ['lumics_get_company_metrics', { moduleType: 'snmp', properties: METRIC_PROPERTIES }],
+  ['lumics_summarize_company_metrics', { moduleType: 'snmp', properties: METRIC_PROPERTIES }],
+  [
+    'lumics_get_device_metrics',
+    { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: METRIC_PROPERTIES },
+  ],
   [
     'lumics_get_device_item_metrics',
-    { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', itemId: TEST_COMPONENT_ID },
+    {
+      deviceId: TEST_DEVICE_ID,
+      moduleType: 'snmp',
+      properties: METRIC_PROPERTIES,
+      itemId: TEST_COMPONENT_ID,
+    },
   ],
   ['lumics_get_metric_summary', { moduleType: 'snmp' }],
 ];
@@ -247,6 +258,7 @@ describe('a metric read discloses an absent body instead of reporting an empty s
     const called = await callWith(emptyMetricBodyFetch(204), 'lumics_get_device_metrics', {
       deviceId: TEST_DEVICE_ID,
       moduleType: 'snmp',
+      properties: METRIC_PROPERTIES,
     });
     // The list note talks about records in a collection, which is the wrong
     // reading of an empty series — see metricRowCapNote for the same distinction.
@@ -259,7 +271,7 @@ describe('a metric read discloses an absent body instead of reporting an empty s
     const called = await callWith(
       metricFetch(() => jsonResponse({ data: [], from: '2026-07-29T11:00:00.000Z' })),
       'lumics_get_device_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: METRIC_PROPERTIES },
     );
 
     expect(called.isError).toBe(false);
@@ -272,7 +284,7 @@ describe('a metric read discloses an absent body instead of reporting an empty s
     const called = await callWith(
       metricFetch(() => jsonResponse({ from: '2026-07-29T11:00:00.000Z', components: 12 })),
       'lumics_get_device_metrics',
-      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', properties: METRIC_PROPERTIES },
     );
 
     expect(called.isError).toBe(false);
@@ -283,7 +295,11 @@ describe('a metric read discloses an absent body instead of reporting an empty s
   });
 
   it('the three empty outcomes are distinguishable from each other', async () => {
-    const args = { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' };
+    const args = {
+      deviceId: TEST_DEVICE_ID,
+      moduleType: 'snmp',
+      properties: METRIC_PROPERTIES,
+    };
     const absentBody = await callWith(emptyMetricBodyFetch(204), 'lumics_get_device_metrics', args);
     const absentData = await callWith(
       metricFetch(() => jsonResponse({ from: '2026-07-29T11:00:00.000Z' })),
