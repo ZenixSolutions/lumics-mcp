@@ -9,7 +9,7 @@ Note that while the version is below `1.0.0`, the tool surface is not yet stable
 to a tool name or its arguments ships as a **minor** bump with an explicit notice in this file. See
 [docs/RELEASE.md](./docs/RELEASE.md).
 
-## [0.1.0] - Unreleased
+## [0.1.0] - 2026-07-30
 
 First release. Nothing below has shipped yet; this section is the release note under construction
 and is finalised at tag time.
