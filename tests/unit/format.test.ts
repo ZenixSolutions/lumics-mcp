@@ -22,7 +22,7 @@ import {
   shapeToolOutput,
   toCompactJson,
 } from '../../src/presentation/format.js';
-import { DEFAULT_MAX_OUTPUT_CHARS } from '../../src/constants.js';
+import { DEFAULT_MAX_OUTPUT_CHARS, MIN_MAX_OUTPUT_CHARS } from '../../src/constants.js';
 
 /**
  * Keys the API does not have and this server must never invent. `sort`/`order`
@@ -330,6 +330,108 @@ describe('shapeToolOutput', () => {
     const shaped = shapeToolOutput({ blob: 'x'.repeat(DEFAULT_MAX_OUTPUT_CHARS + 100) });
     expect(shaped.budgetTruncated).toBe(true);
     expect(shaped.text).toContain(String(DEFAULT_MAX_OUTPUT_CHARS));
+  });
+});
+
+/**
+ * `LUMICS_MAX_OUTPUT_CHARS` is documented as a cap on tool output, and it has to
+ * be one. The payload used to be fitted to `maxChars` and the disclosure notes
+ * prepended afterwards, so the returned text always exceeded the budget by the
+ * length of the notes — measured at +112% on a 1,000-character budget, which is
+ * the smallest value the configuration allows and therefore exactly where an
+ * operator economising is worst served.
+ *
+ * The rule the fix implements: notes and payload share one budget, notes are
+ * reserved first, and a disclosure is never dropped or shortened to make room —
+ * if the notes alone fill the budget the payload goes to nothing instead.
+ */
+describe('maxChars caps the whole response, notes included', () => {
+  const rows = (count: number, blob = 80): readonly unknown[] =>
+    Array.from({ length: count }, (_unused, index) => ({ id: index, blob: 'x'.repeat(blob) }));
+
+  it.each([1_000, 5_000, 25_000])(
+    'fits the payload and its truncation disclosure inside a %i-character budget',
+    (maxChars) => {
+      const shaped = shapeToolOutput(rows(600), { maxChars });
+      expect(shaped.budgetTruncated).toBe(true);
+      expect(shaped.text.length).toBeLessThanOrEqual(maxChars);
+    },
+  );
+
+  it.each([5_000, 25_000])('fits BOTH disclosures inside a %i-character budget', (maxChars) => {
+    const shaped = shapeToolOutput(rows(600), { maxChars, requestedLimit: 600 });
+    expect(shaped.limitReached).toBe(true);
+    expect(shaped.budgetTruncated).toBe(true);
+    expect(shaped.text).toContain('NOTE ON COMPLETENESS:');
+    expect(shaped.text).toContain('NOTE ON TRUNCATION:');
+    expect(shaped.text.length).toBeLessThanOrEqual(maxChars);
+  });
+
+  it('emits the disclosures in full at the smallest configurable budget', () => {
+    const shaped = shapeToolOutput(rows(600), {
+      maxChars: MIN_MAX_OUTPUT_CHARS,
+      requestedLimit: 600,
+    });
+    // Both disclosures together are longer than the whole budget, so they are
+    // what survives and the payload is what goes — never the other way round.
+    expect(shaped.text).toContain('NOTE ON COMPLETENESS:');
+    expect(shaped.text).toContain('NOTE ON TRUNCATION:');
+    expect(shaped.droppedItems).toBe(600);
+    // Everything except a two-character empty array is disclosure text, which is
+    // the only case where the output may exceed the budget.
+    expect(shaped.text.endsWith('\n\n[]')).toBe(true);
+  });
+
+  it('counts caller-supplied notes against the same budget', () => {
+    const notes = ['A CALLER NOTE. ' + 'y'.repeat(600), 'A SECOND CALLER NOTE.'];
+    const shaped = shapeToolOutput(rows(200), { maxChars: 2_000, notes });
+    expect(shaped.text.length).toBeLessThanOrEqual(2_000);
+    // The notes are still there in full: nothing was shortened to fit.
+    for (const note of notes) {
+      expect(shaped.text).toContain(note);
+    }
+  });
+
+  it('caps a hard-truncated single object too', () => {
+    const shaped = shapeToolOutput(
+      { blob: 'x'.repeat(50_000) },
+      { maxChars: 1_000, notes: ['A CALLER NOTE.'] },
+    );
+    expect(shaped.budgetTruncated).toBe(true);
+    expect(shaped.text.length).toBeLessThanOrEqual(1_000);
+    expect(shaped.text).toContain('A CALLER NOTE.');
+    expect(shaped.text).toContain('INCOMPLETE and may not parse');
+  });
+
+  it('keeps every disclosure and empties the payload when the notes fill the budget', () => {
+    const huge = 'A LONG CALLER DISCLOSURE. ' + 'z'.repeat(1_500);
+    const shaped = shapeToolOutput(rows(50), {
+      maxChars: 1_000,
+      notes: [huge],
+      requestedLimit: 50,
+    });
+
+    // The disclosures survive intact — that is the property that outranks the cap.
+    expect(shaped.text).toContain(huge);
+    expect(shaped.text).toContain('NOTE ON COMPLETENESS:');
+    expect(shaped.text).toContain('NOTE ON TRUNCATION:');
+    // And the payload, not a disclosure, is what was given up.
+    expect(shaped.droppedItems).toBe(50);
+    expect(shaped.text.endsWith('[]')).toBe(true);
+  });
+
+  it('still fits everything when the whole response is comfortably inside the budget', () => {
+    const shaped = shapeToolOutput([{ id: 1 }], { maxChars: 1_000, notes: ['SHORT NOTE.'] });
+    expect(shaped.budgetTruncated).toBe(false);
+    expect(shaped.text).toBe('SHORT NOTE.\n\n[{"id":1}]');
+  });
+
+  it('reports a dropped count that matches the payload it actually emitted', () => {
+    const items = rows(200);
+    const shaped = shapeToolOutput(items, { maxChars: 1_000 });
+    const payload = JSON.parse(shaped.text.slice(shaped.text.indexOf('['))) as unknown[];
+    expect(payload.length).toBe(items.length - shaped.droppedItems);
+    expect(shaped.text).toContain(`${String(shaped.droppedItems)} of 200 items were dropped`);
   });
 });
 

@@ -151,6 +151,66 @@ describe('LumicsApiError factory constructors', () => {
     expect(error.message).toMatch(/LUMICS_TIMEOUT_MS/);
   });
 
+  /**
+   * Finding H2. Both transport-failure messages ended with fixed advice written
+   * for a read — "Retry the call", "Narrow the request" — regardless of verb. On
+   * a POST or PATCH the client makes exactly one attempt *by design*, because the
+   * write may already have been applied upstream, and then handed the model an
+   * instruction to retry it anyway. An agent that complies creates a duplicate,
+   * or a 409 it then has to reason about. DELETE joined that set when it stopped
+   * being retried.
+   */
+  const WRITE_OPERATIONS = [
+    'POST /companies/c/devices',
+    'PATCH /companies/c/devices/d',
+    'DELETE /companies/c/devices/d',
+  ] as const;
+
+  it.each(WRITE_OPERATIONS)(
+    'incompleteBody on "%s" never tells the model to retry',
+    (operation) => {
+      const error = LumicsApiError.incompleteBody(operation, 1, new Error('ECONNRESET'));
+
+      expect(error.message).not.toMatch(/retry the call/i);
+      expect(error.message).toMatch(/may already have been applied/);
+      // Verify, do not replay.
+      expect(error.message).toMatch(/read/i);
+      // "A truncated list is indistinguishable from a short one" is nonsense on a
+      // create, and reads as though the server were describing a collection.
+      expect(error.message).not.toContain('a truncated list is indistinguishable');
+    },
+  );
+
+  it.each(WRITE_OPERATIONS)('timeout on "%s" never tells the model to retry', (operation) => {
+    const error = LumicsApiError.timeout(operation, 30_000, 1);
+
+    expect(error.message).not.toMatch(/retry the call/i);
+    expect(error.message).toMatch(/may already have been applied/);
+    expect(error.message).toMatch(/read/i);
+  });
+
+  it.each(WRITE_OPERATIONS)(
+    'network on "%s" does not imply the write never landed',
+    (operation) => {
+      const error = LumicsApiError.network(operation, 1, new TypeError('fetch failed'));
+      expect(error.message).toMatch(/may already have been applied/);
+      expect(error.message).not.toMatch(/retry the call/i);
+    },
+  );
+
+  it.each(['GET /companies/c/devices', 'PUT /companies/c/devices/d/modules/snmp/lastDiscovery'])(
+    'keeps the retry advice on "%s", where a replay changes nothing',
+    (operation) => {
+      const incomplete = LumicsApiError.incompleteBody(operation, 2, new Error('ECONNRESET'));
+      expect(incomplete.message).toMatch(/retry the call/i);
+      expect(incomplete.message).not.toMatch(/may already have been applied/);
+
+      const timedOut = LumicsApiError.timeout(operation, 30_000, 2);
+      expect(timedOut.message).toMatch(/narrow the request/i);
+      expect(timedOut.message).not.toMatch(/may already have been applied/);
+    },
+  );
+
   it('network pulls the innermost cause out of a fetch cause chain', () => {
     const inner = new Error('getaddrinfo ENOTFOUND lumics.invalid');
     const middle = new Error('connection failed', { cause: inner });

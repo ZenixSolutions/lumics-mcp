@@ -157,8 +157,22 @@ export function toEpochMs(value: string | number, field: string): number {
 }
 
 /**
- * `Date.parse` on input whose *shape* is already validated. A shape-valid but
- * calendar-invalid value (`2026-02-31T00:00:00Z`) still lands here.
+ * `Date.parse` on input whose *shape* is already validated, plus the calendar
+ * check `Date.parse` does not perform.
+ *
+ * `Date.parse` returns NaN for an out-of-range month, day or hour
+ * (`2026-13-45T99:99:99Z`), but it **rolls over** a day that is merely absent
+ * from its month: `Date.parse('2026-02-31T00:00:00Z')` is 2026-03-03, and
+ * `2025-02-29` is 2025-03-01. Nothing downstream could then tell that the
+ * window had moved — the window note would report "requested 2026-03-03" to a
+ * caller who asked for February 31st, so a model that mis-computes a month
+ * boundary gets a silently shifted, internally consistent answer.
+ *
+ * So the calendar date is re-serialised from its own components and compared
+ * back: a rolled-over value does not match, and is rejected. The comparison is
+ * done on the date fields taken from the *input string*, not on the parsed
+ * instant, so an offset form (`2026-04-31T12:00:00+02:00`) is judged on the
+ * calendar date the caller wrote rather than on its UTC equivalent.
  */
 function assertParsed(candidate: string, original: string, field: string): number {
   const parsed = Date.parse(candidate);
@@ -167,7 +181,46 @@ function assertParsed(candidate: string, original: string, field: string): numbe
       `${field} "${original}" has the shape of an ISO-8601 timestamp but is not a real instant — check the month, day and hour values. Use a form like 2026-07-29T14:00:00Z.`,
     );
   }
+  assertRealCalendarDate(candidate, original, field, parsed);
   return parsed;
+}
+
+/** `YYYY-MM-DD` at the head of an already shape-validated timestamp. */
+const LEADING_DATE_PATTERN = /^(\d{4})-(\d{2})-(\d{2})/;
+
+function assertRealCalendarDate(
+  candidate: string,
+  original: string,
+  field: string,
+  parsed: number,
+): void {
+  const match = LEADING_DATE_PATTERN.exec(candidate);
+  if (match === null) {
+    return;
+  }
+  const year = Number.parseInt(match[1] as string, 10);
+  const month = Number.parseInt(match[2] as string, 10);
+  const day = Number.parseInt(match[3] as string, 10);
+
+  // Build the instant those three fields describe and read them back. Feb 31
+  // becomes Mar 3, whose day is 3 rather than 31, so the mismatch is the signal.
+  const roundTrip = new Date(Date.UTC(year, month - 1, day));
+  // `Date.UTC` maps a year below 100 onto 1900+year, which would make a real
+  // date like 0099-01-01 look rolled-over. Such a date is rejected downstream by
+  // the epoch-milliseconds floor; it should be rejected with THAT message, not
+  // with a false claim that the calendar date does not exist.
+  roundTrip.setUTCFullYear(year);
+  if (
+    roundTrip.getUTCFullYear() === year &&
+    roundTrip.getUTCMonth() === month - 1 &&
+    roundTrip.getUTCDate() === day
+  ) {
+    return;
+  }
+
+  throw new LumicsInputError(
+    `${field} "${original}" is not a real calendar date: that day does not exist in that month, and JavaScript would have silently rolled it forward to ${new Date(parsed).toISOString().slice(0, 10)} rather than rejecting it. The window this server reported back would then have described days you did not ask for. Check the month and day — month lengths and leap years both matter — and re-send a real date such as 2026-07-29T14:00:00Z.`,
+  );
 }
 
 /**

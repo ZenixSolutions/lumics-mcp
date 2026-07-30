@@ -118,20 +118,33 @@ describe('a free-form segment is encoded, and the URL still lands where it shoul
       '/modules/',
     ],
   ])('%s is percent-encoded on the wire', async (_label, tool, args, mustContain) => {
-    const fetcher = recordFetch(jsonResponse({ data: [], updated: { id: 'x' } }));
+    // The body doubles as the device record the device-scoped metric tools read
+    // first to enforce the company pin (spec §12.3 has no company in its path),
+    // so that read succeeds and the tool goes on to build the URL under test.
+    const fetcher = recordFetch(
+      jsonResponse({
+        data: [],
+        updated: { id: 'x' },
+        id: TEST_DEVICE_ID,
+        company: TEST_COMPANY_ID,
+      }),
+    );
     const harness = await connect(makeConfig(), {
       clientOptions: { fetchImpl: fetcher.fetchImpl },
     });
     try {
       await harness.call(tool, args);
-      expect(fetcher.calls).toHaveLength(1);
 
-      const { url } = fetcher.only();
+      // The tool's own request is the last one; any pin pre-read precedes it.
+      const { url } = fetcher.last();
       expect(url.pathname).toContain('..%2F..%2Fme%2Ftoken');
       // Still inside the intended collection, and nowhere near the token route.
       expect(url.pathname).toContain(mustContain);
-      expect(url.pathname).not.toMatch(/\/me\/token(\/|$)/);
-      expect(url.pathname.split('/')).not.toContain('..');
+      // No request in the exchange escaped, not just the last one.
+      for (const call of fetcher.calls) {
+        expect(call.url.pathname).not.toMatch(/\/me\/token(\/|$)/);
+        expect(call.url.pathname.split('/')).not.toContain('..');
+      }
     } finally {
       await harness.close();
     }

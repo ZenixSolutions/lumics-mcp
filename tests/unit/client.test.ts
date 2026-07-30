@@ -22,6 +22,7 @@ import {
   LumicsClient,
   unwrapDeleted,
   unwrapUpdated,
+  unwrapUpdatedArray,
 } from '../../src/api/client.js';
 import { LumicsApiError } from '../../src/api/errors.js';
 import {
@@ -363,7 +364,7 @@ describe('retry policy', () => {
 });
 
 describe('retry safety for non-idempotent verbs', () => {
-  it.each(['post', 'patch'] as const)(
+  it.each(['post', 'patch', 'delete'] as const)(
     'never retries a %s on a network error: the request may already have been applied',
     async (method) => {
       const fetcher = networkFailureFetch();
@@ -371,20 +372,58 @@ describe('retry safety for non-idempotent verbs', () => {
 
       const error = await captureApiError(client[method]('/devices', { body: { name: 'x' } }));
       expect(error.code).toBe('network_error');
-      // Exactly one attempt. A second could create a duplicate device.
+      // Exactly one attempt. A second could create a duplicate device, or 404 on
+      // a record the first attempt already deleted.
       expect(fetcher.calls).toHaveLength(1);
       expect(delays).toHaveLength(0);
       expect(error.attempts).toBe(1);
     },
   );
 
-  it.each(['post', 'patch'] as const)('never retries a %s on a timeout', async (method) => {
-    const fetcher = timeoutFetch();
+  it.each(['post', 'patch', 'delete'] as const)(
+    'never retries a %s on a timeout',
+    async (method) => {
+      const fetcher = timeoutFetch();
+      const { client } = makeClient(fetcher);
+
+      const error = await captureApiError(client[method]('/devices', { body: { name: 'x' } }));
+      expect(error.code).toBe('timeout');
+      expect(fetcher.calls).toHaveLength(1);
+    },
+  );
+
+  /**
+   * The DELETE blocker, reproduced exactly as the reviewer found it.
+   *
+   * The connection drops *after* Lumics applied the delete. The old retry policy
+   * treated DELETE as idempotent and replayed it; the second attempt found
+   * nothing and answered 404, and 404 is not retryable, so `not_found` was the
+   * error that surfaced — "Lumics has no such resource" reported for a record
+   * this server had just successfully deleted. A completed destructive action
+   * described as never having happened is the exact inversion this codebase is
+   * organised against, and `factory.ts` already states the position: destructive
+   * tools carry `idempotentHint: false` because "the second call 404s rather
+   * than reproducing the first result".
+   */
+  it('does not turn a dropped DELETE into a 404 by replaying it', async () => {
+    const fetcher = recordFetch((_call, attempt) => {
+      if (attempt === 1) {
+        // Lumics applied the delete; the response never made it back.
+        throw new TypeError('fetch failed', { cause: new Error('ECONNRESET') });
+      }
+      return errorResponse(404);
+    });
     const { client } = makeClient(fetcher);
 
-    const error = await captureApiError(client[method]('/devices', { body: { name: 'x' } }));
-    expect(error.code).toBe('timeout');
+    const error = await captureApiError(client.delete('/companies/c/devices/d'));
+
     expect(fetcher.calls).toHaveLength(1);
+    expect(error.code).toBe('network_error');
+    expect(error.code).not.toBe('not_found');
+    expect(error.status).toBeUndefined();
+    expect(error.message).not.toContain('Lumics has no such resource');
+    // And it says what to do about a delete whose outcome is unknown.
+    expect(error.message).toMatch(/may already have been applied/);
   });
 
   it('does retry a POST on HTTP 429, because the server answered and did not act', async () => {
@@ -394,9 +433,19 @@ describe('retry safety for non-idempotent verbs', () => {
     expect(fetcher.calls).toHaveLength(2);
   });
 
-  it.each(['get', 'put', 'delete'] as const)(
-    'does retry a %s on a network error, since the verb is idempotent',
+  it('does retry a DELETE on HTTP 429: a status proves the server answered and did not act', async () => {
+    const fetcher = recordFetch([errorResponse(429), jsonResponse({ deleted: { id: 'a' } })]);
+    const { client } = makeClient(fetcher);
+    await expect(client.delete('/devices/x')).resolves.toEqual({ deleted: { id: 'a' } });
+    expect(fetcher.calls).toHaveLength(2);
+  });
+
+  it.each(['get', 'put'] as const)(
+    'does retry a %s on a network error: replaying it cannot change the outcome',
     async (method) => {
+      // PUT stays here deliberately. The only PUT this server issues sets
+      // `lastDiscovery` to an absolute value (spec §7.4), so replaying it writes
+      // the same timestamp — unlike a DELETE, whose replay 404s.
       const fetcher = networkFailureFetch();
       const { client } = makeClient(fetcher);
       await expect(client[method]('/devices/x')).rejects.toBeInstanceOf(LumicsApiError);
@@ -439,8 +488,30 @@ describe('envelope unwrapping (spec section 4.2)', () => {
     expect(unwrapUpdated({ updated: { id: 'a' } }, 'PATCH x')).toEqual({ id: 'a' });
   });
 
-  it('unwrapUpdated handles the batch shape, where the envelope holds an array', () => {
-    expect(unwrapUpdated({ updated: [{ id: 'a' }, { id: 'b' }] }, 'PATCH batch')).toHaveLength(2);
+  it('unwrapUpdatedArray handles the batch shape, where the envelope holds an array', () => {
+    expect(unwrapUpdatedArray({ updated: [{ id: 'a' }, { id: 'b' }] }, 'PATCH batch')).toHaveLength(
+      2,
+    );
+    // An empty array is a real answer here — "none of your ids matched" — and is
+    // not the same as an absent or non-array envelope.
+    expect(unwrapUpdatedArray({ updated: [] }, 'PATCH batch')).toEqual([]);
+  });
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['a single record', { id: 'a' }],
+  ])('unwrapUpdatedArray rejects a batch envelope holding %s', (_label, inner) => {
+    const error = (() => {
+      try {
+        unwrapUpdatedArray({ updated: inner }, 'PATCH batch');
+        return undefined;
+      } catch (thrown) {
+        return thrown as LumicsApiError;
+      }
+    })();
+    expect(error?.code).toBe('invalid_response');
+    expect(error?.message).toContain('an array of the records it changed');
   });
 
   it.each([
@@ -466,8 +537,68 @@ describe('envelope unwrapping (spec section 4.2)', () => {
     expect(() => unwrapDeleted({ updated: { id: 'a' } }, 'DELETE x')).toThrow(/"deleted" envelope/);
   });
 
-  it('an envelope holding an explicit undefined still counts as present', () => {
-    expect(unwrapUpdated({ updated: undefined }, 'PATCH x')).toBeUndefined();
+  /**
+   * Finding H3. The envelope *key* was validated but never its contents, so
+   * `{updated: null}` and `{deleted: null}` unwrapped to `null` and were returned
+   * as a successful result whose whole payload was the literal text `null` —
+   * under a note stating as fact that the record had been updated or permanently
+   * deleted. `expectObject` exists to close exactly this hole on the read path;
+   * leaving it open on the write path let a write make a stronger claim from the
+   * identical body shape than a read is allowed to make.
+   */
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['a string', 'gone'],
+    ['a number', 0],
+    ['an array', [{ id: 'a' }]],
+  ])('unwrapUpdated rejects an envelope holding %s rather than passing it through', (_l, inner) => {
+    const error = (() => {
+      try {
+        unwrapUpdated({ updated: inner }, 'PATCH device x');
+        return undefined;
+      } catch (thrown) {
+        return thrown as LumicsApiError;
+      }
+    })();
+    expect(error?.code).toBe('invalid_response');
+  });
+
+  it.each([
+    ['null', null],
+    ['undefined', undefined],
+    ['a string', 'gone'],
+    // A single delete documents `{deleted: {...}}` (spec §4.2). An array here is
+    // drift, and it was previously rendered under the singular "the device below
+    // has been permanently deleted" note.
+    ['an array', [{ id: 'a' }]],
+  ])('unwrapDeleted rejects an envelope holding %s rather than passing it through', (_l, inner) => {
+    const error = (() => {
+      try {
+        unwrapDeleted({ deleted: inner }, 'DELETE device x');
+        return undefined;
+      } catch (thrown) {
+        return thrown as LumicsApiError;
+      }
+    })();
+    expect(error?.code).toBe('invalid_response');
+  });
+
+  it('an empty envelope is not reported as "the record does not exist"', () => {
+    const error = (() => {
+      try {
+        unwrapDeleted({ deleted: null }, 'DELETE device x');
+        return undefined;
+      } catch (thrown) {
+        return thrown as LumicsApiError;
+      }
+    })();
+    // The same distinction `expectObject` draws on a read: a missing record is a
+    // documented 404, not an empty 200.
+    expect(error?.message).toContain('This is not the same as "the record does not exist"');
+    // And the write may well have landed, so the model is told to go and look
+    // rather than to report a failure or replay the call.
+    expect(error?.message).toMatch(/may already have been applied/);
   });
 
   it('expectArray passes a bare array through', () => {

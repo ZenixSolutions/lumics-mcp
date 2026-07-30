@@ -15,7 +15,7 @@ import { loadConfig, type LumicsConfig } from './config.js';
 import { SERVER_NAME, SERVER_VERSION } from './constants.js';
 import { buildServer } from './server.js';
 import { startStdioTransport } from './transport/stdio.js';
-import { logger } from './util/logger.js';
+import { logger, setLogLevel } from './util/logger.js';
 import { redactedMessage } from './util/redact.js';
 
 interface Shutdownable {
@@ -31,9 +31,15 @@ async function main(): Promise<void> {
     return;
   }
 
-  loadDotEnvIfPresent();
-
+  // The environment is read exactly as the process received it. Nothing here
+  // discovers a `.env`, and nothing should: see the note at the foot of this file.
   const config: LumicsConfig = loadConfig();
+
+  // Before anything can log. `loadConfig` only parses the level; applying it is a
+  // process-wide side effect and belongs in the entry point, so importing the
+  // package cannot change a host application's logging.
+  setLogLevel(config.logLevel);
+
   const handle = await start(config);
 
   installProcessHandlers(handle);
@@ -107,24 +113,24 @@ function installProcessHandlers(handle: Shutdownable): void {
 }
 
 /**
- * Load `.env` when one is present, using Node's built-in loader so no dotenv
- * dependency is added. `.env.example` tells developers to copy it to `.env`, so
- * without this the documented workflow would not work.
+ * No implicit `.env` load. This file used to hand Node's own dotenv loader the
+ * **relative** path `.env`, which for the published binary meant whatever
+ * directory the MCP client happened to launch the server from — a user's
+ * workspace, a cloned repository, a directory the very agent this server serves
+ * can write to. A planted file could redirect `LUMICS_BASE_URL` (the token is a
+ * bearer credential, so that is exfiltration, reproduced against a loopback sink)
+ * and open every `LUMICS_ENABLE_*` gate the operator had left unset, which is all
+ * of them by default. Real environment variables won, so only the defaults were
+ * hijackable — and the defaults are the security posture.
  *
- * Real environment variables always win: `loadEnvFile` does not overwrite them.
+ * Local development uses Node's own flag, which is explicit and chosen by the
+ * operator rather than discovered from the filesystem:
+ *
+ *   node --env-file=.env dist/index.js
+ *
+ * Every documented client install passes the variables in the client's own `env`
+ * block instead. Verified by `tests/security/dotenv-not-loaded.test.ts`.
  */
-function loadDotEnvIfPresent(): void {
-  const loadEnvFile = (process as { loadEnvFile?: (path?: string) => void }).loadEnvFile;
-  if (typeof loadEnvFile !== 'function') {
-    return;
-  }
-  try {
-    loadEnvFile('.env');
-  } catch {
-    // No .env, or unreadable. Both are normal — the file is optional and
-    // configuration may come entirely from the client's env block.
-  }
-}
 
 main().catch((error: unknown) => {
   // The one place a configuration failure surfaces. `loadConfig` throws a

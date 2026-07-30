@@ -11,8 +11,12 @@
  * `process.env`.
  */
 
+import { readFileSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
 import { afterEach, describe, expect, it } from 'vitest';
 import {
+  BASE_URL_REQUIRES_TLS,
   buildHttpTransportConfig,
   describeConfig,
   HTTP_TRANSPORT_UNAVAILABLE,
@@ -30,11 +34,18 @@ import {
   MIN_MAX_OUTPUT_CHARS,
   MIN_TIMEOUT_MS,
 } from '../../src/constants.js';
-import { clearRegisteredSecrets, registeredSecretCount } from '../../src/util/redact.js';
+import { LOG_LEVELS } from '../../src/util/logger.js';
+import {
+  clearRegisteredSecrets,
+  redactString,
+  registeredSecretCount,
+} from '../../src/util/redact.js';
 import { makeConfig, makeEnv, TEST_COMPANY_ID, TEST_TOKEN } from '../helpers/config.js';
 
 /** A 32-character placeholder for the HTTP shared secret. Obviously not real. */
 const HTTP_SECRET = 'placeholder-http-secret-32-chars';
+
+const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 
 afterEach(() => {
   // `registerSecret` writes to a module-level set; keep cases isolated.
@@ -250,6 +261,106 @@ describe('boolean flags refuse to fail open', () => {
       expect(() => loadConfig(makeEnv({ [variable]: 'sure' }))).toThrow(new RegExp(variable));
     },
   );
+});
+
+/**
+ * The API token is a bearer credential sent on every request, so the base URL
+ * decides who receives it. Requiring TLS is the control that keeps a redirected
+ * base URL from being a plaintext credential disclosure as well; loopback is
+ * exempt because a local development proxy is a real use and cannot leave the
+ * machine.
+ */
+describe('LUMICS_BASE_URL requires TLS off the loopback interface', () => {
+  it.each([
+    'https://app.lumics.io/api/v1',
+    'https://lumics.example.invalid/api/v1',
+    'http://127.0.0.1:8080/api/v1',
+    'http://localhost:8080/api/v1',
+    'http://[::1]:8080/api/v1',
+    'http://localhost/api/v1',
+  ])('accepts %s', (value) => {
+    expect(loadConfig(makeEnv({ LUMICS_BASE_URL: value })).baseUrl).toBe(value);
+  });
+
+  it.each([
+    'http://app.lumics.io/api/v1',
+    'http://192.168.1.10/api/v1',
+    'http://lumics.internal:8080/api/v1',
+    // Not loopback: the hostname merely starts with one of the loopback spellings.
+    'http://localhost.attacker.invalid/api/v1',
+    'http://127.0.0.1.attacker.invalid/api/v1',
+  ])('rejects the plaintext non-loopback URL %s', (value) => {
+    expect(() => loadConfig(makeEnv({ LUMICS_BASE_URL: value }))).toThrow(/LUMICS_BASE_URL/);
+    expect(() => loadConfig(makeEnv({ LUMICS_BASE_URL: value }))).toThrow(
+      /lumics-mcp cannot start/,
+    );
+  });
+
+  it('says exactly why, naming the credential and the exemption', () => {
+    const attempt = (): unknown =>
+      loadConfig(makeEnv({ LUMICS_BASE_URL: 'http://app.lumics.io/api/v1' }));
+    // The operator has to be able to act on this without reading the source.
+    expect(attempt).toThrow(/must use https:/);
+    expect(attempt).toThrow(/credential sent in the Authorization header/);
+    expect(attempt).toThrow(/clear text/);
+    expect(attempt).toThrow(/127\.0\.0\.1/);
+    expect(attempt).toThrow(/localhost/);
+    expect(attempt).toThrow(/\[::1\]/);
+  });
+
+  /**
+   * The constant is exported so a test can assert "the same sentence the operator
+   * reads" — which only means anything while the two actually agree. An earlier
+   * wording said "a bearer credential sent on every request", and `BEARER_PATTERN`
+   * in the redactor matches `bearer <word>`, so the operator was shown "a bearer
+   * [REDACTED] sent on every request". The redactor is right to be greedy about
+   * anything shaped like a credential; the prose has to stay out of its way. This
+   * asserts that property directly rather than trusting a reviewer to notice.
+   */
+  it('survives the redactor unchanged, so the operator reads the exported sentence', () => {
+    expect(redactString(BASE_URL_REQUIRES_TLS)).toBe(BASE_URL_REQUIRES_TLS);
+    expect(redactString(BASE_URL_REQUIRES_TLS)).not.toContain('[REDACTED]');
+  });
+
+  it('still reports a non-absolute URL as such rather than as a TLS problem', () => {
+    expect(() => loadConfig(makeEnv({ LUMICS_BASE_URL: 'app.lumics.io/api/v1' }))).toThrow(
+      /must be an absolute http\(s\) URL/,
+    );
+  });
+});
+
+/**
+ * `LUMICS_LOG_LEVEL`. The mechanism (`setLogLevel`) already existed and was
+ * tested, but nothing in `src/` called it, so `logger.debug` — the per-call
+ * diagnostic in the tool factory — was unreachable in production and an operator
+ * could not quiet a server whose stderr they did not want.
+ */
+describe('LUMICS_LOG_LEVEL', () => {
+  it('defaults to info', () => {
+    expect(loadConfig(makeEnv()).logLevel).toBe('info');
+    expect(describeConfig(loadConfig(makeEnv())).logLevel).toBe('info');
+  });
+
+  it.each(LOG_LEVELS)('accepts %s', (level) => {
+    expect(loadConfig(makeEnv({ LUMICS_LOG_LEVEL: level })).logLevel).toBe(level);
+  });
+
+  it.each(['verbose', 'trace', 'INFO', 'quiet', '2'])(
+    'rejects %j instead of falling back to a level the operator did not choose',
+    (value) => {
+      expect(() => loadConfig(makeEnv({ LUMICS_LOG_LEVEL: value }))).toThrow(/LUMICS_LOG_LEVEL/);
+      expect(() => loadConfig(makeEnv({ LUMICS_LOG_LEVEL: value }))).toThrow(
+        /debug, info, warn, error, silent/,
+      );
+    },
+  );
+
+  it('is applied by the entry point, not merely parsed', () => {
+    // `src/index.ts` is the only place that may touch the process-wide logger:
+    // `loadConfig` stays free of that side effect so tests can call it freely.
+    const source = readFileSync(resolve(REPO_ROOT, 'src', 'index.ts'), 'utf8');
+    expect(source).toContain('setLogLevel(config.logLevel)');
+  });
 });
 
 describe('http transport requires its own shared secret', () => {

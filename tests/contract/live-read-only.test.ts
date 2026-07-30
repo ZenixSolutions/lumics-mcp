@@ -21,10 +21,11 @@
  *
  * This file covers identity (spec §11.1), the list conventions of spec §4.2/§4.3
  * and the IPAM path asymmetry of spec §13 Q1. Its siblings cover the rest:
- * `live-metrics.test.ts` (spec §12, the largest and riskiest surface) and
- * `live-resources.test.ts` (spec §5, §6, §9). Shared gating, the evidence ledger
- * and the sparse-tenant mechanism live in `harness.ts`; read its header before
- * adding a case.
+ * `live-metrics.test.ts` (spec §12, the largest and riskiest surface, plus the
+ * spec §7.2 device-ownership pre-read that puts the device metric endpoints behind
+ * the company pin) and `live-resources.test.ts` (spec §5, §6, §9). Shared gating,
+ * the evidence ledger, the sparse-tenant mechanism and the one sanctioned source
+ * of a device id live in `harness.ts`; read its header before adding a case.
  *
  * A failure here is a **documentation defect to report**, not a licence to change
  * the code: CLAUDE.md is explicit that if the spec is wrong about live behaviour,

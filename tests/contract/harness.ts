@@ -35,15 +35,37 @@
  * report is useless without saying which module an assumption was checked
  * against.
  *
+ * **4. A device id may only come from the configured company.** The two
+ * device-scoped metric tools (spec §12.3) now perform an ownership **pre-read**
+ * before the metric call: `src/tools/metrics.ts` reads the device inside
+ * `LUMICS_COMPANY_ID` and refuses unless `device.company` is that company. A
+ * device resolved from anywhere else is therefore refused by the server rather
+ * than served, and a case built on such an id would fail for the pin's reason
+ * while appearing to report a metric-contract violation. {@link pinnedCompanyDevices}
+ * is the only sanctioned source of a device id in this directory: it reads the
+ * configured company's own device list, so ownership holds by construction.
+ *
  * **READ-ONLY, without exception.** Every call this suite makes is a GET. It
  * never touches `GET /me/token`, `POST /me/token` or `POST /me/token/revoke` —
  * the first two mint credentials and the third would revoke the operator's own
  * working token mid-run (spec §11.2–§11.4).
+ *
+ * **Configuration comes from the process environment and nowhere else.** The
+ * server no longer reads a `.env` file (`tests/security/dotenv-not-loaded.test.ts`
+ * records why), and neither does vitest, so the variables have to be exported or
+ * passed on the command line. `loadConfig` also validates them: since the TLS
+ * requirement landed, `LUMICS_BASE_URL` must be `https:` off loopback, and
+ * `LUMICS_LOG_LEVEL` and `LUMICS_TRANSPORT` are checked too. {@link api} turns
+ * that failure into one sentence naming the run, rather than a bare zod dump from
+ * inside whichever test happened to touch the client first.
  */
 
+import { randomBytes } from 'node:crypto';
 import { describe, expect, it, type TestContext } from 'vitest';
-import { LumicsClient } from '../../src/api/client.js';
+import { expectArray, LumicsClient } from '../../src/api/client.js';
+import { devicesPath } from '../../src/api/paths.js';
 import { loadConfig, type LumicsConfig } from '../../src/config.js';
+import type { Device } from '../../src/domain/index.js';
 
 // ---------------------------------------------------------------------------
 // Gating
@@ -75,10 +97,83 @@ let cached: { readonly client: LumicsClient; readonly config: LumicsConfig } | u
 
 export function api(): { readonly client: LumicsClient; readonly config: LumicsConfig } {
   cached ??= (() => {
-    const config = loadConfig(process.env);
+    const config = loadConfigForRun();
     return { client: new LumicsClient(config), config };
   })();
   return cached;
+}
+
+/**
+ * `loadConfig`, with the failure explained in terms of the contract run.
+ *
+ * The environment this suite is handed goes through the same validation as a real
+ * server start, which is the point — a run configured in a way the server would
+ * refuse is measuring nothing. But the failure arrives lazily, inside the first
+ * test or `beforeAll` that touches the client, where a raw multi-line
+ * configuration error reads like a suite bug. The commonest causes are now
+ * validation rather than absence: `LUMICS_BASE_URL` must be `https:` unless the
+ * host is loopback (`BASE_URL_REQUIRES_TLS`), `LUMICS_LOG_LEVEL` must be one of
+ * the five levels, and `LUMICS_TRANSPORT=http` is refused outright in 0.1.0.
+ *
+ * `loadConfig`'s message names variables and never values, so it is safe to
+ * re-emit. No request has been made at this point and no assumption has been
+ * checked, which is what the added sentence says.
+ */
+function loadConfigForRun(): LumicsConfig {
+  try {
+    return loadConfig(process.env);
+  } catch (error) {
+    const detail = error instanceof Error ? error.message : String(error);
+    throw new Error(
+      `the contract run's environment is not a configuration this server would start with, so NOTHING was verified against the live API and no request was made. ` +
+        `Fix the environment and re-run: LUMICS_CONTRACT_TESTS=1 npm run test:contract. ` +
+        `Note that no .env file is read — export the variables, or pass them on the command line.\n\n${detail}`,
+      { cause: error },
+    );
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Device ids, which the company pin constrains
+// ---------------------------------------------------------------------------
+
+/**
+ * Device records from the **configured company's own list** (spec §7.1).
+ *
+ * The single sanctioned source of a device id in this directory, for the reason
+ * in point 4 of the file comment: `src/tools/metrics.ts` now resolves a device's
+ * owner with a company-scoped read before it will fetch any metric, so an id from
+ * any other origin is refused by this server before the metric endpoint is ever
+ * reached. Reading the list the pin itself trusts keeps that from being an
+ * accident of which fixture a test picked.
+ *
+ * Raw records, not a projection: the `company` field the pin depends on is exactly
+ * what the callers here need to inspect, and a `fields` projection is a tool-layer
+ * concern that does not exist at this level.
+ *
+ * `limit` is small by default — a contract check needs one or two devices, not an
+ * inventory.
+ */
+export async function pinnedCompanyDevices(limit = 3): Promise<readonly Device[]> {
+  const { client, config } = api();
+  return expectArray<Device>(
+    await client.get(devicesPath(config.companyId), { query: { limit } }),
+    'GET devices for the configured company',
+  );
+}
+
+/**
+ * A 24-hex identifier that belongs to nobody, for probing what the API does with
+ * an id it has never seen.
+ *
+ * Generated per call rather than written down, because a literal in this
+ * directory would be a tenant value if it ever collided and a magic constant
+ * either way. Twelve random bytes make a collision with a real ObjectId
+ * effectively impossible, and every caller has to handle the accepted outcome
+ * anyway — that is what makes the case an observation rather than a guess.
+ */
+export function syntheticObjectId(): string {
+  return randomBytes(12).toString('hex');
 }
 
 // ---------------------------------------------------------------------------
@@ -158,6 +253,31 @@ export function reportEvidence(title: string): void {
   process.stderr.write(`${lines.join('\n')}\n`);
 }
 
+/** Once per module instance; vitest isolates files, so once per file in practice. */
+let announcedMissingCredentials = false;
+
+/**
+ * Tell the operator, in the run output, that an opted-in run verified nothing.
+ *
+ * The per-file explanation case asserts the fact, but a passing assertion prints
+ * nothing: the run would summarise as "3 passed, 61 skipped", and "skipped" alone
+ * does not distinguish a deliberate `npm test` from a release gate that quietly
+ * did not execute. Kept to three lines because each contract file runs in its own
+ * worker and therefore prints its own copy.
+ */
+function announceMissingCredentials(): void {
+  if (announcedMissingCredentials) {
+    return;
+  }
+  announcedMissingCredentials = true;
+  process.stderr.write(
+    '\n=== CONTRACT SUITE NOT RUN: no credentials ===\n' +
+      'LUMICS_CONTRACT_TESTS is set but LUMICS_TOKEN and/or LUMICS_COMPANY_ID are missing from the process\n' +
+      'environment, so every case here is SKIPPED and nothing was checked against the live API — not a pass.\n' +
+      'No .env file is read. Run: LUMICS_TOKEN=... LUMICS_COMPANY_ID=... npm run test:contract\n\n',
+  );
+}
+
 /**
  * The suite every contract file declares for the case where it did **not** run.
  *
@@ -174,9 +294,16 @@ export function declareSkipExplanation(label: string): void {
         expect(process.env.LUMICS_CONTRACT_TESTS).toBeUndefined();
         return;
       }
+      // Opted in, and still not runnable. This assertion passes, and a passing
+      // assertion prints nothing — so the run would summarise as "3 passed, N
+      // skipped" and an operator who believed they had just executed the release
+      // gate would be reading the output of a suite that made no request at all.
+      // Said once per process, on stderr, for the same reason the ledger goes
+      // there.
+      announceMissingCredentials();
       expect(
         HAS_TOKEN && HAS_COMPANY,
-        `LUMICS_CONTRACT_TESTS is set but LUMICS_TOKEN and/or LUMICS_COMPANY_ID are missing, so ${label} was NOT validated against a live tenant`,
+        `LUMICS_CONTRACT_TESTS is set but LUMICS_TOKEN and/or LUMICS_COMPANY_ID (a 24-character hex id) are missing from the process environment, so ${label} was NOT validated against a live tenant. No .env file is read — export both variables, or pass them on the command line: LUMICS_TOKEN=... LUMICS_COMPANY_ID=... npm run test:contract. LUMICS_COMPANY_ID is required, not optional, because the device-scoped metric tools are withheld entirely without it and their company pin has nothing to pin to.`,
       ).toBe(false);
     });
   });

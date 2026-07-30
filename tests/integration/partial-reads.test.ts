@@ -59,6 +59,28 @@ function emptyBodyFetch(status: number): ReturnType<typeof recordFetch> {
   return recordFetch(() => new Response(null, { status }));
 }
 
+/**
+ * The two device-scoped metric tools (spec §12.3) resolve the device's owning
+ * company with a company-scoped device read before they read any metrics, so the
+ * cross-company pin covers a metric path that carries no company segment. That
+ * read has to succeed for the degraded metric response under test to be reached,
+ * so this wrapper answers it with a device in the configured company and hands
+ * everything else to `respond`. The pin itself is asserted in
+ * `tests/security/company-scoping.test.ts`.
+ */
+function metricFetch(respond: () => Response): ReturnType<typeof recordFetch> {
+  return recordFetch((call) =>
+    call.path === `/companies/${TEST_COMPANY_ID}/devices/${TEST_DEVICE_ID}`
+      ? jsonResponse({ id: TEST_DEVICE_ID, company: TEST_COMPANY_ID })
+      : respond(),
+  );
+}
+
+/** An absent body (204 or empty 200) on the metric read, ownership read intact. */
+function emptyMetricBodyFetch(status: number): ReturnType<typeof recordFetch> {
+  return metricFetch(() => new Response(null, { status }));
+}
+
 async function callWith(
   fetcher: ReturnType<typeof recordFetch>,
   tool: string,
@@ -202,7 +224,7 @@ const ABSENT_METRIC_MARKER = 'NOTE ON AN EMPTY RESULT:';
 
 describe('a metric read discloses an absent body instead of reporting an empty series', () => {
   it.each(METRIC_READS)('%s discloses it', async (tool, args) => {
-    const called = await callWith(emptyBodyFetch(204), tool, args);
+    const called = await callWith(emptyMetricBodyFetch(204), tool, args);
 
     expect(called.isError).toBe(false);
     expect(called.text).toContain(ABSENT_METRIC_MARKER);
@@ -212,7 +234,7 @@ describe('a metric read discloses an absent body instead of reporting an empty s
   it.each(METRIC_READS)(
     '%s names the conclusions the response does not support',
     async (tool, args) => {
-      const called = await callWith(emptyBodyFetch(200), tool, args);
+      const called = await callWith(emptyMetricBodyFetch(200), tool, args);
 
       // "Lumics sent nothing" must not be readable as "the device is silent".
       expect(called.text).toMatch(/NOT because/);
@@ -222,7 +244,7 @@ describe('a metric read discloses an absent body instead of reporting an empty s
   );
 
   it('uses series wording, not the list-completeness wording', async () => {
-    const called = await callWith(emptyBodyFetch(204), 'lumics_get_device_metrics', {
+    const called = await callWith(emptyMetricBodyFetch(204), 'lumics_get_device_metrics', {
       deviceId: TEST_DEVICE_ID,
       moduleType: 'snmp',
     });
@@ -235,7 +257,7 @@ describe('a metric read discloses an absent body instead of reporting an empty s
 
   it('stays silent when Lumics genuinely returned an empty series', async () => {
     const called = await callWith(
-      recordFetch(jsonResponse({ data: [], from: '2026-07-29T11:00:00.000Z' })),
+      metricFetch(() => jsonResponse({ data: [], from: '2026-07-29T11:00:00.000Z' })),
       'lumics_get_device_metrics',
       { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
     );
@@ -248,7 +270,7 @@ describe('a metric read discloses an absent body instead of reporting an empty s
 
   it('discloses an envelope whose documented "data" field never arrived', async () => {
     const called = await callWith(
-      recordFetch(jsonResponse({ from: '2026-07-29T11:00:00.000Z', components: 12 })),
+      metricFetch(() => jsonResponse({ from: '2026-07-29T11:00:00.000Z', components: 12 })),
       'lumics_get_device_metrics',
       { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
     );
@@ -262,14 +284,14 @@ describe('a metric read discloses an absent body instead of reporting an empty s
 
   it('the three empty outcomes are distinguishable from each other', async () => {
     const args = { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' };
-    const absentBody = await callWith(emptyBodyFetch(204), 'lumics_get_device_metrics', args);
+    const absentBody = await callWith(emptyMetricBodyFetch(204), 'lumics_get_device_metrics', args);
     const absentData = await callWith(
-      recordFetch(jsonResponse({ from: '2026-07-29T11:00:00.000Z' })),
+      metricFetch(() => jsonResponse({ from: '2026-07-29T11:00:00.000Z' })),
       'lumics_get_device_metrics',
       args,
     );
     const emptySeries = await callWith(
-      recordFetch(jsonResponse({ data: [] })),
+      metricFetch(() => jsonResponse({ data: [] })),
       'lumics_get_device_metrics',
       args,
     );
@@ -284,7 +306,7 @@ describe('a metric read discloses an absent body instead of reporting an empty s
 
 describe('the summaries endpoint (spec section 12.4) separates absence from "nothing matched"', () => {
   it('does not claim nothing matched when no body arrived', async () => {
-    const called = await callWith(emptyBodyFetch(204), 'lumics_get_metric_summary', {
+    const called = await callWith(emptyMetricBodyFetch(204), 'lumics_get_metric_summary', {
       moduleType: 'snmp',
     });
 
@@ -297,7 +319,7 @@ describe('the summaries endpoint (spec section 12.4) separates absence from "not
 
   it('still says "nothing matched" when Lumics sent a present but empty data object', async () => {
     const called = await callWith(
-      recordFetch(jsonResponse({ data: {}, count: 0 })),
+      metricFetch(() => jsonResponse({ data: {}, count: 0 })),
       'lumics_get_metric_summary',
       { moduleType: 'snmp' },
     );
@@ -310,7 +332,7 @@ describe('the summaries endpoint (spec section 12.4) separates absence from "not
 
   it('discloses a summaries envelope with no "data" field at all', async () => {
     const called = await callWith(
-      recordFetch(jsonResponse({ count: 0 })),
+      metricFetch(() => jsonResponse({ count: 0 })),
       'lumics_get_metric_summary',
       { moduleType: 'snmp' },
     );

@@ -19,6 +19,22 @@
  * Plus two envelope shapes the tool layer unwraps differently: §12.1–§12.3 return
  * `{data: [...]}`, §12.4 returns `{data: {devices: [...]}, count: n}`.
  *
+ * **The device-ownership pre-read is now part of this contract.** spec §12.3's
+ * paths carry no company segment, so `lumics_get_device_metrics` and
+ * `lumics_get_device_item_metrics` reach the pin through a company-scoped device
+ * read (spec §7.2) issued *before* the metric call: they refuse unless
+ * `device.company` equals `LUMICS_COMPANY_ID`. Two consequences for this file.
+ *
+ *  - A device metric call in the tool layer is **two** requests, and the suite
+ *    exercises them separately: the pre-read has its own block below, the metric
+ *    read keeps the §12.3 cases. Nothing here counts requests, and no case may
+ *    assert on "the metric call" without saying which of the two it means.
+ *  - Every device id comes from {@link pinnedCompanyDevices} — the configured
+ *    company's own device list — so the pin holds by construction. An id from any
+ *    other origin would now be refused by this server for the pin's reason, and a
+ *    §12.3 case built on one would fail looking like a metric-contract violation
+ *    when it was nothing of the kind.
+ *
  * **READ-ONLY.** Every call here is a GET. Nothing touches the token endpoints.
  *
  * **Cost.** These hit a live production monitoring system, so windows are one
@@ -31,13 +47,13 @@
  * licence to change `src/`.
  */
 
-import { afterAll, beforeAll, describe, expect, it } from 'vitest';
+import { afterAll, beforeAll, describe, expect, it, type TestContext } from 'vitest';
 import {
   companyMetricsPath,
   companyMetricsSummarizePath,
   deviceItemMetricsPath,
   deviceMetricsPath,
-  devicesPath,
+  devicePath,
   componentTypesPath,
   metricSummariesPath,
 } from '../../src/api/paths.js';
@@ -52,12 +68,15 @@ import {
   describeValue,
   describeVocabulary,
   DOCUMENTED_STATUSES,
+  isObjectIdShaped,
   isRecord,
   keysOf,
+  pinnedCompanyDevices,
   recordAsserted,
   recordObserved,
   reportEvidence,
   RUNNABLE,
+  syntheticObjectId,
   unverifiable,
 } from './harness.js';
 
@@ -102,9 +121,28 @@ interface Fixture {
   readonly itemType: string | undefined;
   /** A `group.property` path present in the probe's `stats` (spec §12.0). */
   readonly propertyPath: string | undefined;
-  /** A device that reports {@link deviceModuleType}, for §12.3. */
+  /**
+   * A device that reports {@link deviceModuleType}, for §12.3. Resolved from the
+   * configured company's own device list, which is what makes it usable at all
+   * now that the metric tools refuse a device they cannot confirm owning.
+   */
   readonly deviceId: string | undefined;
   readonly deviceModuleType: string | undefined;
+  /**
+   * The first device in the configured company's list, whether or not it declares
+   * a polling module. The ownership pre-read needs a device, not a *monitored*
+   * device, so this is a weaker requirement than {@link deviceId} and is
+   * available on tenants where that one is not.
+   */
+  readonly pinnedDeviceId: string | undefined;
+  /** How many devices the configured company's list returned, for a report line. */
+  readonly pinnedDeviceCount: number;
+  /**
+   * Whether the LIST read carried a `company` field. The pin reads the SINGLE
+   * device (spec §7.2), so this is recorded rather than asserted — a list that
+   * omits it says nothing about the read the pin performs.
+   */
+  readonly listCarriedCompany: boolean;
 }
 
 let fixture: Fixture | undefined;
@@ -241,10 +279,13 @@ async function discover(): Promise<Fixture> {
     firstRow !== undefined && isNonEmptyString(firstRow['type']) ? firstRow['type'] : undefined;
   const propertyPath = firstRow === undefined ? undefined : statPaths(firstRow)[0];
 
-  const devices = expectArray<Device>(
-    await client.get(devicesPath(config.companyId), { query: { limit: 3 } }),
-    'GET devices',
-  );
+  // The configured company's own list, and deliberately nothing else: these ids
+  // are the ones the device metric tools' ownership pre-read will accept. See
+  // pinnedCompanyDevices in harness.ts.
+  const devices = await pinnedCompanyDevices(3);
+  const firstDevice = devices[0];
+  const pinnedDeviceId = firstDevice === undefined ? undefined : resourceId(firstDevice);
+  const listCarriedCompany = firstDevice !== undefined && typeof firstDevice.company === 'string';
 
   let deviceId: string | undefined;
   let deviceModuleType: string | undefined;
@@ -283,6 +324,9 @@ async function discover(): Promise<Fixture> {
     propertyPath,
     deviceId,
     deviceModuleType,
+    pinnedDeviceId,
+    pinnedDeviceCount: devices.length,
+    listCarriedCompany,
   };
 }
 
@@ -741,9 +785,12 @@ describe.skipIf(!RUNNABLE)('live contract: spec 12.1-12.4 — response envelopes
           ctx,
           '12.3',
           'GET /metrics/devices/:id/modules/:moduleType returns {data: [...]}',
-          'no device on this tenant declares a polling module, so the endpoint cannot be called meaningfully',
+          'no device in the CONFIGURED company declares a polling module, so the endpoint cannot be called meaningfully. Devices from any other company are deliberately not considered: the metric tools refuse them (the ownership pre-read), so an id from elsewhere would test the pin rather than this envelope',
         );
       }
+      // The metric read only. In the tool layer this same call is preceded by the
+      // company-scoped device read covered above; the device id used here came
+      // from the configured company's own list, so that pre-read would pass.
       const { client } = api();
       const response = await client.get<unknown>(
         deviceMetricsPath(state.deviceId, state.deviceModuleType),
@@ -763,7 +810,7 @@ describe.skipIf(!RUNNABLE)('live contract: spec 12.1-12.4 — response envelopes
           ctx,
           '12.3',
           'GET /metrics/devices/:id/modules/:moduleType/:item returns {data: [...]}',
-          'no device on this tenant declares a polling module',
+          'no device in the CONFIGURED company declares a polling module (a device from another company would be refused by the ownership pre-read before this endpoint was reached)',
         );
       }
       // spec §12.3: ":item — Item ID (device ID or component ID)". The device's
@@ -865,7 +912,181 @@ function assertSeriesEnvelope(response: unknown, spec: string, label: string): v
 }
 
 // ---------------------------------------------------------------------------
-// Assumption 6 — metrics/summaries accepts no limit (spec §12.4)
+// Assumption 6 — the ownership pre-read that puts §12.3 behind the company pin
+// (spec §7.2, relied on by §12.3)
+// ---------------------------------------------------------------------------
+
+/**
+ * The pre-read is a security control implemented entirely out of *live API
+ * behaviour*, which is why it belongs in this file rather than only in
+ * `tests/security/company-scoping.test.ts`. That suite proves the server refuses
+ * the right things against a mocked tenant; nothing there can tell an operator
+ * whether the two live facts the control rests on are true:
+ *
+ *  1. `GET /:context/:contextId/devices/:id` (spec §7.2) returns a device record
+ *     that **carries a `company` field**. spec §7.2 documents only "bare device
+ *     object" — the field list including `company` is §7.1's, for the *list* read,
+ *     so the single read carrying it is an inference. If the vendor stops sending
+ *     it, `assertDeviceInPinnedCompany` takes its "owner cannot be verified"
+ *     branch and **both device metric tools refuse every call**, on a healthy
+ *     tenant, with a message about API drift. That is a fail-closed outcome and
+ *     the right one, but an operator should learn it from this gate rather than
+ *     from a user.
+ *  2. That field's value is the company in the path — i.e. the company-scoped
+ *     device read really is scoped. If it were not, the pin would be comparing a
+ *     value the API chose rather than one it constrained.
+ *
+ * Read-only: one `GET` of a device that this company's own list just returned,
+ * plus one `GET` of an id generated at random. No metric read is involved, and no
+ * tool is invoked — the suite exercises the two requests of a device metric call
+ * separately, this section being the first of them.
+ */
+describe.skipIf(!RUNNABLE)('live contract: spec 7.2 — the device-ownership pre-read', () => {
+  /**
+   * The single device read the pin performs, for a device the configured
+   * company's own list returned. UNVERIFIED rather than a pass when the tenant has
+   * no devices: with nothing to read, neither fact below has been checked.
+   */
+  async function readPinnedDevice(
+    ctx: TestContext,
+    claim: string,
+  ): Promise<Record<string, unknown>> {
+    const state = fx();
+    const deviceId = state.pinnedDeviceId;
+    if (deviceId === undefined) {
+      unverifiable(
+        ctx,
+        '7.2',
+        claim,
+        state.pinnedDeviceCount === 0
+          ? 'the configured company has no devices at all, so the read the ownership pre-read performs cannot be exercised'
+          : 'the configured company\'s device list carried no "id" or "_id", so there is no device to read by id',
+      );
+    }
+
+    const { client, config } = api();
+    const single = await client.get<unknown>(devicePath(config.companyId, deviceId));
+    expect(
+      isRecord(single),
+      `spec section 7.2 documents a bare device object; the body was ${describeValue(single)}. src/tools/metrics.ts passes this response through expectObject() before it will read any metric, so anything else makes both device metric tools fail closed.`,
+    ).toBe(true);
+    const record = single as Record<string, unknown>;
+    // Runtime-to-runtime: the id came from the list read moments ago and no
+    // tenant value is written into this file.
+    expect(
+      resourceId(record as Device),
+      'the company-scoped device read returned a different record than the id requested, so nothing it says about ownership describes the device asked about.',
+    ).toBe(deviceId);
+    return record;
+  }
+
+  it(
+    'ASSERT: a device read inside the configured company carries a "company" field',
+    async (ctx) => {
+      const claim =
+        'GET /companies/:companyId/devices/:id returns a device record carrying an ObjectId-shaped "company" field';
+      const device = await readPinnedDevice(ctx, claim);
+
+      expect(
+        isObjectIdShaped(device['company']),
+        `the device record carried ${describeValue(device['company'])} for "company" (keys present: ${keysOf(device).join(',')}). The company pin on spec section 12.3 is built on this field: src/tools/metrics.ts assertDeviceInPinnedCompany treats an absent or non-string "company" as an owner it cannot verify and REFUSES the call, so if this is gone lumics_get_device_metrics and lumics_get_device_item_metrics reject every request on a perfectly healthy tenant. spec section 7.1 documents "company" among the device fields; section 7.2 documents only "bare device object", so this is the inference the control depends on. Report this.`,
+      ).toBe(true);
+
+      recordAsserted(
+        '7.2',
+        claim,
+        `single device read keys: ${keysOf(device).join(',')}; "company" is ${describeValue(device['company'])}`,
+      );
+      recordObserved(
+        '7.1',
+        'whether the device LIST also carries "company", which the pin does not read but a future simplification might',
+        fx().listCarriedCompany
+          ? 'the list read carried "company" as well, so resolving ownership from a list is possible in principle — it is still not what the pin does, and one list read for N devices is not the same guarantee as a scoped read of the one device asked about'
+          : 'the list read carried no "company" field, so the single read the pin performs is the only place this field was observed',
+      );
+    },
+    TIMEOUT,
+  );
+
+  it(
+    'ASSERT: that device belongs to the company this server is configured for',
+    async (ctx) => {
+      const claim =
+        'a device read inside a company reports that company as its owner — the company-scoped device path really is scoped';
+      const device = await readPinnedDevice(ctx, claim);
+      const owner = device['company'];
+
+      if (!isObjectIdShaped(owner)) {
+        // Deliberately not a failure here: the previous case owns the "field is
+        // present" claim and reports it. Passing this one on an absent field
+        // would be a vacuous pass, so it goes UNVERIFIED with the reason.
+        unverifiable(
+          ctx,
+          '7.2',
+          claim,
+          `the device record carried ${describeValue(owner)} for "company", so there is no owner value to compare — see the preceding case, which is where that failure is reported`,
+        );
+      }
+
+      // Runtime-to-runtime against the configured id. No company id is written
+      // into this file.
+      expect(
+        owner,
+        'a device read INSIDE the configured company came back owned by a different company. src/tools/metrics.ts pins the two device metric tools by comparing exactly these two values, and tests/security/company-scoping.test.ts asserts the refusal; if the API serves a foreign device from a company-scoped path, the path scoping this server relies on everywhere does not hold server-side and the pin is comparing a value the API chose rather than one it constrained. Report this as a security finding, not a documentation defect.',
+      ).toBe(api().config.companyId);
+
+      recordAsserted(
+        '7.2',
+        claim,
+        'the device the configured company listed reports that same company as its owner, which is the equality the pin on spec section 12.3 tests',
+      );
+    },
+    TIMEOUT,
+  );
+
+  it(
+    'OBSERVE: how a company-scoped device read answers for an id this company does not have',
+    async () => {
+      // A 24-hex id generated at random, never a tenant value. This is the input
+      // the pre-read's fail-closed branch is written for: `assertDeviceInPinnedCompany`
+      // maps a 404 to a "not in this company" refusal naming LUMICS_ALLOW_CROSS_COMPANY,
+      // and lets any other API error propagate as itself. Both are fail-closed;
+      // which one an operator sees depends on this answer.
+      const unknownId = syntheticObjectId();
+      const { client, config } = api();
+      const outcome = await attempt(client.get<unknown>(devicePath(config.companyId, unknownId)));
+
+      expect(
+        outcome.ok || outcome.status === undefined || DOCUMENTED_STATUSES.includes(outcome.status),
+        `reading an unknown device id inside the configured company produced ${describeOutcome(outcome)}, which spec section 3 does not document — its table is the only documented status set.`,
+      ).toBe(true);
+
+      // The real assertion, and it cannot pass vacuously: a record coming back
+      // for an id nobody issued would mean this path serves devices it was not
+      // asked for, and the pre-read reads a served record as evidence of
+      // ownership. A collision with a real ObjectId is not a plausible
+      // explanation at twelve random bytes.
+      expect(
+        outcome.ok && isRecord(outcome.value),
+        'a company-scoped read of a randomly generated device id returned a device RECORD. src/tools/metrics.ts treats a record served from this path as the thing to check ownership on, so a path that answers with something for an id it was not asked about undermines the pre-read itself. Report this.',
+      ).toBe(false);
+
+      recordObserved(
+        '7.2',
+        'the pre-read maps a 404 to "not in this company"; what does a company-scoped read of an id the company does not have actually return?',
+        `${describeOutcome(outcome)}. ${
+          !outcome.ok && outcome.status === 404
+            ? 'A 404, which is the branch assertDeviceInPinnedCompany is written for: a device in another company (or no company) produces the refusal that names LUMICS_ALLOW_CROSS_COMPANY and tells the model to confirm the id with lumics_list_devices.'
+            : 'NOT a 404, so a device the configured company does not have takes the fall-through path instead: the refusal still happens (the metric read is never issued), but the model sees the raw API error rather than the guidance written for this case. Worth reporting — the message, not the control, is what is wrong.'
+        } This case cannot observe a device that exists in ANOTHER company: obtaining such an id would mean reading a tenant this run is not configured for, which the suite does not do.`,
+      );
+    },
+    TIMEOUT,
+  );
+});
+
+// ---------------------------------------------------------------------------
+// Assumption 7 — metrics/summaries accepts no limit (spec §12.4)
 // ---------------------------------------------------------------------------
 
 describe.skipIf(!RUNNABLE)('live contract: spec 12.4 — summaries has no limit parameter', () => {
@@ -922,7 +1143,7 @@ function countSummaryItems(response: unknown): number {
 }
 
 // ---------------------------------------------------------------------------
-// Assumption 7 — the remaining documented parameters (spec §12.0)
+// Assumption 8 — the remaining documented parameters (spec §12.0)
 // ---------------------------------------------------------------------------
 
 describe.skipIf(!RUNNABLE)('live contract: spec 12.0 — the remaining query parameters', () => {
@@ -960,6 +1181,57 @@ describe.skipIf(!RUNNABLE)('live contract: spec 12.0 — the remaining query par
         '12.0',
         `${name} is accepted on the metric-data endpoints`,
         `sent against module "${state.moduleType}" and served`,
+      );
+    },
+    TIMEOUT,
+  );
+
+  it(
+    'ASSERT: limit caps the metric rows returned, which is what the row-cap disclosure claims',
+    async (ctx) => {
+      const state = fx();
+      const window = hourWindow();
+      // `src/tools/metrics.ts` sends NO limit on the series endpoints unless the
+      // caller supplies one (metricLimitSchema has no default, deliberately), and
+      // its ROW COUNT note then tells the model two things: that Lumics returned
+      // every matching row, and that a limit — if one IS passed — is applied by
+      // Lumics and can cut across time as well as across components. The second
+      // half is only true if the parameter does something, which nothing has
+      // checked; the acceptance case above only proves it is not rejected.
+      const unlimited = rowsOf(
+        await companySeries({ ...window, dataPoints: SMALL_DATA_POINTS, lastMetric: true }),
+      );
+      if (unlimited.length < 2) {
+        unverifiable(
+          ctx,
+          '12.0',
+          'limit caps the number of metric rows Lumics returns',
+          `module "${state.moduleType}" returned ${String(unlimited.length)} row(s) with no limit over the last hour, so a cap of 1 cannot be told from the whole result`,
+        );
+      }
+      const capped = rowsOf(
+        await companySeries({
+          ...window,
+          dataPoints: SMALL_DATA_POINTS,
+          lastMetric: true,
+          limit: 1,
+        }),
+      );
+
+      expect(
+        capped.length <= 1,
+        `limit=1 returned ${String(capped.length)} row(s) where the same call without a limit returned ${String(unlimited.length)}. spec section 12.0 documents limit as "Maximum number of results to return"; if it is ignored, the ROW COUNT note that lumics_get_company_metrics and the device metric tools print when a caller passes one — "you asked for at most N row(s) and Lumics applied that cap" — is false, and a model is being warned about holes in a series that were never cut. Report this.`,
+      ).toBe(true);
+
+      recordAsserted(
+        '12.0',
+        'limit is honoured on the metric-data endpoints as a row cap',
+        `${String(unlimited.length)} row(s) with no limit versus ${String(capped.length)} with limit=1 (module "${state.moduleType}", lastMetric)`,
+      );
+      recordObserved(
+        '12.0',
+        'this server sends no limit on a metric series unless the caller asks for one, and discloses that Lumics then returned every matching row',
+        `the unlimited call returned ${String(unlimited.length)} row(s) for one hour of module "${state.moduleType}" at lastMetric=true. Whether Lumics applies a cap of its own when none is sent is not observable from here — the API documents no default — so the disclosure rests on that documented absence, not on this measurement.`,
       );
     },
     TIMEOUT,

@@ -178,6 +178,16 @@ export const DEFAULT_HTTP_PORT = 3000;
 /** RFC-001 D3: loopback bind by default; widening it is an explicit act. */
 export const DEFAULT_HTTP_HOST = '127.0.0.1';
 export const DEFAULT_HTTP_ALLOWED_HOSTS = ['127.0.0.1', 'localhost', '[::1]'] as const;
+
+/**
+ * Hosts for which plaintext `http:` is accepted on `LUMICS_BASE_URL`. Anywhere
+ * else the bearer token would cross a network in clear text.
+ *
+ * Spelled as `URL.hostname` returns them: WHATWG keeps the brackets on an IPv6
+ * literal, so `[::1]` is the value to compare against, and it also canonicalises
+ * `[0:0:0:0:0:0:0:1]` to that form before the comparison happens.
+ */
+export const LOOPBACK_HOSTNAMES: readonly string[] = ['127.0.0.1', 'localhost', '[::1]'];
 export const MCP_HTTP_PATH = '/mcp';
 export const HTTP_RATE_LIMIT_WINDOW_MS = 60_000;
 export const HTTP_RATE_LIMIT_MAX = 120;

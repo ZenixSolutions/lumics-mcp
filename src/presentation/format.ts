@@ -27,7 +27,11 @@
 import { DEFAULT_MAX_OUTPUT_CHARS } from '../constants.js';
 
 export interface ShapeOptions {
-  /** Character budget for the JSON payload. Defaults to the configured value. */
+  /**
+   * Character budget for the **whole** returned text — disclosure notes and JSON
+   * payload together, not the payload alone. Defaults to the configured value.
+   * See {@link shapeToolOutput} for the one case that can exceed it.
+   */
   readonly maxChars?: number;
   /** Whitelist of top-level fields to keep on each record. */
   readonly fields?: readonly string[] | undefined;
@@ -133,6 +137,39 @@ export function projectFields(value: unknown, fields: readonly string[] | undefi
 }
 
 /**
+ * How many characters of the budget a set of notes consumes, blank-line
+ * separators and the gap before the payload included.
+ */
+function notesLength(notes: readonly string[]): number {
+  if (notes.length === 0) {
+    return 0;
+  }
+  const separators = (notes.length - 1) * 2 + 2; // "\n\n" between notes and before the payload
+  return notes.reduce((sum, note) => sum + note.length, 0) + separators;
+}
+
+/**
+ * What is left of `maxChars` for the payload once `notes` are counted.
+ *
+ * Exported because a tool that fits a payload itself — `lumics_get_metric_summary`
+ * sheds per item class before returning, since {@link shapeToolOutput} cannot shed
+ * from a keyed object — has to reserve the same way, or it fits to a budget the
+ * notes then blow through.
+ *
+ * Never negative: notes that exceed the budget on their own take the payload to
+ * zero rather than being cut themselves. A truncation or completeness disclosure
+ * dropped to save characters is exactly the silent-shortening failure this whole
+ * module exists to prevent, so the disclosures are the part that survives.
+ */
+export function budgetAfterNotes(notes: readonly string[], maxChars: number): number {
+  return Math.max(0, maxChars - notesLength(notes));
+}
+
+function joinNotes(notes: readonly string[], payload: string): string {
+  return notes.length === 0 ? payload : `${notes.join('\n\n')}\n\n${payload}`;
+}
+
+/**
  * Shape a payload into the single text block a tool returns.
  *
  * Budget handling differs by shape, deliberately:
@@ -141,56 +178,108 @@ export function projectFields(value: unknown, fields: readonly string[] | undefi
  *    a missing one.
  *  - **Anything else** is hard-truncated with a disclosure, because there is no
  *    meaningful smaller unit to shed.
+ *
+ * In both cases the notes are counted against the *same* budget as the payload,
+ * and reserved before it is fitted. `maxChars` is documented as a cap on tool
+ * output; fitting the payload to it and then prepending ~1,100 characters of
+ * disclosure made every response exceed it, worst in relative terms at the
+ * smallest configurable budget. The disclosures are never shortened or dropped
+ * to make the sum fit — the payload gives way instead, down to nothing.
  */
 export function shapeToolOutput(value: unknown, options: ShapeOptions = {}): ShapedOutput {
   const maxChars = options.maxChars ?? DEFAULT_MAX_OUTPUT_CHARS;
   const projected = projectFields(value, options.fields);
-
-  const notes: string[] = [...(options.notes ?? [])];
-  let droppedItems = 0;
-  let budgetTruncated = false;
-  let limitReached = false;
-  let payload: string;
+  const baseNotes: readonly string[] = [...(options.notes ?? [])];
 
   if (Array.isArray(projected)) {
-    // The budget is fitted FIRST so the completeness note can be told about it:
-    // the two disclosures used to be generated independently and could give
-    // opposite advice in the same response.
-    const fitted = fitArrayToBudget(projected, maxChars);
-    droppedItems = fitted.dropped;
-    budgetTruncated = fitted.dropped > 0;
-    payload = fitted.json;
+    return shapeArray(projected, maxChars, baseNotes, options.requestedLimit);
+  }
+  return shapeSingle(projected, maxChars, baseNotes);
+}
 
-    const completeness = listCompletenessNote(
-      projected.length,
-      options.requestedLimit,
-      budgetTruncated,
-    );
+/**
+ * Fit an array and its disclosures into one budget.
+ *
+ * The two are mutually dependent: shedding items adds a truncation note, the
+ * note consumes budget, and the smaller budget may shed more items. So this
+ * iterates to a fixed point rather than fitting once and hoping. Convergence is
+ * guaranteed because a larger note set can only shed more, and the note set
+ * changes size only by the digits of its counts; the loop is capped anyway, and
+ * on the (unreachable in practice) cap the honest counts win over the last few
+ * characters of budget.
+ */
+function shapeArray(
+  items: readonly unknown[],
+  maxChars: number,
+  baseNotes: readonly string[],
+  requestedLimit: number | undefined,
+): ShapedOutput {
+  const notesFor = (dropped: number): readonly string[] => {
+    const built = [...baseNotes];
+    const completeness = listCompletenessNote(items.length, requestedLimit, dropped > 0);
     if (completeness !== undefined) {
-      limitReached = true;
-      notes.push(completeness);
+      built.push(completeness);
     }
+    if (dropped > 0) {
+      built.push(budgetTruncationNote(dropped, items.length - dropped, maxChars));
+    }
+    return built;
+  };
 
-    if (budgetTruncated) {
-      notes.push(budgetTruncationNote(fitted.dropped, projected.length - fitted.dropped, maxChars));
-    }
-  } else {
-    const json = toCompactJson(projected);
-    if (json.length > maxChars) {
-      budgetTruncated = true;
-      payload = json.slice(0, maxChars);
-      notes.push(
-        `NOTE ON TRUNCATION: this single object exceeded the ${String(maxChars)}-character output budget and was cut ` +
-          `after ${String(maxChars)} characters, so the JSON below is INCOMPLETE and may not parse. Re-run with a ` +
-          'fields projection to select only the properties you need.',
-      );
-    } else {
-      payload = json;
+  let fitted = fitArrayToBudget(items, budgetAfterNotes(baseNotes, maxChars));
+  for (let pass = 0; pass < 5; pass += 1) {
+    const refitted = fitArrayToBudget(items, budgetAfterNotes(notesFor(fitted.dropped), maxChars));
+    const settled = refitted.dropped === fitted.dropped;
+    fitted = refitted;
+    if (settled) {
+      break;
     }
   }
 
-  const text = notes.length === 0 ? payload : `${notes.join('\n\n')}\n\n${payload}`;
-  return { text, budgetTruncated, droppedItems, limitReached };
+  const notes = notesFor(fitted.dropped);
+  return {
+    text: joinNotes(notes, fitted.json),
+    budgetTruncated: fitted.dropped > 0,
+    droppedItems: fitted.dropped,
+    limitReached:
+      listCompletenessNote(items.length, requestedLimit, fitted.dropped > 0) !== undefined,
+  };
+}
+
+/** Fit a single value, which has no smaller unit to shed, against the same budget. */
+function shapeSingle(value: unknown, maxChars: number, baseNotes: readonly string[]): ShapedOutput {
+  const json = toCompactJson(value);
+  if (json.length <= budgetAfterNotes(baseNotes, maxChars)) {
+    return {
+      text: joinNotes(baseNotes, json),
+      budgetTruncated: false,
+      droppedItems: 0,
+      limitReached: false,
+    };
+  }
+
+  const noteFor = (cut: number): string =>
+    `NOTE ON TRUNCATION: this single object exceeded the ${String(maxChars)}-character output budget and was cut ` +
+    `after ${String(cut)} characters — the budget left once the notes above were counted — so the JSON below is ` +
+    'INCOMPLETE and may not parse. Re-run with a fields projection to select only the properties you need.';
+
+  // Same fixed point as the array path: the note costs budget, which shortens
+  // the cut, which changes the note by a digit or two.
+  let cut = budgetAfterNotes(baseNotes, maxChars);
+  for (let pass = 0; pass < 5; pass += 1) {
+    const next = budgetAfterNotes([...baseNotes, noteFor(cut)], maxChars);
+    if (next === cut) {
+      break;
+    }
+    cut = next;
+  }
+
+  return {
+    text: joinNotes([...baseNotes, noteFor(cut)], json.slice(0, cut)),
+    budgetTruncated: true,
+    droppedItems: 0,
+    limitReached: false,
+  };
 }
 
 export interface KeyedFitResult {

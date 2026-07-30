@@ -21,6 +21,7 @@ import {
   DEFAULT_HTTP_PORT,
   DEFAULT_MAX_OUTPUT_CHARS,
   DEFAULT_TIMEOUT_MS,
+  LOOPBACK_HOSTNAMES,
   MAX_MAX_OUTPUT_CHARS,
   MAX_TIMEOUT_MS,
   MIN_HTTP_AUTH_TOKEN_LENGTH,
@@ -28,6 +29,7 @@ import {
   MIN_TIMEOUT_MS,
   OBJECT_ID_PATTERN,
 } from './constants.js';
+import { DEFAULT_LOG_LEVEL, LOG_LEVELS, type LogLevel } from './util/logger.js';
 import { registerSecret } from './util/redact.js';
 
 export const TRANSPORTS = ['stdio', 'http'] as const;
@@ -76,6 +78,12 @@ export interface LumicsConfig {
   readonly maxOutputChars: number;
   /** `LUMICS_READ_ONLY` — when true only `read` tools are *registered*. */
   readonly readOnly: boolean;
+  /**
+   * `LUMICS_LOG_LEVEL` — verbosity of the stderr diagnostics, `info` by default.
+   * Parsed here; applied to the process-wide logger by `src/index.ts`, so that
+   * importing this package cannot change a host application's logging.
+   */
+  readonly logLevel: LogLevel;
   readonly features: FeatureFlags;
   readonly transport: TransportKind;
   /** Present only when `transport === 'http'`. */
@@ -135,6 +143,22 @@ const csvList = z.string().transform((value) =>
     .filter((part) => part.length > 0),
 );
 
+/**
+ * Why a plaintext base URL is refused off the loopback interface. Exported so the
+ * test that locks the control asserts the same sentence the operator reads.
+ *
+ * Deliberately avoids the phrase "bearer <word>": `BEARER_PATTERN` in
+ * `src/util/redact.ts` matches that shape, so an earlier wording ("a bearer
+ * credential sent on every request") reached the operator as "a bearer
+ * [REDACTED] sent on every request". The redactor is right to be greedy — the
+ * fix belongs in the prose, not in the pattern. If you reword this, check the
+ * rendered output rather than trusting the constant, because the test asserting
+ * this string is only meaningful while the two agree.
+ */
+export const BASE_URL_REQUIRES_TLS = `LUMICS_BASE_URL must use https:. The Lumics API token is a credential sent in the Authorization header of every request, so over plain http: to a remote host it crosses the network in clear text and is readable by anything on the path. Plain http: is accepted only for a loopback host (${LOOPBACK_HOSTNAMES.join(
+  ', ',
+)}), which is enough for a local development proxy.`;
+
 const envSchema = z.object({
   // `loadConfig` strips empty and whitespace-only values before parsing, so an
   // unset variable arrives as `undefined` and never reaches `.min(1)`. The
@@ -180,6 +204,14 @@ const envSchema = z.object({
     .refine(
       isHttpUrl,
       'LUMICS_BASE_URL must be an absolute http(s) URL, e.g. https://app.lumics.io/api/v1 — include the /api/v1 prefix.',
+    )
+    .refine(isTlsOrLoopback, BASE_URL_REQUIRES_TLS)
+    .optional(),
+
+  LUMICS_LOG_LEVEL: z
+    .enum(
+      LOG_LEVELS,
+      `LUMICS_LOG_LEVEL must be one of ${LOG_LEVELS.join(', ')} (default ${DEFAULT_LOG_LEVEL}). Diagnostics go to stderr; "debug" adds a per-call record of duration, output size and any truncation, and "silent" turns them off entirely.`,
     )
     .optional(),
 
@@ -280,6 +312,7 @@ export function loadConfig(env: RawEnv = process.env): LumicsConfig {
     timeoutMs: data.LUMICS_TIMEOUT_MS ?? DEFAULT_TIMEOUT_MS,
     maxOutputChars: data.LUMICS_MAX_OUTPUT_CHARS ?? DEFAULT_MAX_OUTPUT_CHARS,
     readOnly: data.LUMICS_READ_ONLY ?? false,
+    logLevel: data.LUMICS_LOG_LEVEL ?? DEFAULT_LOG_LEVEL,
     features: {
       batchUpdate: data.LUMICS_ENABLE_BATCH_UPDATE ?? false,
       tokenRevocation: data.LUMICS_ENABLE_TOKEN_REVOCATION ?? false,
@@ -313,6 +346,7 @@ export function describeConfig(config: LumicsConfig): Record<string, unknown> {
     timeoutMs: config.timeoutMs,
     maxOutputChars: config.maxOutputChars,
     readOnly: config.readOnly,
+    logLevel: config.logLevel,
     features: { ...config.features },
     transport: config.transport,
     tokenConfigured: config.token.length > 0,
@@ -399,4 +433,32 @@ function isHttpUrl(value: string): boolean {
   } catch {
     return false;
   }
+}
+
+/**
+ * TLS everywhere except loopback.
+ *
+ * Every request carries `Authorization: Bearer <token>`, so the base URL decides
+ * who receives the credential. `https:` is therefore the requirement and `http:`
+ * the exception, granted only where the traffic cannot leave the machine — a
+ * developer proxying to a self-hosted Lumics is a real case and does not need a
+ * certificate. The comparison is against `URL.hostname`, which is exact: a host
+ * such as `localhost.attacker.invalid` is not loopback and gets no exemption.
+ *
+ * No environment flag widens this. If a deployment genuinely needs plaintext to a
+ * remote host, that is a change to argue for on its merits, not a default to leave
+ * open.
+ */
+function isTlsOrLoopback(value: string): boolean {
+  let url: URL;
+  try {
+    url = new URL(value);
+  } catch {
+    // Unparseable is `isHttpUrl`'s complaint to make; do not shadow it.
+    return true;
+  }
+  if (url.protocol === 'https:') {
+    return true;
+  }
+  return LOOPBACK_HOSTNAMES.includes(url.hostname);
 }

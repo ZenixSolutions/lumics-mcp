@@ -212,6 +212,49 @@ describe('toEpochMs requires an explicit zone on any timestamp carrying a time',
   });
 });
 
+/**
+ * A shape-valid but calendar-invalid timestamp used to roll over silently.
+ * `Date.parse('2026-02-31T00:00:00Z')` is 2026-03-03, so a caller who asked for
+ * February 31st got a March window — and the window note then reported
+ * "requested 2026-03-03", which makes the wrong answer internally consistent.
+ * The comment on `assertParsed` claimed such a value "still lands here"; it did
+ * not, because `Date.parse` never returns NaN for it.
+ */
+describe('toEpochMs rejects a calendar-invalid date instead of rolling it over', () => {
+  it.each([
+    ['2026-02-31T00:00:00Z', 'February 31st'],
+    ['2026-02-30', 'February 30th, date-only'],
+    ['2025-02-29', 'February 29th of a non-leap year'],
+    ['2026-04-31T12:00:00+02:00', 'April 31st behind an offset'],
+    ['2026-06-31T00:00:00Z', 'June 31st'],
+    ['2026-09-31', 'September 31st'],
+  ])('rejects %j (%s)', (input) => {
+    expect(() => toEpochMs(input, 'from')).toThrow(LumicsInputError);
+    expect(() => toEpochMs(input, 'from')).toThrow(/not a real calendar date/);
+  });
+
+  it('names the date it would otherwise have silently returned', () => {
+    expect(() => toEpochMs('2026-02-31T00:00:00Z', 'from')).toThrow(/2026-03-03/);
+    expect(() => toEpochMs('2026-02-31T00:00:00Z', 'from')).toThrow(/^from "2026-02-31T00:00:00Z"/);
+  });
+
+  it('still accepts every real date, including a leap day and a month end', () => {
+    expect(toEpochMs('2024-02-29T00:00:00Z', 'from')).toBe(Date.UTC(2024, 1, 29));
+    expect(toEpochMs('2024-02-29', 'from')).toBe(Date.UTC(2024, 1, 29));
+    expect(toEpochMs('2026-02-28T23:59:59Z', 'from')).toBe(Date.UTC(2026, 1, 28, 23, 59, 59));
+    expect(toEpochMs('2026-04-30T12:00:00+02:00', 'from')).toBe(Date.UTC(2026, 3, 30, 10));
+    expect(toEpochMs('2026-12-31T23:59:59.999Z', 'from')).toBe(
+      Date.UTC(2026, 11, 31, 23, 59, 59, 999),
+    );
+  });
+
+  it('refuses the whole window rather than reporting a shifted one', () => {
+    expect(() =>
+      resolveTimeRange({ from: '2026-02-31T00:00:00Z', to: '2026-03-05T00:00:00Z' }, NOW),
+    ).toThrow(/not a real calendar date/);
+  });
+});
+
 describe('resolveTimeRange', () => {
   it('defaults to the API-documented window of one hour ago to now', () => {
     expect(resolveTimeRange({}, NOW)).toEqual({ fromMs: NOW - HOUR, toMs: NOW });

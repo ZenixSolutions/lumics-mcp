@@ -54,13 +54,14 @@
  */
 
 import { z } from 'zod';
-import { isAbsentBody, type QueryParams } from '../api/client.js';
-import { LumicsApiError } from '../api/errors.js';
+import { expectObject, isAbsentBody, type QueryParams } from '../api/client.js';
+import { LumicsApiError, LumicsInputError } from '../api/errors.js';
 import {
   companyMetricsPath,
   companyMetricsSummarizePath,
   deviceItemMetricsPath,
   deviceMetricsPath,
+  devicePath,
   metricSummariesPath,
 } from '../api/paths.js';
 import {
@@ -68,10 +69,15 @@ import {
   MAX_LIST_LIMIT,
   METRIC_MIN_INTERVALS_DEFAULT,
 } from '../constants.js';
-import type { MetricDataPoint, MetricEnvelopeMeta, MetricSummaryItem } from '../domain/index.js';
-import { fitKeyedArraysToBudget, projectFields } from '../presentation/format.js';
+import type {
+  Device,
+  MetricDataPoint,
+  MetricEnvelopeMeta,
+  MetricSummaryItem,
+} from '../domain/index.js';
+import { budgetAfterNotes, fitKeyedArraysToBudget, projectFields } from '../presentation/format.js';
 import { describeSpan, resolveTimeRange, type TimeRange } from '../util/time.js';
-import { defineTool, result, type LumicsToolDefinition } from './factory.js';
+import { defineTool, result, type LumicsToolDefinition, type ToolContext } from './factory.js';
 import {
   companyIdSchema,
   fieldsSchema,
@@ -484,6 +490,86 @@ function formatIso(epochMs: number): string {
   return new Date(epochMs).toISOString();
 }
 
+// ---------------------------------------------------------------------------
+// The company pin on a path that has no company in it
+// ---------------------------------------------------------------------------
+
+/**
+ * Refuse a device that is not in the company this server is pinned to.
+ *
+ * spec §12.3's paths are `/metrics/devices/:id/...` — **no company segment**, so
+ * these two tools have no `companyId` argument and used to call nothing that
+ * enforced the pin. A Lumics token issued to an MSP user reaches every company
+ * that user administers, so a `deviceId` for another tenant was read and returned
+ * while every other tool refused the same tenant. `deviceId` is precisely the
+ * kind of value SECURITY.md classes as untrusted — an id picked up from a
+ * document, or from an injected instruction in a device description — so the
+ * absence of a gate here was the absence of the control, not a narrower version
+ * of it.
+ *
+ * The device's owner is therefore resolved first, with a company-scoped read of
+ * the device (spec §7.2) against the configured company, and the metric read is
+ * issued only if that read confirms ownership. That costs one extra round trip
+ * per call; the alternative was a security control with a documented exception,
+ * which is much weaker than one without.
+ *
+ * Fail-closed in every ambiguous case:
+ *  - a 404 from the company-scoped device read means the device is not in this
+ *    company (or does not exist at all) — either way, refused;
+ *  - a device record with no `company` field cannot be verified, so it is refused
+ *    rather than assumed to belong here.
+ *
+ * Skipped entirely when the operator has set `LUMICS_ALLOW_CROSS_COMPANY`: there
+ * is no pin to enforce then, and no reason to spend the request.
+ */
+async function assertDeviceInPinnedCompany(deviceId: string, context: ToolContext): Promise<void> {
+  if (context.config.allowCrossCompany) {
+    return;
+  }
+
+  // Registration withholds both tools when no company is configured
+  // (`requiresCompany`), so this resolves the configured id rather than throwing.
+  const pinned = context.resolveCompanyId();
+  const operation = `GET device ${deviceId} to resolve its company`;
+
+  let device: Device;
+  try {
+    device = expectObject<Device>(
+      await context.client.get(devicePath(pinned, deviceId)),
+      operation,
+    );
+  } catch (error) {
+    if (error instanceof LumicsApiError && error.status === 404) {
+      throw new LumicsInputError(
+        `Device ${deviceId} is not in the company this server is configured for (LUMICS_COMPANY_ID is ${pinned}): reading it inside that company returned 404 Not Found. The metric read was NOT performed. Either the id does not exist, or it belongs to another Lumics company — one token can reach several, so this server refuses a device it cannot confirm belongs to the configured company. Confirm the id with lumics_list_devices, which lists only the configured company. If the device really is in another company, tell the user which one and ask them to have the operator set LUMICS_ALLOW_CROSS_COMPANY=1; that is an operator setting and cannot be overridden from here.`,
+        'not_permitted',
+      );
+    }
+    throw error;
+  }
+
+  const owner = typeof device.company === 'string' ? device.company : undefined;
+  if (owner === pinned) {
+    return;
+  }
+
+  if (owner === undefined) {
+    throw new LumicsInputError(
+      `Device ${deviceId} could not be confirmed to belong to the company this server is configured for (LUMICS_COMPANY_ID is ${pinned}): the device record Lumics returned carried no "company" field, so its owner cannot be verified. The metric read was NOT performed, because an unverified owner is not a verified one and this metric path (spec section 12.3) carries no company segment of its own to constrain it. Report this as unexpected API drift. An operator who accepts the risk can set LUMICS_ALLOW_CROSS_COMPANY=1, which turns this check off; that is an operator setting and cannot be overridden from here.`,
+      'not_permitted',
+    );
+  }
+
+  throw new LumicsInputError(
+    `Device ${deviceId} belongs to Lumics company ${owner}, which is not the company this server is configured for (LUMICS_COMPANY_ID is ${pinned}). The metric read was NOT performed. Cross-company access is refused unless the operator sets LUMICS_ALLOW_CROSS_COMPANY=1, because one Lumics token can reach several tenants and a device id is exactly the sort of value that arrives from a document or another tool's output. Use lumics_list_devices to pick a device in the configured company. If you genuinely need the other company, tell the user which one and ask them to have the operator enable LUMICS_ALLOW_CROSS_COMPANY; this is an operator setting and cannot be overridden from here.`,
+    'not_permitted',
+  );
+}
+
+/** The sentence both device-scoped metric tools append to their description. */
+const DEVICE_PIN_DISCLOSURE =
+  ' This tool takes no companyId argument because the Lumics metric path for a device carries no company (spec section 12.3). It is still covered by the company pin: before reading any metrics this server reads the device inside the company it is configured for (LUMICS_COMPANY_ID) and refuses the call if the device belongs to another company, so a device id that arrived from a document or from another tool cannot reach a tenant the operator did not configure. That costs one extra request per call.';
+
 function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === 'object' && value !== null && !Array.isArray(value);
 }
@@ -521,8 +607,14 @@ const getCompanyMetrics = defineTool({
     );
     const series = unwrapMetricSeries(response, operation);
 
+    // Deliberately no `requestedLimit`. A metric response is one row per
+    // component per time bucket, so `metricRowCapNote` describes what a cap did
+    // to the SERIES; the list-completeness note would describe the same response
+    // as a possibly-incomplete inventory and tell the model to "re-run with a
+    // higher limit", which is the opposite of "drop this limit". Two notes with
+    // opposite advice in one response is the defect that was already fixed on the
+    // list path.
     return result(series.points, {
-      requestedLimit: args.limit,
       fields: args.fields,
       notes: metricSeriesNotes(request, series),
     });
@@ -571,8 +663,8 @@ const summarizeCompanyMetrics = defineTool({
         : `AGGREGATION: values below are SUMMED across components using each component's "${args.sum}" rollup property, so a bucket is a total and not an average.`,
     );
 
+    // No `requestedLimit` here either — see getCompanyMetrics.
     return result(series.points, {
-      requestedLimit: args.limit,
       fields: args.fields,
       notes,
     });
@@ -588,14 +680,18 @@ const summarizeCompanyMetrics = defineTool({
  *
  * Full shared set without `sum`, including `itemType` — the vendor's own example
  * passes `itemType: "snmp_cisco_envmonfan"` here. There is no company in this
- * path, so no `companyId` argument: the device id alone identifies the scope.
+ * path, so no `companyId` argument; the pin is enforced instead by
+ * {@link assertDeviceInPinnedCompany}, which is why the tool is marked
+ * `requiresCompany`.
  */
 const getDeviceMetrics = defineTool({
   name: 'lumics_get_device_metrics',
   title: 'Get metrics for one device',
   operation: 'read',
+  requiresCompany: true,
   description:
-    'Get metrics for the components of a single device — every fan, interface, pool or volume the named module polls on it — returning a row per component per time bucket. This is the tool for "how is this device doing": pair it with lastMetric true and a narrow "properties" list for a current-status readout, or leave lastMetric unset for a series over the window. Restrict to one kind of component with itemType when a device has many. The window defaults to the last 1 hour and a resolution of 60 data points is sent unless you pass dataPoints. For one specific component, or for the device\'s own device-level metrics, use lumics_get_device_item_metrics.',
+    'Get metrics for the components of a single device — every fan, interface, pool or volume the named module polls on it — returning a row per component per time bucket. This is the tool for "how is this device doing": pair it with lastMetric true and a narrow "properties" list for a current-status readout, or leave lastMetric unset for a series over the window. Restrict to one kind of component with itemType when a device has many. The window defaults to the last 1 hour and a resolution of 60 data points is sent unless you pass dataPoints. For one specific component, or for the device\'s own device-level metrics, use lumics_get_device_item_metrics.' +
+    DEVICE_PIN_DISCLOSURE,
   inputSchema: {
     deviceId: objectIdSchema.describe('Lumics device id. Get it from lumics_list_devices.'),
     moduleType: moduleTypeSchema,
@@ -606,6 +702,10 @@ const getDeviceMetrics = defineTool({
     fields: fieldsSchema,
   },
   async handler(args, context) {
+    // Before the metric read, never after: an unpinned device must not have its
+    // metrics fetched at all, not merely withheld from the response.
+    await assertDeviceInPinnedCompany(args.deviceId, context);
+
     const request = buildMetricRequest(args);
     const operation = `GET device ${args.deviceId} metrics ${args.moduleType}`;
     const response = await context.client.get<unknown>(
@@ -614,8 +714,10 @@ const getDeviceMetrics = defineTool({
     );
     const series = unwrapMetricSeries(response, operation);
 
+    // Deliberately no `requestedLimit`: `metricRowCapNote` already describes a
+    // capped series, and the list-completeness note's "re-run with a higher
+    // limit" is the opposite advice on this path. See `metricRowCapNote`.
     return result(series.points, {
-      requestedLimit: args.limit,
       fields: args.fields,
       notes: metricSeriesNotes(request, series),
     });
@@ -634,8 +736,10 @@ const getDeviceItemMetrics = defineTool({
   name: 'lumics_get_device_item_metrics',
   title: 'Get metrics for one item',
   operation: 'read',
+  requiresCompany: true,
   description:
-    "Get metrics for exactly one item on a device: pass the device's own id as itemId for device-level metrics such as CPU, memory or uptime, or a component id for one interface, fan, pool or volume. This is the narrowest and cheapest metric read, and the right one for charting a single series or checking one thing. Results are returned as time buckets, typically carrying min, max and avg per property along with the owning device's id and name. The window defaults to the last 1 hour and a resolution of 60 data points is sent unless you pass dataPoints. Unlike the other metric tools this one takes no itemType, because the item is already identified.",
+    "Get metrics for exactly one item on a device: pass the device's own id as itemId for device-level metrics such as CPU, memory or uptime, or a component id for one interface, fan, pool or volume. This is the narrowest and cheapest metric read, and the right one for charting a single series or checking one thing. Results are returned as time buckets, typically carrying min, max and avg per property along with the owning device's id and name. The window defaults to the last 1 hour and a resolution of 60 data points is sent unless you pass dataPoints. Unlike the other metric tools this one takes no itemType, because the item is already identified." +
+    DEVICE_PIN_DISCLOSURE,
   inputSchema: {
     deviceId: objectIdSchema.describe('Lumics device id that owns the item.'),
     moduleType: moduleTypeSchema,
@@ -648,6 +752,8 @@ const getDeviceItemMetrics = defineTool({
     fields: fieldsSchema,
   },
   async handler(args, context) {
+    await assertDeviceInPinnedCompany(args.deviceId, context);
+
     const request = buildMetricRequest(args);
     const operation = `GET device ${args.deviceId} item ${args.itemId} metrics ${args.moduleType}`;
     const response = await context.client.get<unknown>(
@@ -656,8 +762,8 @@ const getDeviceItemMetrics = defineTool({
     );
     const series = unwrapMetricSeries(response, operation);
 
+    // No `requestedLimit`, as on every series endpoint — see getDeviceMetrics.
     return result(series.points, {
-      requestedLimit: args.limit,
       fields: args.fields,
       notes: metricSeriesNotes(request, series),
     });
@@ -728,7 +834,7 @@ const getMetricSummary = defineTool({
       .max(1_000)
       .optional()
       .describe(
-        'Keep only this many items after the local sort. This is a client-side trim of a full response, not a server-side limit — Lumics fetched and returned everything either way. Combine it with sortBy, otherwise it just keeps the first N items in whatever order Lumics happened to return, which is not a documented ordering.',
+        'Keep only this many items after the local sort. This is a client-side trim of a full response, not a server-side limit — Lumics fetched and returned everything either way. Combine it with sortBy, otherwise it just keeps the first N items in whatever order Lumics happened to return, which is not a documented ordering. Note that when Lumics returns more than one item class (spec section 12.4 keys its results by class, e.g. devices and pools), this trim is applied to EACH class separately, so you can receive up to topN multiplied by the number of classes, and no ranking crosses classes; the response says so when that happens. Pass itemType to reduce the response to one class if you need a single global top-N.',
       ),
     fields: fieldsSchema,
   },
@@ -780,6 +886,12 @@ const getMetricSummary = defineTool({
       notes.push(effective);
     }
 
+    // Ranking and trimming happen INSIDE each item class, so `topN` is not a cap
+    // on the response: with two classes and topN 2, four rows come back. That
+    // used to be inferable only from the presence of two LOCAL RANKING notes,
+    // while the explicit cross-class caveat lived in the truncation note — which
+    // fires only when the budget dropped something. It is stated here instead,
+    // whenever more than one class is present.
     const rankedClasses: Record<string, readonly MetricSummaryItem[]> = {};
     for (const className of classNames) {
       const items = classes[className] ?? [];
@@ -788,6 +900,17 @@ const getMetricSummary = defineTool({
       if (ranked.notes.length > 0) {
         notes.push(`LOCAL RANKING of "${className}": ${ranked.notes.join(' ')}`);
       }
+    }
+
+    // Said once, whether or not any class was long enough to trim: the reader
+    // needs to know that topN is not a cap on the response and that no ranking
+    // crossed a class boundary. "No class was long enough this time" is not a
+    // reason to leave that unsaid, and a per-class trim is not what "top N"
+    // means to anyone reading the answer.
+    if (args.topN !== undefined && classNames.length > 1) {
+      notes.push(
+        `LOCAL RANKING ACROSS CLASSES: topN was applied to EACH item class separately, NOT across the response. Lumics returned ${String(classNames.length)} item classes (${classNames.join(', ')}), so up to ${String(args.topN * classNames.length)} row(s) can appear below, and the top item of one class is not comparable with the top item of another — this server ranked within each class only. For a single global top-${String(args.topN)}, pass itemType to reduce the response to one class.`,
+      );
     }
 
     // Zero classes with a `data` object actually present is a real response, not
@@ -842,17 +965,47 @@ const getMetricSummary = defineTool({
       ) as readonly unknown[];
     }
 
-    const fitted = fitKeyedArraysToBudget(projectedClasses, context.config.maxOutputChars);
+    // The notes are counted against the budget before the classes are fitted to
+    // it, the same way `shapeToolOutput` reserves them: fitting the payload to the
+    // whole budget and letting ~1,100 characters of disclosure be prepended
+    // afterwards is what made `LUMICS_MAX_OUTPUT_CHARS` not a cap. Here it would
+    // also undo the shedding — a keyed object over budget is hard-truncated into
+    // JSON that does not parse, which is the H4 defect this branch exists to fix.
+    //
+    // The truncation note itself costs budget, which can shed more, which changes
+    // the note's counts, so this settles it in a bounded loop and keeps a little
+    // slack for the digits.
+    const maxChars = context.config.maxOutputChars;
+    const truncationNote = (dropped: number, total: number, perKeyCap: number): string =>
+      `NOTE ON TRUNCATION: this response holds ${String(classNames.length)} item classes (${classNames.join(', ')}) ` +
+      `and exceeded the ${String(maxChars)}-character output budget, so ` +
+      `${String(dropped)} of ${String(total)} item(s) were dropped — each class was cut to at most ` +
+      `${String(perKeyCap)} item(s), taken from the start of the order shown. The dropped items exist; ` +
+      'they are simply not here, and no ranking you asked for was applied across classes. Narrow "properties" ' +
+      'or "itemType" (which also reduces this to a single class), pass a smaller "fields" projection, use topN, ' +
+      'or ask the operator to raise LUMICS_MAX_OUTPUT_CHARS.';
+
+    /** Slack for the counts in the truncation note growing by a digit. */
+    const digitSlack = 16;
+    const budgetFor = (extra: readonly string[]): number =>
+      Math.max(0, budgetAfterNotes([...notes, ...extra], maxChars) - digitSlack);
+
+    let fitted = fitKeyedArraysToBudget(projectedClasses, budgetFor([]));
+    for (let pass = 0; pass < 5; pass += 1) {
+      const extra =
+        fitted.dropped > 0
+          ? [truncationNote(fitted.dropped, fitted.total, fitted.perKeyCap)]
+          : ([] as readonly string[]);
+      const refitted = fitKeyedArraysToBudget(projectedClasses, budgetFor(extra));
+      const settled = refitted.dropped === fitted.dropped;
+      fitted = refitted;
+      if (settled) {
+        break;
+      }
+    }
+
     if (fitted.dropped > 0) {
-      notes.push(
-        `NOTE ON TRUNCATION: this response holds ${String(classNames.length)} item classes (${classNames.join(', ')}) ` +
-          `and exceeded the ${String(context.config.maxOutputChars)}-character output budget, so ` +
-          `${String(fitted.dropped)} of ${String(fitted.total)} item(s) were dropped — each class was cut to at most ` +
-          `${String(fitted.perKeyCap)} item(s), taken from the start of the order shown. The dropped items exist; ` +
-          'they are simply not here, and no ranking you asked for was applied across classes. Narrow "properties" ' +
-          'or "itemType" (which also reduces this to a single class), pass a smaller "fields" projection, use topN, ' +
-          'or ask the operator to raise LUMICS_MAX_OUTPUT_CHARS.',
-      );
+      notes.push(truncationNote(fitted.dropped, fitted.total, fitted.perKeyCap));
     }
 
     // Deliberately no requestedLimit: this endpoint takes no limit, so the

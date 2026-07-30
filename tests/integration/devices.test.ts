@@ -21,6 +21,8 @@ import {
   TEST_COMPANY_ID,
   TEST_DEVICE_ID,
 } from '../helpers/config.js';
+import { recordFetch, type FetchRecorder } from '../helpers/fetch.js';
+import { connect, firstText } from '../helpers/mcp.js';
 import {
   exchange,
   expectNoFabricatedPagination,
@@ -421,6 +423,22 @@ describe('lumics_update_device (spec section 7.5)', () => {
     expect(text).toContain('"updated" envelope');
   });
 
+  /**
+   * Finding H3. `{updated: null}` used to unwrap to `null` and be returned as a
+   * successful result whose entire payload was the literal text `null`. The
+   * envelope key was checked; what it held was not.
+   */
+  it('reports an empty updated envelope as drift instead of answering "null"', async () => {
+    const { text } = await failingExchange(
+      'lumics_update_device',
+      { deviceId: TEST_DEVICE_ID, enabled: false },
+      { updated: null },
+    );
+    expect(text).toContain('invalid_response');
+    expect(text).not.toMatch(/\bnull\s*$/);
+    expect(text).toContain('This is not the same as "the record does not exist"');
+  });
+
   it.each([
     ['a priority above the documented range', { priority: 11 }],
     ['a negative priority', { priority: -1 }],
@@ -542,17 +560,38 @@ describe('lumics_batch_update_devices (spec section 7.6)', () => {
     expect(notes).toContain('some ids did not match a device in this company');
   });
 
-  it('reports zero updated records when the envelope does not hold an array', async () => {
-    // spec §7.6 documents `{updated: [...]}`, but the single PATCH returns a bare
-    // object. If the API ever returns the singular shape here, the note must not
-    // claim a count it cannot read.
-    const { notes } = await exchange(
+  /**
+   * Finding M4. spec §7.6 documents `{updated: [...]}`, but the envelope was
+   * never checked to hold an array, and the note fell back to a count of zero for
+   * anything else. Lumics returning the singular shape produced "Lumics returned
+   * 0 updated record(s); if that count is lower than the number of ids you sent,
+   * some ids did not match" printed directly above a record that plainly did
+   * match — a bulk change reported as having failed entirely, in a result marked
+   * successful. The count is not something to guess at: it is drift, and it is
+   * reported as drift.
+   */
+  it('reports a non-array batch envelope as drift instead of guessing a count', async () => {
+    const { text } = await failingExchange(
       'lumics_batch_update_devices',
       { deviceIds: [TEST_DEVICE_ID], enabled: false, confirm: true },
       { updated: SAMPLE_DEVICE },
       { config },
     );
-    expect(notes).toContain('Lumics returned 0 updated record(s)');
+    expect(text).toContain('invalid_response');
+    expect(text).not.toContain('0 updated record(s)');
+    // Nor may it claim the ids matched nothing.
+    expect(text).not.toContain('some ids did not match');
+  });
+
+  it('reports an empty batch envelope as drift rather than a successful no-op', async () => {
+    const { text } = await failingExchange(
+      'lumics_batch_update_devices',
+      { deviceIds: [TEST_DEVICE_ID], enabled: false, confirm: true },
+      { updated: null },
+      { config },
+    );
+    expect(text).toContain('invalid_response');
+    expect(text).toMatch(/may already have been applied/);
   });
 
   it('refuses a no-field batch, which would change nothing across every id', async () => {
@@ -602,6 +641,88 @@ describe('lumics_delete_device (spec section 7.7)', () => {
       { updated: SAMPLE_DEVICE },
     );
     expect(text).toContain('"deleted" envelope');
+  });
+
+  /**
+   * Finding H3, at its sharpest. `{deleted: null}` used to produce a successful
+   * result reading "The device below has been permanently deleted from Lumics."
+   * followed by the literal text `null` — a factual claim that a record was
+   * destroyed, with nothing to show for it, from a body a *read* is not even
+   * allowed to interpret as an empty record.
+   */
+  it('never asserts a permanent deletion from an empty deleted envelope', async () => {
+    const { text } = await failingExchange(
+      'lumics_delete_device',
+      { deviceId: TEST_DEVICE_ID, confirm: true },
+      { deleted: null },
+    );
+    expect(text).toContain('invalid_response');
+    expect(text).not.toContain('permanently deleted');
+    expect(text).not.toMatch(/\bnull\s*$/);
+    // The delete may well have landed; the model is sent to look, not told the
+    // record is gone and not told to try again.
+    expect(text).toMatch(/may already have been applied/);
+  });
+
+  it('rejects an array in the deleted envelope of a single delete', async () => {
+    const { text } = await failingExchange(
+      'lumics_delete_device',
+      { deviceId: TEST_DEVICE_ID, confirm: true },
+      { deleted: [SAMPLE_DEVICE] },
+    );
+    expect(text).toContain('invalid_response');
+    expect(text).not.toContain('permanently deleted');
+  });
+});
+
+/**
+ * Finding H2 end to end: a write whose response body dies mid-transfer. The
+ * client makes exactly one attempt on purpose, so the guidance the model reads
+ * must not be "retry the call".
+ */
+describe('a device write whose response body never finishes arriving', () => {
+  /** A 200 whose body stream fails partway through, the way a reset connection does. */
+  function truncatedBodyFetch(): FetchRecorder {
+    return recordFetch(
+      () =>
+        ({
+          ok: true,
+          status: 200,
+          headers: new Headers({ 'content-type': 'application/json' }),
+          text: () =>
+            Promise.reject(new TypeError('terminated', { cause: new Error('ECONNRESET') })),
+        }) as unknown as Response,
+    );
+  }
+
+  it.each([
+    [
+      'lumics_create_device',
+      {
+        name: 'core-sw-02',
+        ipAddress: '10.20.30.41',
+        collector: TEST_COLLECTOR_ID,
+        deviceType: 'switch',
+      },
+    ],
+    ['lumics_update_device', { deviceId: TEST_DEVICE_ID, enabled: false }],
+    ['lumics_delete_device', { deviceId: TEST_DEVICE_ID, confirm: true }],
+  ])('%s is attempted once and the model is told to verify, not to retry', async (tool, args) => {
+    const fetcher = truncatedBodyFetch();
+    const harness = await connect(makeConfig(), {
+      clientOptions: { fetchImpl: fetcher.fetchImpl, sleep: () => Promise.resolve() },
+    });
+    try {
+      const called = await harness.call(tool, args);
+      const text = firstText(called);
+
+      expect(called.isError).toBe(true);
+      expect(fetcher.calls).toHaveLength(1);
+      expect(text).toMatch(/may already have been applied/);
+      expect(text).not.toMatch(/retry the call/i);
+    } finally {
+      await harness.close();
+    }
   });
 });
 

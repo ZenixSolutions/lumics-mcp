@@ -39,6 +39,7 @@ export function makeConfig(overrides: Partial<LumicsConfig> = {}): LumicsConfig 
     timeoutMs: 5_000,
     maxOutputChars: 25_000,
     readOnly: false,
+    logLevel: 'info' as const,
     features: { batchUpdate: false, tokenRevocation: false },
     transport: 'stdio' as const,
     http: undefined,

@@ -97,12 +97,16 @@ discover the id:
 3. Set `LUMICS_COMPANY_ID` to that value and **restart the server** (and your client, if it caches
    the tool list).
 
-Until the variable is set, only the tools that need no company are registered — `lumics_get_me`,
-`lumics_get_device_definition_components`, `lumics_get_device_metrics` and
-`lumics_get_device_item_metrics` (plus `lumics_revoke_tokens` if you have enabled it). Everything
-else is company-scoped and is withheld from `tools/list` rather than left to fail on every call, so
-a partly-configured server looks small rather than broken. The server logs a warning on stderr
-saying exactly this.
+Until the variable is set, only the tools that need no company are registered — `lumics_get_me` and
+`lumics_get_device_definition_components`, which is **two** tools (three, if you have enabled
+`lumics_revoke_tokens`). Everything else is company-scoped and is withheld from `tools/list` rather
+than left to fail on every call, so a partly-configured server looks small rather than broken. The
+server logs a warning on stderr saying exactly this.
+
+`lumics_get_device_metrics` and `lumics_get_device_item_metrics` are in that withheld set even
+though their Lumics paths carry no company segment: they enforce the company pin by reading the
+device inside `LUMICS_COMPANY_ID` first, so without a configured company there is nothing for them
+to check against. See [Cross-company access is off by default](#cross-company-access-is-off-by-default).
 
 If you already know the id you can skip all of that and set it up front; the examples below do. A
 value that is supplied is validated at startup and must be 24 hex characters, so a typo fails
@@ -260,32 +264,53 @@ deployment is not released yet. Until it is, this section describes work that ha
 All configuration is by environment variable. The canonical, commented list is
 [`.env.example`](./.env.example); this table mirrors it.
 
-| Variable                         | Required                                       | Default                                        | Description                                                                                                                                                                                                                                         |
-| -------------------------------- | ---------------------------------------------- | ---------------------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `LUMICS_TOKEN`                   | Yes                                            | —                                              | Lumics API token (JWT bearer). Sent as `Authorization: Bearer <token>`.                                                                                                                                                                             |
-| `LUMICS_COMPANY_ID`              | No                                             | unset                                          | Your Lumics company id (24-character hex), used as the `companies` context id. Unset, the server starts with only the tools that need no company and logs a warning — see [First run](#first-run-finding-your-company-id). Validated when supplied. |
-| `LUMICS_BASE_URL`                | No                                             | `https://app.lumics.io/api/v1`                 | API base URL. Override only for a self-hosted or non-production Lumics.                                                                                                                                                                             |
-| `LUMICS_TIMEOUT_MS`              | No                                             | `30000`                                        | Per-request timeout in milliseconds.                                                                                                                                                                                                                |
-| `LUMICS_MAX_OUTPUT_CHARS`        | No                                             | `25000`                                        | Maximum characters of tool output before truncation is applied. Truncation is always disclosed in the response.                                                                                                                                     |
-| `LUMICS_READ_ONLY`               | No                                             | unset (off)                                    | Set to `1` to register **only** read tools. No create, update, delete, or admin tool is exposed to the model. Recommended.                                                                                                                          |
-| `LUMICS_ALLOW_CROSS_COMPANY`     | No                                             | unset (off)                                    | Set to `1` to let a tool call name a `companyId` other than `LUMICS_COMPANY_ID`. Off, such a call is refused with `not_permitted`. Read [Security](#security) first.                                                                                |
-| `LUMICS_ENABLE_BATCH_UPDATE`     | No                                             | unset (off)                                    | Set to `1` to expose bulk device update. One call can rewrite arbitrary fields on many devices.                                                                                                                                                     |
-| `LUMICS_ENABLE_TOKEN_REVOCATION` | No                                             | unset (off)                                    | Set to `1` to expose token revocation. Revokes **every** token on your account. Read [Security](#security) first.                                                                                                                                   |
-| `LUMICS_TRANSPORT`               | No                                             | `stdio`                                        | `stdio` is the only value 0.1.0 accepts. **`http` is refused at startup** and arrives in v0.2 — see [The HTTP transport is not in 0.1.0](#the-http-transport-is-not-in-010).                                                                        |
-| `LUMICS_HTTP_PORT`               | No _(v0.2 only)_                               | `3000`                                         | HTTP listener port. Inert in 0.1.0; documented for forward reference.                                                                                                                                                                               |
-| `LUMICS_HTTP_HOST`               | No _(v0.2 only)_                               | `127.0.0.1`                                    | HTTP bind address. Loopback by default. Change only behind TLS and authentication. Inert in 0.1.0.                                                                                                                                                  |
-| `LUMICS_HTTP_AUTH_TOKEN`         | Yes when `LUMICS_TRANSPORT=http` _(v0.2 only)_ | —                                              | Shared secret clients must present as `Authorization: Bearer <value>`. Minimum 32 characters, enforced at startup. Generate with `openssl rand -hex 32`. Inert in 0.1.0.                                                                            |
-| `LUMICS_HTTP_ALLOWED_HOSTS`      | No _(v0.2 only)_                               | `127.0.0.1,localhost,[::1]` plus the bind host | Comma-separated `Host` allowlist for DNS-rebinding protection. Setting it replaces the default list, so repeat every loopback spelling you use — including `[::1]` — and the bind host. Inert in 0.1.0.                                             |
-| `LUMICS_HTTP_ALLOWED_ORIGINS`    | No _(v0.2 only)_                               | empty (no origin allowed)                      | Comma-separated `Origin` allowlist for CORS. Inert in 0.1.0.                                                                                                                                                                                        |
-| `LUMICS_CONTRACT_TESTS`          | No                                             | unset (off)                                    | Maintainers only. Set to `1` to run tests that make real, read-only calls against a live tenant.                                                                                                                                                    |
+| Variable                         | Required                                       | Default                                        | Description                                                                                                                                                                                                                                           |
+| -------------------------------- | ---------------------------------------------- | ---------------------------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `LUMICS_TOKEN`                   | Yes                                            | —                                              | Lumics API token (JWT bearer). Sent as `Authorization: Bearer <token>`.                                                                                                                                                                               |
+| `LUMICS_COMPANY_ID`              | No                                             | unset                                          | Your Lumics company id (24-character hex), used as the `companies` context id. Unset, the server starts with only the tools that need no company and logs a warning — see [First run](#first-run-finding-your-company-id). Validated when supplied.   |
+| `LUMICS_BASE_URL`                | No                                             | `https://app.lumics.io/api/v1`                 | API base URL. Override only for a self-hosted or non-production Lumics. **Must use `https:`**, except for a loopback host (`127.0.0.1`, `localhost`, `[::1]`) — the token is a bearer credential sent on every request. Refused at startup otherwise. |
+| `LUMICS_TIMEOUT_MS`              | No                                             | `30000`                                        | Per-request timeout in milliseconds.                                                                                                                                                                                                                  |
+| `LUMICS_MAX_OUTPUT_CHARS`        | No                                             | `25000`                                        | Maximum characters of tool output — disclosure notes and JSON payload together, not the payload alone. Truncation is always disclosed in the response.                                                                                                |
+| `LUMICS_LOG_LEVEL`               | No                                             | `info`                                         | Diagnostic verbosity on stderr: `debug`, `info`, `warn`, `error`, `silent`. `debug` adds a per-call record with duration, output size and truncation counts; `silent` quiets stderr entirely. Never touches stdout, which is the protocol channel.    |
+| `LUMICS_READ_ONLY`               | No                                             | unset (off)                                    | Set to `1` to register **only** read tools. No create, update, delete, or admin tool is exposed to the model. Recommended.                                                                                                                            |
+| `LUMICS_ALLOW_CROSS_COMPANY`     | No                                             | unset (off)                                    | Set to `1` to let a tool call name a `companyId` other than `LUMICS_COMPANY_ID`. Off, such a call is refused with `not_permitted`. Read [Security](#security) first.                                                                                  |
+| `LUMICS_ENABLE_BATCH_UPDATE`     | No                                             | unset (off)                                    | Set to `1` to expose bulk device update. One call can rewrite arbitrary fields on many devices.                                                                                                                                                       |
+| `LUMICS_ENABLE_TOKEN_REVOCATION` | No                                             | unset (off)                                    | Set to `1` to expose token revocation. Revokes **every** token on your account. Read [Security](#security) first.                                                                                                                                     |
+| `LUMICS_TRANSPORT`               | No                                             | `stdio`                                        | `stdio` is the only value 0.1.0 accepts. **`http` is refused at startup** and arrives in v0.2 — see [The HTTP transport is not in 0.1.0](#the-http-transport-is-not-in-010).                                                                          |
+| `LUMICS_HTTP_PORT`               | No _(v0.2 only)_                               | `3000`                                         | HTTP listener port. Inert in 0.1.0; documented for forward reference.                                                                                                                                                                                 |
+| `LUMICS_HTTP_HOST`               | No _(v0.2 only)_                               | `127.0.0.1`                                    | HTTP bind address. Loopback by default. Change only behind TLS and authentication. Inert in 0.1.0.                                                                                                                                                    |
+| `LUMICS_HTTP_AUTH_TOKEN`         | Yes when `LUMICS_TRANSPORT=http` _(v0.2 only)_ | —                                              | Shared secret clients must present as `Authorization: Bearer <value>`. Minimum 32 characters, enforced at startup. Generate with `openssl rand -hex 32`. Inert in 0.1.0.                                                                              |
+| `LUMICS_HTTP_ALLOWED_HOSTS`      | No _(v0.2 only)_                               | `127.0.0.1,localhost,[::1]` plus the bind host | Comma-separated `Host` allowlist for DNS-rebinding protection. Setting it replaces the default list, so repeat every loopback spelling you use — including `[::1]` — and the bind host. Inert in 0.1.0.                                               |
+| `LUMICS_HTTP_ALLOWED_ORIGINS`    | No _(v0.2 only)_                               | empty (no origin allowed)                      | Comma-separated `Origin` allowlist for CORS. Inert in 0.1.0.                                                                                                                                                                                          |
+| `LUMICS_CONTRACT_TESTS`          | No                                             | unset (off)                                    | Maintainers only. Set to `1` to run tests that make real, read-only calls against a live tenant.                                                                                                                                                      |
 
 The five `LUMICS_HTTP_*` variables are listed because they are validated at startup when you ask for
 the HTTP transport — but 0.1.0 then refuses the transport itself, so setting any of them changes
 nothing about how this release runs. They are documented so a v0.2 deployment can be prepared and
 reviewed before it exists.
 
-For local development, copy `.env.example` to `.env` and fill it in. `.env` is gitignored and must
-never be committed.
+### The server does not read a `.env` file
+
+Configuration comes from the environment the process is given, and from nowhere else. **Nothing here
+discovers a `.env`.** An earlier build did, using a relative path, which for a published server meant
+whichever directory the MCP client happened to launch it from — so a file planted there could
+redirect `LUMICS_BASE_URL` and send the token elsewhere, or reopen every safety gate the operator had
+left closed. See [Security](#security).
+
+Two supported ways to use a `.env`, both of which are the operator choosing a file rather than the
+server finding one:
+
+- **Your MCP client's `env` block.** Every install above already does this; nothing extra is needed.
+- **Node's own flag**, for local development:
+
+  ```bash
+  cp .env.example .env      # then edit it
+  node --env-file=.env dist/index.js
+  ```
+
+  `--env-file=.env` requires the file to exist; `--env-file-if-exists=.env` tolerates its absence.
+
+`.env` is gitignored and must never be committed.
 
 ---
 
@@ -323,11 +348,20 @@ Both stay unavailable unless you opt in with an environment variable. A model ca
 
 ### Cross-company access is off by default
 
-Every tool takes an optional `companyId` argument, and by default a value that differs from
-`LUMICS_COMPANY_ID` is refused with a `not_permitted` error. A Lumics token issued to an MSP user
-reaches every company that user administers, so without this gate a model that had picked up another
-tenant's id — from a conversation, a document, a previous answer — could read or write there, while
-the tool description said the call applied to the configured company.
+**Every tool is covered by the company pin.** Most take an optional `companyId` argument, and by
+default a value that differs from `LUMICS_COMPANY_ID` is refused with a `not_permitted` error. A
+Lumics token issued to an MSP user reaches every company that user administers, so without this gate
+a model that had picked up another tenant's id — from a conversation, a document, a previous answer —
+could read or write there, while the tool description said the call applied to the configured
+company.
+
+Two tools have no `companyId` argument to check, because their Lumics paths carry no company segment:
+`lumics_get_device_metrics` and `lumics_get_device_item_metrics` are addressed by device id alone.
+They enforce the same pin a different way — **a device-ownership read first**: the device is fetched
+inside `LUMICS_COMPANY_ID`, and the metric read happens only if that confirms the device belongs
+there. A device in another tenant is refused with `not_permitted` and no metric request is made. That
+costs one extra round trip per call, which is the price of a control with no exception in it. Both
+tools are therefore company-scoped, and are withheld entirely when `LUMICS_COMPANY_ID` is unset.
 
 Set `LUMICS_ALLOW_CROSS_COMPANY=1` only if you deliberately operate several tenants through one
 server, and understand that it widens the blast radius of every write from one company to every
@@ -426,6 +460,22 @@ response says so.
 Pass `fields` with the names you want to override it, pass `fields: []` to get whole records, or
 call `lumics_get_device` for one device in full. No other list tool projects by default.
 
+### A write is never retried after a transport failure
+
+If the connection drops, times out, or delivers an incomplete body on a `POST`, `PATCH`, or `DELETE`,
+the server makes **one** attempt and no more. The request may have been applied before the connection
+died, and the transport cannot tell that apart from a request Lumics never saw, so a replay would
+duplicate a record, double-apply a change, or hit a record the first attempt had already deleted. The
+error text says the write may already have landed and instructs a verifying read rather than a retry;
+read that as "go and look", not "it failed".
+
+`DELETE` is in that set even though HTTP calls it idempotent. Idempotence guarantees the same state,
+not the same answer: a replayed delete 404s, and `not_found` — "Lumics has no such resource" — is what
+would surface, so a completed deletion would be reported as never having happened.
+
+Retries on a **status code** are unchanged and still apply to every verb, `429` included: a status
+proves the server answered, which removes the ambiguity.
+
 ### The HTTP transport is not in 0.1.0
 
 `LUMICS_TRANSPORT=http` is **refused at startup** in this release. 0.1.0 ships stdio only
@@ -498,8 +548,8 @@ credential you will forget you issued.
 ### The server started but almost no tools are there
 
 `LUMICS_COMPANY_ID` is not set. Company-scoped tools are withheld from `tools/list` when there is
-no company to scope them to, which leaves four tools in a default deployment. The server logs a
-warning on stderr saying so. Follow
+no company to scope them to, which leaves two tools in a default deployment — `lumics_get_me` and
+`lumics_get_device_definition_components`. The server logs a warning on stderr saying so. Follow
 [First run: finding your company id](#first-run-finding-your-company-id).
 
 ### Tools work but every list comes back empty
@@ -536,6 +586,25 @@ question entirely. See [Timestamps must carry a timezone](#timestamps-must-carry
 If the rejection says the value is in the future, that is `to` — it may not be later than now, give
 or take 24 hours of clock skew.
 
+### A metric call was refused and named a device in another company
+
+`lumics_get_device_metrics` and `lumics_get_device_item_metrics` take no `companyId`, so they check
+the pin by reading the device inside `LUMICS_COMPANY_ID` first. A `not_permitted` refusal there means
+the device is in a different Lumics company, or does not exist at all; no metric request was made.
+Pick a device with `lumics_list_devices`, which lists only the configured company. See
+[Cross-company access is off by default](#cross-company-access-is-off-by-default).
+
+### The server refuses to start and says `LUMICS_BASE_URL must use https:`
+
+Your `LUMICS_BASE_URL` is a plain `http:` URL for a host that is not loopback. The Lumics token is a
+bearer credential sent on every request, so over plaintext to a remote host it crosses the network in
+the clear and is readable by anything on the path. Switch the URL to `https:`.
+
+Plain `http:` is accepted only for `127.0.0.1`, `localhost`, or `[::1]`, which covers a local
+development proxy. The comparison is exact, so a host like `localhost.example.invalid` gets no
+exemption. No environment flag widens this — if a deployment genuinely needs plaintext to a remote
+host, terminate TLS in front of Lumics or tunnel to loopback.
+
 ### The server refuses to start with `LUMICS_TRANSPORT=http`
 
 That is deliberate in 0.1.0, not a bug. See
@@ -547,6 +616,17 @@ Configuration is validated at startup and the message names the variable and wha
 Read it on **stderr** — most clients hide server stderr behind a "server disconnected" message, so
 check your client's MCP log rather than concluding the server is broken. Nothing is requested and no
 credential is read when validation fails.
+
+### I need to see what the server is actually doing
+
+Turn the verbosity up with `LUMICS_LOG_LEVEL=debug` and restart. Diagnostics go to **stderr** —
+stdout is the MCP protocol channel and carries nothing else — so look in your client's MCP log.
+
+`debug` adds a record per tool call: which tool, how long it took, how many characters it returned,
+whether a list reached the `limit` it asked for, and how many items the output budget dropped. That is
+what to reach for when a tool returns less than you expected. The default is `info`; `warn` and
+`error` are quieter, and `silent` turns the stream off entirely for a supervisor that treats any
+stderr output as a fault.
 
 ---
 
@@ -560,7 +640,7 @@ present the right confirmation prompts.
 **39 tools exist; 37 are registered in a default deployment.** The two missing are
 `lumics_batch_update_devices` and `lumics_revoke_tokens`, each behind its own environment flag. With
 `LUMICS_READ_ONLY=1` only the Read rows are registered, which is 20 tools. Without
-`LUMICS_COMPANY_ID` only the four tools that need no company are registered — see
+`LUMICS_COMPANY_ID` only the two tools that need no company are registered — see
 [First run](#first-run-finding-your-company-id).
 
 ### Devices
@@ -664,7 +744,12 @@ git clone https://github.com/ZenixSolutions/lumics-mcp.git
 cd lumics-mcp
 npm ci
 cp .env.example .env   # then set LUMICS_TOKEN, and LUMICS_COMPANY_ID once you have it
+npm run build
+node --env-file=.env dist/index.js
 ```
+
+The `--env-file` flag is how the `.env` gets read: the server does not look for one itself. See
+[The server does not read a `.env` file](#the-server-does-not-read-a-env-file).
 
 | Script                  | What it does                                                     |
 | ----------------------- | ---------------------------------------------------------------- |

@@ -74,16 +74,20 @@ reproducing the first result.
 | Default                                                               | 37               |
 | `LUMICS_READ_ONLY=1`                                                  | 20 (all Read)    |
 | `LUMICS_ENABLE_BATCH_UPDATE=1` and `LUMICS_ENABLE_TOKEN_REVOCATION=1` | 39               |
-| `LUMICS_COMPANY_ID` unset                                             | 4                |
+| `LUMICS_COMPANY_ID` unset                                             | 2                |
 
 The two tools missing from a default deployment are `lumics_batch_update_devices`
 (`LUMICS_ENABLE_BATCH_UPDATE`) and `lumics_revoke_tokens` (`LUMICS_ENABLE_TOKEN_REVOCATION`).
 
-Without `LUMICS_COMPANY_ID` the 34 company-scoped tools are withheld too, leaving `lumics_get_me`,
-`lumics_get_device_definition_components`, `lumics_get_device_metrics` and
-`lumics_get_device_item_metrics` — five, if `LUMICS_ENABLE_TOKEN_REVOCATION` is also on. See
-[`companyId` defaults](#companyid-defaults-to-lumics_company_id) for the bootstrap this exists to
-allow.
+Without `LUMICS_COMPANY_ID` the 36 company-scoped tools are withheld too, leaving
+`lumics_get_me` and `lumics_get_device_definition_components` — three, if
+`LUMICS_ENABLE_TOKEN_REVOCATION` is also on, since token revocation is scoped to the token's own user
+rather than to a company. See [`companyId` defaults](#companyid-defaults-to-lumics_company_id) for the
+bootstrap this exists to allow.
+
+`lumics_get_device_metrics` and `lumics_get_device_item_metrics` count as company-scoped even though
+they take no `companyId`: they enforce the company pin with a device-ownership read against
+`LUMICS_COMPANY_ID`, so with no company configured there is nothing to check the device against.
 
 Gating is **registration-time**, not a runtime refusal: a tool that is gated off does not appear in
 `tools/list` at all, so a model cannot see it, cannot try it, and cannot narrate a refusal as a
@@ -129,13 +133,33 @@ tenant's data: identity keys differ per endpoint (`id` on most list reads, `_id`
 the single ipgroup read, and every create/update/delete payload), and component objects carry the
 Mongoose internals `__t` (discriminator, e.g. `"pingtcp.Port"`) and `__v` (version key).
 
-Output is capped at `LUMICS_MAX_OUTPUT_CHARS` (default 25,000). Arrays shed whole items from the end
-so what survives still parses; a single large object is cut. **Either way the response says so, with
-a count of what was dropped.** Truncation is never silent.
+`LUMICS_MAX_OUTPUT_CHARS` caps the entire text a tool returns — disclosure notes and JSON payload
+together. Notes are reserved first and the payload is fitted to what remains, so output never exceeds
+the budget except in one case: when the mandatory disclosures alone are longer than the budget they
+are still emitted in full and the payload is reduced to nothing, because a disclosure is never dropped
+or shortened to save space.
+
+Within that budget, arrays shed whole items from the end so what survives still parses; a single large
+object is cut. **Either way the response says so, with a count of what was dropped.** Truncation is
+never silent.
 
 Errors come back as `isError: true` with the text `<code>: <message>` — for example
 `not_found: …` or `not_permitted: …`. Credential material is stripped structurally at the error
 boundary before anything is logged or returned.
+
+One error shape is worth knowing in advance. When a **write** (`POST`, `PATCH`, `DELETE`) fails at the
+transport — a dropped connection, a timeout, an incomplete response body — the server makes exactly
+one attempt and the error says the request **may already have been applied**, then instructs a
+verifying read. It does not say "retry the call", because the transport cannot distinguish a request
+Lumics never processed from one it processed and then failed to answer, and replaying it would
+duplicate a record, double-apply a change, or 404 on a record the first attempt deleted. Do not report
+a write as failed on the strength of such an error: read the record back, or list its parent
+collection, and report what is actually there.
+
+`DELETE` is in that set alongside `POST` and `PATCH` even though HTTP calls it idempotent —
+idempotence guarantees the same state, not the same answer, and a replayed delete returns `not_found`,
+which reads as "the record never existed". Retries triggered by a **status code** are unaffected and
+still apply to every verb, `429` included: a status proves the server answered.
 
 ---
 
@@ -267,6 +291,16 @@ when the visible rows are fewer than the rows that were summarised.
 Client-side ranking is the honest option here. The alternative — leaving a model to sort a large
 JSON blob in its head — is how a "top 10" ends up containing an eleventh device nobody checked.
 
+#### `topN` is per item class, not per response
+
+Lumics keys its `data` by item class (spec §12.4 documents `devices`; a tenant can return others, such
+as pools). Sorting and trimming happen **inside each class**, so `topN` is not a cap on the response:
+with `topN: 2` over two item classes you can get up to **four** rows back, and the top item of one
+class is not comparable with the top item of another because no ranking crosses a class boundary.
+
+The response says so whenever more than one class is present, whether or not any class was long enough
+to trim. For a single global top-N, pass `itemType` to reduce the response to one class.
+
 ### `companyId` defaults to `LUMICS_COMPANY_ID`
 
 Almost every Lumics route is scoped to a company. Rather than making callers repeat the id, every
@@ -282,12 +316,25 @@ an operator setting; nothing in a conversation can change it. When it _is_ on, e
 description says so explicitly, so a client's approval prompt shows the human that a foreign
 `companyId` will be honoured.
 
-Five tools take no `companyId`, because their endpoints have no company segment:
+Five tools take no `companyId` **argument**, because their endpoints have no company segment:
 `lumics_get_device_definition_components` (platform metadata), `lumics_get_device_metrics` and
-`lumics_get_device_item_metrics` (scoped by device id), and `lumics_get_me` and
+`lumics_get_device_item_metrics` (addressed by device id), and `lumics_get_me` and
 `lumics_revoke_tokens` (scoped to the token's own user).
 
-**`LUMICS_COMPANY_ID` is optional, and those same five tools are what you get without it.** The
+**No argument does not mean no pin.** The two device-scoped metric tools are covered by it, and
+enforce it with a **device-ownership read** instead: before any metric request, the device is fetched
+inside `LUMICS_COMPANY_ID` (spec §7.2), and the metric read is issued only if that confirms the device
+belongs there. A device in another company is refused with `not_permitted` and no metric request is
+made; a 404 from the scoped read, or a device record carrying no `company` field, is also a refusal,
+because an unverified owner is not a verified one. This costs **one extra round trip per call**. The
+check is skipped when the operator has set `LUMICS_ALLOW_CROSS_COMPANY`, since there is then no pin to
+enforce. `deviceId` is exactly the kind of value that arrives from a document or another tool's output,
+and the metric path carries no company segment of its own to constrain it, so the absence of this gate
+was the absence of the control rather than a narrower version of it.
+
+Because that check needs a configured company, both metric tools are company-scoped for registration
+purposes. **`LUMICS_COMPANY_ID` is optional, and without it you get two tools: `lumics_get_me` and
+`lumics_get_device_definition_components`** (plus `lumics_revoke_tokens` if its flag is on). The
 server starts, registers only the tools that need no company, and logs a warning. That is
 deliberate: the documented way to discover a company id is `lumics_get_me`, and a server that
 refused to start without the id could not run the tool that finds it. The bootstrap is therefore:
@@ -313,7 +360,9 @@ state impact at the point of action.
 
 **The real gate is the environment.** `LUMICS_READ_ONLY` and the two `LUMICS_ENABLE_*` flags are set
 by the human who deploys the server, out of band from the conversation, and no prompt can change
-them. When a flag is absent the tool is not registered, so there is no call for a model to attempt.
+them — nor can a file, since the server reads no `.env` of its own
+([SECURITY.md](../SECURITY.md#configuration-is-not-read-from-the-filesystem)). When a flag is absent
+the tool is not registered, so there is no call for a model to attempt.
 See [ADR-002](./adr/ADR-002-security-posture-and-capability-reductions.md), which says the same
 thing at greater length.
 
@@ -1141,7 +1190,9 @@ Five tools, one per endpoint in spec §12 — note that §12.3 documents two. Re
 [`lumics_get_metric_summary` ranks locally](#lumics_get_metric_summary-ranks-locally) before using
 any of them; those three behaviours apply across the group and are not repeated per tool.
 
-All five are **Read**, so all five are available under `LUMICS_READ_ONLY=1`.
+All five are **Read**, so all five are available under `LUMICS_READ_ONLY=1`. Two of them —
+`lumics_get_device_metrics` and `lumics_get_device_item_metrics` — additionally require
+`LUMICS_COMPANY_ID`, because that is what they check a device's ownership against.
 
 ### The shared metric argument set
 
@@ -1252,7 +1303,7 @@ lower `minIntervals` — that is how the vendor's own example gets buckets out o
 
 - **Class:** Read
 - **Endpoint:** `GET /metrics/devices/:id/modules/:moduleType` (spec §12.3)
-- **Gating:** none
+- **Gating:** requires `LUMICS_COMPANY_ID` — see below
 
 | Argument                         | Type   | Required     | Default   | Constraints                                      |
 | -------------------------------- | ------ | ------------ | --------- | ------------------------------------------------ |
@@ -1260,7 +1311,11 @@ lower `minIntervals` — that is how the vendor's own example gets buckets out o
 | `moduleType`                     | string | **Required** | —         | Polling module name                              |
 | _the shared metric argument set_ |        | Optional     | see above | `sum` is **not** accepted here                   |
 
-**No `companyId`** — the device id alone identifies the scope; this path has no company segment.
+**No `companyId`** — this path has no company segment, so the device id addresses the request on its
+own. The company pin still applies: this server reads the device inside `LUMICS_COMPANY_ID` first and
+refuses the call if the device belongs elsewhere, which costs one extra request and means the tool is
+**not registered when `LUMICS_COMPANY_ID` is unset**. See
+[`companyId` defaults](#companyid-defaults-to-lumics_company_id).
 
 **Returns** the same envelope shape as §12.1: a row per component per bucket. This is the tool for
 "how is this device doing" — every fan, interface, pool or volume the named module polls on it. Pair
@@ -1272,7 +1327,7 @@ unset for a series. For one specific component, or the device's own device-level
 
 - **Class:** Read
 - **Endpoint:** `GET /metrics/devices/:id/modules/:moduleType/:item` (spec §12.3)
-- **Gating:** none
+- **Gating:** requires `LUMICS_COMPANY_ID` — see below
 
 | Argument                         | Type   | Required     | Default   | Constraints                                                                                                                                                 |
 | -------------------------------- | ------ | ------------ | --------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
@@ -1281,7 +1336,9 @@ unset for a series. For one specific component, or the device's own device-level
 | `itemId`                         | string | **Required** | —         | 24-char hex ObjectId. **Pass the device's own id for device-level metrics** (CPU, memory, uptime), or a component id for one interface, fan, pool or volume |
 | _the shared metric argument set_ |        | Optional     | see above | Neither `sum` nor `itemType` is accepted — the item is already identified                                                                                   |
 
-**No `companyId`.**
+**No `companyId`**, and the same device-ownership check as `lumics_get_device_metrics`: the device is
+read inside `LUMICS_COMPANY_ID` before any metric request, one extra round trip, and the tool is not
+registered when `LUMICS_COMPANY_ID` is unset.
 
 **Returns** the `data` array of time buckets, typically carrying `min`, `max` and `avg` per property
 plus `parentId` and `parentName` for the owning device (envelope `type: "minMaxAvg"`).
@@ -1295,18 +1352,18 @@ checking one thing.
 - **Endpoint:** `GET /companies/:companyId/metrics/summaries/:moduleType` (spec §12.4)
 - **Gating:** none
 
-| Argument        | Type    | Required     | Default             | Constraints                                                                                                                                                                         |
-| --------------- | ------- | ------------ | ------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `moduleType`    | string  | **Required** | —                   | Polling module name                                                                                                                                                                 |
-| `companyId`     | string  | Optional     | `LUMICS_COMPANY_ID` | 24-char hex ObjectId                                                                                                                                                                |
-| `itemType`      | string  | Optional     | all types           | `device` for device-level summaries, or a component type for component-level ones                                                                                                   |
-| `properties`    | string  | Optional     | all properties      | Comma-separated metric property paths                                                                                                                                               |
-| `lookback`      | string  | Optional     | `1h`                | As in the shared set                                                                                                                                                                |
-| `from`, `to`    | string  | Optional     | see shared set      | ISO-8601 with an explicit zone, as in the shared set                                                                                                                                |
-| `sortBy`        | string  | Optional     | no sort             | 1–200 characters. Dot-separated path to the numeric value to rank by, resolved against the item and then inside its `stats` — e.g. `Calculated.cpu.avg`. **Applied by this server** |
-| `sortDirection` | enum    | Optional     | `desc`              | `desc` (largest first) or `asc`. **Applied by this server**                                                                                                                         |
-| `topN`          | integer | Optional     | keep everything     | 1–1000. A client-side trim of a full response, not a server-side limit                                                                                                              |
-| `fields`        | array   | Optional     | all fields          | ≤ 50 names                                                                                                                                                                          |
+| Argument        | Type    | Required     | Default             | Constraints                                                                                                                                                                                                |
+| --------------- | ------- | ------------ | ------------------- | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `moduleType`    | string  | **Required** | —                   | Polling module name                                                                                                                                                                                        |
+| `companyId`     | string  | Optional     | `LUMICS_COMPANY_ID` | 24-char hex ObjectId                                                                                                                                                                                       |
+| `itemType`      | string  | Optional     | all types           | `device` for device-level summaries, or a component type for component-level ones                                                                                                                          |
+| `properties`    | string  | Optional     | all properties      | Comma-separated metric property paths                                                                                                                                                                      |
+| `lookback`      | string  | Optional     | `1h`                | As in the shared set                                                                                                                                                                                       |
+| `from`, `to`    | string  | Optional     | see shared set      | ISO-8601 with an explicit zone, as in the shared set                                                                                                                                                       |
+| `sortBy`        | string  | Optional     | no sort             | 1–200 characters. Dot-separated path to the numeric value to rank by, resolved against the item and then inside its `stats` — e.g. `Calculated.cpu.avg`. **Applied by this server**                        |
+| `sortDirection` | enum    | Optional     | `desc`              | `desc` (largest first) or `asc`. **Applied by this server**                                                                                                                                                |
+| `topN`          | integer | Optional     | keep everything     | 1–1000. A client-side trim of a full response, not a server-side limit — and applied [**per item class**](#topn-is-per-item-class-not-per-response), so with two classes you can get up to `2 × topN` rows |
+| `fields`        | array   | Optional     | all fields          | ≤ 50 names                                                                                                                                                                                                 |
 
 **This endpoint has a much smaller parameter surface than the rest of the group.** Only `itemType`,
 `properties`, `fromMs` and `toMs` are documented (spec §12.4), so **no `dataPoints`, `width`,

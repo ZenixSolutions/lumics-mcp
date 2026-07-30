@@ -30,14 +30,15 @@ import {
   TEST_COMPONENT_ID,
   TEST_DEVICE_ID,
 } from '../helpers/config.js';
-import { jsonResponse, recordFetch } from '../helpers/fetch.js';
-import { connect } from '../helpers/mcp.js';
 import {
-  exchange,
-  expectNoFabricatedPagination,
-  expectNoFabricatedQueryParams,
-  failingExchange,
-} from '../helpers/tools.js';
+  jsonResponse,
+  recordFetch,
+  type FetchRecorder,
+  type RecordedCall,
+} from '../helpers/fetch.js';
+import { connect, notesOf, payloadOf } from '../helpers/mcp.js';
+import { expectNoFabricatedPagination, expectNoFabricatedQueryParams } from '../helpers/tools.js';
+import type { LumicsConfig } from '../../src/config.js';
 
 const C = TEST_COMPANY_ID;
 const HOUR_MS = 3_600_000;
@@ -79,6 +80,86 @@ const DATA_ENDPOINTS: readonly {
   },
 ];
 
+/**
+ * The device-scoped metric tools (spec §12.3) now resolve the device's owning
+ * company with a company-scoped device read before they read any metrics, so the
+ * cross-company pin covers a path that carries no company segment. That makes a
+ * device metric call two requests rather than one, so these tests answer the
+ * ownership read with a device in the configured company and assert against the
+ * metric request itself. `tests/security/company-scoping.test.ts` asserts the pin.
+ */
+const OWNED_DEVICE = { id: TEST_DEVICE_ID, name: 'edge-switch-1', company: C };
+
+interface MetricExchange {
+  readonly call: RecordedCall;
+  readonly calls: readonly RecordedCall[];
+  readonly text: string;
+  readonly payload: unknown;
+  readonly notes: string;
+}
+
+/** A fetch that serves the ownership read, then the supplied metric response. */
+function metricFetch(response: unknown): FetchRecorder {
+  return recordFetch((call) =>
+    call.path.startsWith(`/companies/${C}/devices/`)
+      ? jsonResponse(OWNED_DEVICE)
+      : jsonResponse(response),
+  );
+}
+
+/** Like `exchange`, but tolerant of the ownership pre-read. `call` is the metric call. */
+async function metricExchange(
+  tool: string,
+  args: Record<string, unknown>,
+  response: unknown,
+  options: { readonly config?: LumicsConfig } = {},
+): Promise<MetricExchange> {
+  const fetcher = metricFetch(response);
+  const harness = await connect(options.config ?? makeConfig(), {
+    clientOptions: { fetchImpl: fetcher.fetchImpl },
+  });
+  try {
+    const called = await harness.call(tool, args);
+    if (called.isError === true) {
+      const block = called.content[0];
+      throw new Error(
+        `${tool} returned an error result: ${block?.type === 'text' ? block.text : '?'}`,
+      );
+    }
+    const text = called.content[0]?.type === 'text' ? called.content[0].text : '';
+    return {
+      call: fetcher.last(),
+      calls: fetcher.calls,
+      text,
+      payload: payloadOf(text),
+      notes: notesOf(text),
+    };
+  } finally {
+    await harness.close();
+  }
+}
+
+/** The failing counterpart, with the same ownership stub. */
+async function failingMetricExchange(
+  tool: string,
+  args: Record<string, unknown>,
+  response: unknown = {},
+  options: { readonly config?: LumicsConfig } = {},
+): Promise<{ readonly text: string; readonly calls: readonly RecordedCall[] }> {
+  const fetcher = metricFetch(response);
+  const harness = await connect(options.config ?? makeConfig(), {
+    clientOptions: { fetchImpl: fetcher.fetchImpl },
+  });
+  try {
+    const called = await harness.call(tool, args);
+    expect(called.isError, `${tool} was expected to fail`).toBe(true);
+    const block = called.content[0];
+    return { text: block?.type === 'text' ? block.text : '', calls: fetcher.calls };
+  } finally {
+    await harness.close();
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Prototype defect 1: dataPoints is required and must always be sent
 // ---------------------------------------------------------------------------
@@ -87,7 +168,7 @@ describe('dataPoints is sent by default on all four metric-data endpoints (spec 
   it.each(DATA_ENDPOINTS.map((entry) => [entry.tool, entry] as const))(
     '%s sends dataPoints even when the caller supplies none',
     async (_name, entry: (typeof DATA_ENDPOINTS)[number]) => {
-      const { call } = await exchange(entry.tool, entry.args, SERIES);
+      const { call } = await metricExchange(entry.tool, entry.args, SERIES);
       expect(call.path).toBe(entry.path);
       // The API rejects a metric call with neither dataPoints nor width.
       expect(call.query.dataPoints).toBe(String(DEFAULT_METRIC_DATA_POINTS));
@@ -97,7 +178,7 @@ describe('dataPoints is sent by default on all four metric-data endpoints (spec 
   it.each(DATA_ENDPOINTS.map((entry) => [entry.tool, entry] as const))(
     "%s discloses that the resolution was this server's default",
     async (_name, entry: (typeof DATA_ENDPOINTS)[number]) => {
-      const { notes } = await exchange(entry.tool, entry.args, SERIES);
+      const { notes } = await metricExchange(entry.tool, entry.args, SERIES);
       expect(notes).toContain(`dataPoints=${String(DEFAULT_METRIC_DATA_POINTS)}`);
       expect(notes).toContain("this server's default");
       expect(notes).toContain('rejects a metric call with neither');
@@ -107,7 +188,11 @@ describe('dataPoints is sent by default on all four metric-data endpoints (spec 
   it.each(DATA_ENDPOINTS.map((entry) => [entry.tool, entry] as const))(
     '%s honours an explicit dataPoints and stops calling it a default',
     async (_name, entry: (typeof DATA_ENDPOINTS)[number]) => {
-      const { call, notes } = await exchange(entry.tool, { ...entry.args, dataPoints: 5 }, SERIES);
+      const { call, notes } = await metricExchange(
+        entry.tool,
+        { ...entry.args, dataPoints: 5 },
+        SERIES,
+      );
       expect(call.query.dataPoints).toBe('5');
       expect(notes).toContain('dataPoints=5.');
       expect(notes).not.toContain("this server's default");
@@ -115,7 +200,7 @@ describe('dataPoints is sent by default on all four metric-data endpoints (spec 
   );
 
   it('never exposes width, which would silently override dataPoints', async () => {
-    const { call } = await exchange(
+    const { call } = await metricExchange(
       'lumics_get_company_metrics',
       { moduleType: 'snmp', width: 1_920 },
       SERIES,
@@ -125,7 +210,7 @@ describe('dataPoints is sent by default on all four metric-data endpoints (spec 
   });
 
   it.each([0, -1, 5_001, 1.5])('rejects a dataPoints of %s locally', async (dataPoints) => {
-    const { calls } = await failingExchange('lumics_get_company_metrics', {
+    const { calls } = await failingMetricExchange('lumics_get_company_metrics', {
       moduleType: 'snmp',
       dataPoints,
     });
@@ -139,7 +224,7 @@ describe('dataPoints is sent by default on all four metric-data endpoints (spec 
 
 describe('sum is a string enum on summarize (spec section 12.2)', () => {
   it.each(METRIC_SUM_PROPERTIES)('sends sum=%s verbatim', async (sum) => {
-    const { call, notes } = await exchange(
+    const { call, notes } = await metricExchange(
       'lumics_summarize_company_metrics',
       { moduleType: 'snmp', sum },
       SERIES,
@@ -155,7 +240,7 @@ describe('sum is a string enum on summarize (spec section 12.2)', () => {
     ['1', 1],
     ['an undocumented value', 'total'],
   ])('rejects a sum of %s before spending a request', async (_label, sum) => {
-    const { calls } = await failingExchange('lumics_summarize_company_metrics', {
+    const { calls } = await failingMetricExchange('lumics_summarize_company_metrics', {
       moduleType: 'snmp',
       sum,
     });
@@ -163,7 +248,7 @@ describe('sum is a string enum on summarize (spec section 12.2)', () => {
   });
 
   it('omits sum entirely when it was not asked for, and says the result is an AVERAGE', async () => {
-    const { call, notes } = await exchange(
+    const { call, notes } = await metricExchange(
       'lumics_summarize_company_metrics',
       { moduleType: 'snmp' },
       SERIES,
@@ -177,7 +262,7 @@ describe('sum is a string enum on summarize (spec section 12.2)', () => {
     for (const entry of DATA_ENDPOINTS.filter(
       (candidate) => candidate.tool !== 'lumics_summarize_company_metrics',
     )) {
-      const { call } = await exchange(entry.tool, { ...entry.args, sum: 'avg' }, SERIES);
+      const { call } = await metricExchange(entry.tool, { ...entry.args, sum: 'avg' }, SERIES);
       expect(call.url.searchParams.has('sum'), `${entry.tool} must not send sum`).toBe(false);
     }
   });
@@ -189,7 +274,7 @@ describe('sum is a string enum on summarize (spec section 12.2)', () => {
 
 describe('the shared metric query surface maps exactly onto spec section 12.0', () => {
   it('sends fromMs and toMs as epoch milliseconds derived from a lookback', async () => {
-    const { call } = await exchange(
+    const { call } = await metricExchange(
       'lumics_get_company_metrics',
       { moduleType: 'snmp', lookback: '6h' },
       SERIES,
@@ -204,7 +289,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   });
 
   it('defaults to a one-hour window, matching the API default', async () => {
-    const { call, notes } = await exchange(
+    const { call, notes } = await metricExchange(
       'lumics_get_company_metrics',
       { moduleType: 'snmp' },
       SERIES,
@@ -214,7 +299,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   });
 
   it('converts an ISO-8601 from/to pair, so a model never computes epoch ms', async () => {
-    const { call } = await exchange(
+    const { call } = await metricExchange(
       'lumics_get_company_metrics',
       { moduleType: 'snmp', from: '2026-07-28T00:00:00Z', to: '2026-07-29T00:00:00Z' },
       SERIES,
@@ -224,7 +309,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   });
 
   it('passes every documented optional parameter straight through', async () => {
-    const { call } = await exchange(
+    const { call } = await metricExchange(
       'lumics_get_company_metrics',
       {
         moduleType: 'snmp',
@@ -256,7 +341,11 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   });
 
   it('omits every optional parameter the caller did not set', async () => {
-    const { call } = await exchange('lumics_get_company_metrics', { moduleType: 'snmp' }, SERIES);
+    const { call } = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp' },
+      SERIES,
+    );
     // Only the three the server always sends: the window and the resolution.
     // `limit` is NOT among them — see the metric-row-cap block below.
     expect(Object.keys(call.query).sort()).toEqual(['dataPoints', 'fromMs', 'toMs']);
@@ -264,7 +353,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   });
 
   it.each(METRIC_INTERVALS)('accepts the documented interval %s', async (interval) => {
-    const { call } = await exchange(
+    const { call } = await metricExchange(
       'lumics_get_company_metrics',
       { moduleType: 'snmp', interval },
       SERIES,
@@ -273,7 +362,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   });
 
   it('rejects an undocumented interval', async () => {
-    const { calls } = await failingExchange('lumics_get_company_metrics', {
+    const { calls } = await failingMetricExchange('lumics_get_company_metrics', {
       moduleType: 'snmp',
       interval: 'week',
     });
@@ -282,7 +371,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
 
   it('never sends componentQuery or filters, even if a caller supplies them (ADR-002 decision 3)', async () => {
     for (const entry of DATA_ENDPOINTS) {
-      const { call } = await exchange(
+      const { call } = await metricExchange(
         entry.tool,
         { ...entry.args, componentQuery: '{"$where":"1"}', filters: '{"a":1}' },
         SERIES,
@@ -293,7 +382,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   });
 
   it('rejects a from/lookback conflict rather than guessing', async () => {
-    const { calls, text } = await failingExchange('lumics_get_company_metrics', {
+    const { calls, text } = await failingMetricExchange('lumics_get_company_metrics', {
       moduleType: 'snmp',
       from: '2026-07-28T00:00:00Z',
       lookback: '6h',
@@ -303,7 +392,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   });
 
   it('rejects a garbage lookback at the schema, before the time layer sees it', async () => {
-    const { calls } = await failingExchange('lumics_get_company_metrics', {
+    const { calls } = await failingMetricExchange('lumics_get_company_metrics', {
       moduleType: 'snmp',
       lookback: 'last week',
     });
@@ -311,7 +400,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
   });
 
   it('rejects a reversed window', async () => {
-    const { calls, text } = await failingExchange('lumics_get_company_metrics', {
+    const { calls, text } = await failingMetricExchange('lumics_get_company_metrics', {
       moduleType: 'snmp',
       from: '2026-07-29T00:00:00Z',
       to: '2026-07-28T00:00:00Z',
@@ -327,7 +416,7 @@ describe('the shared metric query surface maps exactly onto spec section 12.0', 
 
 describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   it('returns the data array, not the envelope', async () => {
-    const { payload } = await exchange(
+    const { payload } = await metricExchange(
       'lumics_get_device_metrics',
       { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
       SERIES,
@@ -336,7 +425,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   });
 
   it('reports the window Lumics actually served, which alignTimeRange can change', async () => {
-    const { notes } = await exchange(
+    const { notes } = await metricExchange(
       'lumics_get_device_metrics',
       { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', alignTimeRange: true },
       SERIES,
@@ -349,7 +438,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   });
 
   it('reads an epoch-millisecond envelope window as well as an ISO one', async () => {
-    const { notes } = await exchange(
+    const { notes } = await metricExchange(
       'lumics_get_device_metrics',
       { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
       { data: [], fromMs: Date.UTC(2026, 6, 29, 11), toMs: Date.UTC(2026, 6, 29, 12) },
@@ -358,7 +447,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   });
 
   it('omits the effective-window note when the envelope carries no metadata', async () => {
-    const { notes } = await exchange(
+    const { notes } = await metricExchange(
       'lumics_get_device_metrics',
       { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
       { data: [] },
@@ -368,7 +457,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   });
 
   it('treats an absent body as an empty series rather than failing', async () => {
-    const { payload } = await exchange(
+    const { payload } = await metricExchange(
       'lumics_get_device_metrics',
       { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
       null,
@@ -377,7 +466,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   });
 
   it('treats a missing data key as an empty series', async () => {
-    const { payload } = await exchange(
+    const { payload } = await metricExchange(
       'lumics_get_device_metrics',
       { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
       { from: '2026-07-29T11:00:00.000Z' },
@@ -389,7 +478,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
     ['an array where an envelope was documented', [{ time: 1 }]],
     ['a string', 'nope'],
   ])('surfaces %s as documented drift', async (_label, response) => {
-    const { text } = await failingExchange(
+    const { text } = await failingMetricExchange(
       'lumics_get_device_metrics',
       { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
       response,
@@ -398,7 +487,7 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
   });
 
   it('surfaces a non-array data field as drift', async () => {
-    const { text } = await failingExchange(
+    const { text } = await failingMetricExchange(
       'lumics_get_device_metrics',
       { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' },
       { data: { nope: true } },
@@ -406,19 +495,37 @@ describe('the metric envelope is unwrapped and its metadata disclosed', () => {
     expect(text).toContain('documented as an array');
   });
 
-  it('discloses truncation when the row count equals the limit', async () => {
-    const { notes } = await exchange(
-      'lumics_get_company_metrics',
-      { moduleType: 'snmp', limit: 2 },
-      { data: [{ time: 1 }, { time: 2 }] },
-    );
-    expect(notes).toContain('NOTE ON COMPLETENESS:');
-  });
+  /**
+   * The same defect class as finding B2, on the metric path this time. All four
+   * series tools passed `requestedLimit`, so `listCompletenessNote` fired next to
+   * `metricRowCapNote` and a single response carried "drop this limit" and
+   * "re-run with a higher limit" together. `metricRowCapNote` already covers a
+   * capped series honestly, and inventory framing is the wrong reading of one.
+   */
+  it.each(DATA_ENDPOINTS.map((entry) => [entry.tool, entry.args] as const))(
+    '%s describes a capped series once, without inventory advice',
+    async (tool, args) => {
+      const { notes } = await metricExchange(
+        tool,
+        { ...args, limit: 3 },
+        { data: [{ time: 1 }, { time: 2 }, { time: 3 }] },
+      );
+
+      expect(notes).toContain('ROW COUNT:');
+      expect(notes).toContain('at most 3 row(s)');
+      // The series wording tells the model to drop the limit; the inventory
+      // wording tells it to raise it. They must never appear together.
+      expect(notes).toContain('drop this limit');
+      expect(notes).not.toContain('NOTE ON COMPLETENESS:');
+      expect(notes).not.toContain('higher limit');
+      expect(notes).not.toContain('complete inventory');
+    },
+  );
 });
 
 describe('lumics_get_device_item_metrics has a deliberately reduced surface', () => {
   it('does not send itemType, because the item is already named', async () => {
-    const { call } = await exchange(
+    const { call } = await metricExchange(
       'lumics_get_device_item_metrics',
       {
         deviceId: TEST_DEVICE_ID,
@@ -432,7 +539,7 @@ describe('lumics_get_device_item_metrics has a deliberately reduced surface', ()
   });
 
   it('takes the device id as the item id for device-level metrics', async () => {
-    const { call } = await exchange(
+    const { call } = await metricExchange(
       'lumics_get_device_item_metrics',
       { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', itemId: TEST_DEVICE_ID },
       SERIES,
@@ -460,7 +567,7 @@ describe('metric tools never cap a series the caller did not ask to cap (finding
   it.each(DATA_ENDPOINTS.map((entry) => [entry.tool, entry.args] as const))(
     '%s sends no limit by default',
     async (tool, args) => {
-      const { call } = await exchange(tool, args, SERIES);
+      const { call } = await metricExchange(tool, args, SERIES);
       expect(call.query.limit).toBeUndefined();
       expect(call.url.searchParams.has('limit')).toBe(false);
     },
@@ -469,13 +576,17 @@ describe('metric tools never cap a series the caller did not ask to cap (finding
   it.each(DATA_ENDPOINTS.map((entry) => [entry.tool, entry.args] as const))(
     '%s sends a limit only when the caller supplied one',
     async (tool, args) => {
-      const { call } = await exchange(tool, { ...args, limit: 25 }, SERIES);
+      const { call } = await metricExchange(tool, { ...args, limit: 25 }, SERIES);
       expect(call.query.limit).toBe('25');
     },
   );
 
   it('discloses that no cap was applied, and how a budget trim would differ', async () => {
-    const { notes } = await exchange('lumics_get_company_metrics', { moduleType: 'snmp' }, SERIES);
+    const { notes } = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp' },
+      SERIES,
+    );
     expect(notes).toContain('ROW COUNT:');
     expect(notes).toContain('no result cap was sent to Lumics');
     // A budget trim drops from the END, so the loss is positional and sayable.
@@ -484,7 +595,7 @@ describe('metric tools never cap a series the caller did not ask to cap (finding
   });
 
   it('describes an explicit cap as SERIES truncation, not as inventory completeness', async () => {
-    const { notes } = await exchange(
+    const { notes } = await metricExchange(
       'lumics_get_company_metrics',
       { moduleType: 'snmp', limit: 25 },
       SERIES,
@@ -533,9 +644,14 @@ describe('metric tools never cap a series the caller did not ask to cap (finding
         stats: { status: { avg: index, blob: 'x'.repeat(80) } },
       })),
     };
-    const { text } = await exchange('lumics_get_company_metrics', { moduleType: 'snmp' }, many, {
-      config: makeConfig({ maxOutputChars: 2_000 }),
-    });
+    const { text } = await metricExchange(
+      'lumics_get_company_metrics',
+      { moduleType: 'snmp' },
+      many,
+      {
+        config: makeConfig({ maxOutputChars: 2_000 }),
+      },
+    );
     expect(text).toContain('NOTE ON TRUNCATION:');
     expect(text).toContain('items were dropped');
     // No completeness note, because no limit was sent.
@@ -587,7 +703,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('GETs the summaries path', async () => {
-    const { call } = await exchange(
+    const { call } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp' },
       summary([item('a', 1)]),
@@ -597,7 +713,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('sends exactly fromMs and toMs when nothing else was supplied', async () => {
-    const { call } = await exchange(
+    const { call } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp' },
       summary([]),
@@ -606,7 +722,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('sends exactly fromMs, toMs, itemType and properties — and nothing else', async () => {
-    const { call } = await exchange(
+    const { call } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp', itemType: 'device', properties: 'Calculated.cpu' },
       summary([]),
@@ -638,7 +754,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
     ['componentQuery', '{"$where":"1"}'],
     ['filters', '{"a":1}'],
   ])('never sends %s, which this endpoint does not accept', async (parameter, value) => {
-    const { call } = await exchange(
+    const { call } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp', [parameter]: value },
       summary([item('a', 1)]),
@@ -649,7 +765,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('discloses that the endpoint has no server-side limit or pagination at all', async () => {
-    const { notes } = await exchange(
+    const { notes } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp' },
       summary([item('a', 1)]),
@@ -661,7 +777,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('ranks descending by default and says the sort was local', async () => {
-    const { payload, notes } = await exchange(
+    const { payload, notes } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp', sortBy: 'Calculated.cpu.avg' },
       summary([item('low', 10), item('high', 90), item('mid', 50)]),
@@ -677,7 +793,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('ranks ascending when asked', async () => {
-    const { payload, notes } = await exchange(
+    const { payload, notes } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp', sortBy: 'Calculated.cpu.avg', sortDirection: 'asc' },
       summary([item('low', 10), item('high', 90)]),
@@ -687,7 +803,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('resolves a sortBy path both directly and inside stats', async () => {
-    const nested = await exchange(
+    const nested = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp', sortBy: 'stats.Calculated.cpu.avg' },
       summary([item('low', 10), item('high', 90)]),
@@ -697,7 +813,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
 
   it('puts unmeasured items last in BOTH directions and reports how many', async () => {
     for (const direction of ['desc', 'asc'] as const) {
-      const { payload, notes } = await exchange(
+      const { payload, notes } = await metricExchange(
         'lumics_get_metric_summary',
         { moduleType: 'snmp', sortBy: 'Calculated.cpu.avg', sortDirection: direction },
         summary([item('missing', undefined), item('low', 10), item('high', 90)]),
@@ -710,7 +826,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('ignores a non-numeric value at the sort path rather than ordering on it', async () => {
-    const { payload } = await exchange(
+    const { payload } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp', sortBy: 'Calculated.cpu.avg' },
       summary([
@@ -722,7 +838,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('trims to topN after the local sort and says how many were fetched but hidden', async () => {
-    const { payload, notes } = await exchange(
+    const { payload, notes } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp', sortBy: 'Calculated.cpu.avg', topN: 2 },
       summary([item('a', 10), item('b', 90), item('c', 50), item('d', 70)]),
@@ -733,7 +849,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('warns that topN without sortBy is not a real top-N', async () => {
-    const { notes } = await exchange(
+    const { notes } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp', topN: 1 },
       summary([item('a', 10), item('b', 90)]),
@@ -743,8 +859,18 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
     expect(notes).toContain('pass sortBy to make this a real top-1');
   });
 
+  it('does not claim a per-class trim when only one item class came back', async () => {
+    const { notes } = await metricExchange(
+      'lumics_get_metric_summary',
+      { moduleType: 'snmp', sortBy: 'Calculated.cpu.avg', topN: 1 },
+      summary([item('a', 10), item('b', 90)]),
+    );
+    expect(notes).toContain('Trimmed by THIS SERVER');
+    expect(notes).not.toContain('applied to EACH item class');
+  });
+
   it('does not trim when topN is larger than the result set', async () => {
-    const { payload, notes } = await exchange(
+    const { payload, notes } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp', topN: 10 },
       summary([item('a', 10)]),
@@ -754,7 +880,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('returns the single class array directly and names which key it came from', async () => {
-    const { payload, notes } = await exchange(
+    const { payload, notes } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp' },
       summary([item('a', 10)]),
@@ -764,7 +890,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('keeps the vendor keyed object when more than one item class came back', async () => {
-    const { payload } = await exchange(
+    const { payload } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp' },
       { data: { devices: [item('a', 1)], pools: [item('p', 2)] }, count: 2 },
@@ -790,7 +916,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
     });
 
     it('applies the fields projection inside every class', async () => {
-      const { payload } = await exchange(
+      const { payload } = await metricExchange(
         'lumics_get_metric_summary',
         { moduleType: 'snmp', fields: ['name'] },
         twoClasses([item('a', 1)], [item('p', 2)]),
@@ -804,7 +930,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
         name,
         stats: { Calculated: { cpu: { avg: 1, min: 0, max: 2 }, note: 'y'.repeat(200) } },
       });
-      const { payload, text } = await exchange(
+      const { payload, text } = await metricExchange(
         'lumics_get_metric_summary',
         { moduleType: 'snmp' },
         twoClasses(
@@ -825,6 +951,10 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
       expect(text).toContain('item(s) were dropped');
       // The old, useless advice must not reappear on this path.
       expect(text).not.toContain('may not parse');
+      // This branch fits the classes itself, so it has to reserve the notes the
+      // same way the shaping layer does, or the whole response blows the budget
+      // and the keyed object gets hard-truncated back into unparseable JSON.
+      expect(text.length).toBeLessThanOrEqual(2_000);
     });
 
     it('lets a fields projection actually save the payload, as the disclosure claims', async () => {
@@ -840,8 +970,10 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
       );
       const config = makeConfig({ maxOutputChars: 2_000 });
 
-      const unprojected = await exchange('lumics_get_metric_summary', args, response, { config });
-      const projected = await exchange(
+      const unprojected = await metricExchange('lumics_get_metric_summary', args, response, {
+        config,
+      });
+      const projected = await metricExchange(
         'lumics_get_metric_summary',
         { ...args, fields: ['name'] },
         response,
@@ -858,7 +990,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
 
     it('says which classes are present and how many items went missing', async () => {
       const bulky = (name: string) => ({ id: name, stats: { note: 'y'.repeat(300) } });
-      const { text } = await exchange(
+      const { text } = await metricExchange(
         'lumics_get_metric_summary',
         { moduleType: 'snmp' },
         twoClasses(
@@ -872,8 +1004,44 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
       expect(text).toContain('The dropped items exist');
     });
 
+    /**
+     * `topN` is applied inside each class, so `{devices:[90,80,70],
+     * interfaces:[95,85,75]}` with `topN: 2` returns four rows. That was only
+     * inferable from the two LOCAL RANKING notes, and the cross-class caveat
+     * lived in the truncation note, which fires only when the budget dropped
+     * something.
+     */
+    it('states that topN was applied per item class, not globally', async () => {
+      const { payload, notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp', sortBy: 'Calculated.cpu.avg', topN: 2 },
+        twoClasses(
+          [item('d1', 90), item('d2', 80), item('d3', 70)],
+          [item('i1', 95), item('i2', 85), item('i3', 75)],
+        ),
+      );
+
+      const classes = payload as Record<string, unknown[]>;
+      expect(classes.devices).toHaveLength(2);
+      expect(classes.pools).toHaveLength(2);
+      // Four rows came back for topN: 2, and the note has to say why.
+      expect(notes).toContain('applied to EACH item class');
+      expect(notes).toContain('2 item classes (devices, pools)');
+      expect(notes).toContain('up to 4 row(s)');
+      expect(notes).not.toContain('NOTE ON TRUNCATION:');
+    });
+
+    it('states the per-class caveat even when no class was long enough to trim', async () => {
+      const { notes } = await metricExchange(
+        'lumics_get_metric_summary',
+        { moduleType: 'snmp', sortBy: 'Calculated.cpu.avg', topN: 5 },
+        twoClasses([item('d1', 90)], [item('i1', 95)]),
+      );
+      expect(notes).toContain('applied to EACH item class');
+    });
+
     it('still ranks and trims per class before shedding', async () => {
-      const { payload, notes } = await exchange(
+      const { payload, notes } = await metricExchange(
         'lumics_get_metric_summary',
         { moduleType: 'snmp', sortBy: 'Calculated.cpu.avg', topN: 1 },
         twoClasses([item('a', 10), item('b', 90)], [item('p', 5), item('q', 50)]),
@@ -890,7 +1058,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
     // Both of these carry a present `data` object, so "nothing matched" is a
     // conclusion the response actually supports.
     for (const response of [{ data: {} }, { data: { devices: 'nope' } }]) {
-      const { payload, notes } = await exchange(
+      const { payload, notes } = await metricExchange(
         'lumics_get_metric_summary',
         { moduleType: 'snmp' },
         response,
@@ -909,7 +1077,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
     // the estate contains, so the absence is disclosed instead — see
     // tests/integration/partial-reads.test.ts for the full behaviour.
     for (const response of [null, {}]) {
-      const { payload, notes } = await exchange(
+      const { payload, notes } = await metricExchange(
         'lumics_get_metric_summary',
         { moduleType: 'snmp' },
         response,
@@ -927,7 +1095,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
     const many = Array.from({ length: DEFAULT_LIST_LIMIT }, (_unused, index) =>
       item(`d${String(index)}`, index),
     );
-    const { notes } = await exchange(
+    const { notes } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp' },
       summary(many),
@@ -937,7 +1105,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
 
   it('tolerates an absent body, a missing data key and a non-array class', async () => {
     for (const response of [null, {}, { data: {} }, { data: { devices: 'nope' } }]) {
-      const { payload } = await exchange(
+      const { payload } = await metricExchange(
         'lumics_get_metric_summary',
         { moduleType: 'snmp' },
         response,
@@ -947,7 +1115,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('surfaces a non-object data field as documented drift', async () => {
-    const { text } = await failingExchange(
+    const { text } = await failingMetricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp' },
       { data: [{ id: 'a' }] },
@@ -956,7 +1124,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('surfaces a non-object body as documented drift', async () => {
-    const { text } = await failingExchange(
+    const { text } = await failingMetricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp' },
       'nope',
@@ -965,7 +1133,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('omits the count sentence when Lumics sent no count', async () => {
-    const { notes } = await exchange(
+    const { notes } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp' },
       { data: { devices: [item('a', 1)] } },
@@ -974,7 +1142,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('reports the effective window on this endpoint too, when the envelope carries one', async () => {
-    const { notes } = await exchange(
+    const { notes } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp' },
       {
@@ -989,7 +1157,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('keeps items in a stable order when NONE of them has a value at the sort path', async () => {
-    const { payload, notes } = await exchange(
+    const { payload, notes } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp', sortBy: 'Calculated.nosuchmetric.avg' },
       summary([item('a', 1), item('b', 2), item('c', 3)]),
@@ -1000,7 +1168,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('treats a sortBy of only separators as unresolvable rather than throwing', async () => {
-    const { payload, notes } = await exchange(
+    const { payload, notes } = await metricExchange(
       'lumics_get_metric_summary',
       { moduleType: 'snmp', sortBy: '.' },
       summary([item('a', 1), item('b', 2)]),
@@ -1010,7 +1178,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it.each([0, 1_001, 2.5])('rejects a topN of %s locally', async (topN) => {
-    const { calls } = await failingExchange('lumics_get_metric_summary', {
+    const { calls } = await failingMetricExchange('lumics_get_metric_summary', {
       moduleType: 'snmp',
       topN,
     });
@@ -1018,7 +1186,7 @@ describe('lumics_get_metric_summary (spec section 12.4)', () => {
   });
 
   it('rejects an undocumented sortDirection', async () => {
-    const { calls } = await failingExchange('lumics_get_metric_summary', {
+    const { calls } = await failingMetricExchange('lumics_get_metric_summary', {
       moduleType: 'snmp',
       sortDirection: 'random',
     });
@@ -1035,7 +1203,7 @@ describe('no metric tool ever fabricates pagination', () => {
       { data: { devices: [{ id: 'a', stats: { Calculated: { cpu: { avg: 1 } } } }] }, count: 1 },
     ] as const,
   ])('%s', async (tool, args, response) => {
-    const { text, call } = await exchange(tool, args, response);
+    const { text, call } = await metricExchange(tool, args, response);
     expectNoFabricatedPagination(text);
     expectNoFabricatedQueryParams(call);
   });

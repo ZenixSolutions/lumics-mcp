@@ -81,6 +81,14 @@ The server is only as safe as the token you give it and the mode you run it in.
   token issued to your user, including ones other integrations depend on. Plan for that before you
   need it: know what else would break.
 
+### A `.env` file configures nothing unless you point the server at it
+
+The server reads the environment it is given and nothing else. It does **not** look for a `.env` in
+the working directory, and that is a security property rather than an omission — see
+[Configuration is not read from the filesystem](#configuration-is-not-read-from-the-filesystem)
+below. To use a file, either put the variables in your MCP client's own `env` block, or pass Node's
+flag yourself: `node --env-file=.env dist/index.js`.
+
 ### Never commit `.env`
 
 `.env` is gitignored, and `.gitignore` also covers `*.pem` and `*.key`. Keep it that way. Use
@@ -91,6 +99,44 @@ Be aware that client configuration files store tokens in **plaintext**:
 `claude_desktop_config.json`, `.vscode/mcp.json`, `.cursor/mcp.json`, `~/.codex/config.toml`. Never
 commit a project-scoped one. Protect the rest as you would a private key, and remember that
 anything that syncs your home directory syncs them too.
+
+### Configuration is not read from the filesystem
+
+Every control in this document — `LUMICS_READ_ONLY`, the two `LUMICS_ENABLE_*` gates,
+`LUMICS_ALLOW_CROSS_COMPANY`, `LUMICS_BASE_URL` — is only as strong as the answer to "who can supply
+it". The answer is: whoever launches the process, and nobody else.
+
+An earlier build weakened that. `src/index.ts` called Node's own dotenv loader with the **relative**
+path `.env`, which for a published MCP server resolves against whichever directory the client
+happened to launch it from: a user's workspace, a cloned repository, a directory the very agent this
+server serves can write to. Two consequences, both reproduced end to end during review:
+
+- **Token exfiltration.** A planted `LUMICS_BASE_URL` redirected every request, so the bearer token
+  was delivered to a host of the file's choosing.
+- **Gate escalation.** `LUMICS_ALLOW_CROSS_COMPANY`, `LUMICS_ENABLE_BATCH_UPDATE` and
+  `LUMICS_ENABLE_TOKEN_REVOCATION` came back on, registering tools a default install does not have.
+
+Real environment variables always won over the file, so only variables the operator had left unset
+were hijackable — which is every gate, by default. The defaults _are_ the security posture, so that
+was the whole of it.
+
+The load was removed. Nothing in the server now reads a dotfile, and
+`tests/security/dotenv-not-loaded.test.ts` runs the **built** binary in a directory holding a
+hostile `.env` and asserts that the base URL is untouched, that no request reaches the planted host,
+that the gated tools stay unregistered, and that `LUMICS_READ_ONLY` cannot be switched on from the
+file either — a control a file can turn on is a control an operator cannot rely on.
+
+### The base URL must use TLS
+
+`LUMICS_BASE_URL` is refused at startup unless it is `https:`, with one exception: a loopback host
+(`127.0.0.1`, `localhost`, `[::1]`), which covers a local development proxy and cannot put traffic on
+a network. The comparison is against `URL.hostname` and is exact, so `localhost.example.invalid` gets
+no exemption.
+
+The reason is that the URL decides who receives the credential. The Lumics token is a bearer token
+sent on **every** request, so plaintext to a remote host puts it on the wire in the clear for
+anything on the path. No environment flag widens this. If a deployment genuinely needs plaintext to a
+remote host, that is a change to argue for on its merits, not a default to leave open.
 
 ### Why `LUMICS_READ_ONLY` matters
 
@@ -103,6 +149,12 @@ check: with it set, create, update, delete, and admin tools are never advertised
 distinction is the point — a model cannot be talked into calling a tool that was never registered,
 so the control holds even against prompt injection reaching the model through monitoring data,
 device descriptions, or a note field.
+
+It holds against a file on disk too, which is a separate claim and used not to be true: the value
+comes from the process environment alone, and
+[configuration is not read from the filesystem](#configuration-is-not-read-from-the-filesystem).
+`tests/security/dotenv-not-loaded.test.ts` verifies it in both directions — a planted `.env` can
+neither switch this control off nor switch it on.
 
 Most real use of this server is investigative: asking what is down, what a subnet contains, how a
 metric has trended. That work needs no write access. Run read-only by default and keep a second,
@@ -122,9 +174,9 @@ Two operations remain off even without read-only mode, and no model can enable t
 LUMICS_ALLOW_CROSS_COMPANY=1
 ```
 
-Off by default, and worth leaving off. Every tool takes an optional `companyId` argument. With the
-flag unset, an explicit `companyId` that differs from `LUMICS_COMPANY_ID` is refused with a
-`not_permitted` error before any request is made.
+Off by default, and worth leaving off. **Every tool is covered by the pin.** Most take an optional
+`companyId` argument, and with the flag unset an explicit `companyId` that differs from
+`LUMICS_COMPANY_ID` is refused with a `not_permitted` error before any request is made.
 
 The reason is that a Lumics token is not scoped to one company. A token issued to an MSP or
 multi-company user reaches **every** company that user administers, and `companyId` is an ordinary
@@ -133,6 +185,20 @@ injected instruction sitting in a device description. Without the gate, one such
 read or write a tenant nobody configured, while the tool's own description told the approving human
 that writes apply to the configured company. That is the specific failure this closes: not a model
 exceeding its instructions, but a model following them into a tenant that was never named.
+
+Two tools have no `companyId` argument for the check to read, because their Lumics paths carry no
+company segment (spec §12.3): `lumics_get_device_metrics` and `lumics_get_device_item_metrics` are
+addressed by device id alone. That was a hole, and a reviewer walked through it — metrics for a device
+in another company, read with the pin on, while every other tool refused the same tenant. A
+`deviceId` is precisely the untrusted value described above.
+
+They now enforce the pin with a **device-ownership read**: the device is fetched inside
+`LUMICS_COMPANY_ID` first, and the metric read is issued only if that confirms ownership. Every
+ambiguous case fails closed — a 404 from the scoped read, or a device record carrying no `company`
+field, is a refusal, not an assumption. Because that check needs a configured company, both tools are
+company-scoped and are withheld from `tools/list` entirely when `LUMICS_COMPANY_ID` is unset. The cost
+is one extra request per call; the alternative was a security control with a documented exception,
+which is much weaker than one without.
 
 Enabling the flag is therefore a blast-radius decision, not a convenience one. It widens the reach
 of every write from one company to every company the token can reach, and the two are not
@@ -143,8 +209,12 @@ specifically intend cross-tenant writes.
 
 Like the other gates this is registration- and call-time enforcement driven by the environment: it
 is set by the human who deploys the server, out of band from any conversation, and no prompt can
-change it. When it is on, the description of every write tool says so explicitly, so a client's
-approval UI shows the human that a foreign `companyId` will be honoured.
+change it — and, since the dotenv load was removed, no file in the working directory can change it
+either. `tests/security/dotenv-not-loaded.test.ts` asserts exactly that, because the claim in this
+paragraph was previously false: see
+[Configuration is not read from the filesystem](#configuration-is-not-read-from-the-filesystem).
+When it is on, the description of every write tool says so explicitly, so a client's approval UI shows
+the human that a foreign `companyId` will be honoured.
 
 ### Self-hosting the HTTP transport (v0.2)
 

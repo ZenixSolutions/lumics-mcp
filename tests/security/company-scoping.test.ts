@@ -23,8 +23,14 @@
  */
 
 import { describe, expect, it } from 'vitest';
-import { makeConfig, TEST_COMPANY_ID, TEST_DEVICE_ID, TEST_SUBNET_ID } from '../helpers/config.js';
-import { jsonResponse, recordFetch } from '../helpers/fetch.js';
+import {
+  makeConfig,
+  TEST_COMPANY_ID,
+  TEST_COMPONENT_ID,
+  TEST_DEVICE_ID,
+  TEST_SUBNET_ID,
+} from '../helpers/config.js';
+import { errorResponse, jsonResponse, recordFetch } from '../helpers/fetch.js';
 import { connect, type Harness } from '../helpers/mcp.js';
 import type { LumicsConfig } from '../../src/config.js';
 
@@ -122,6 +128,184 @@ describe('an explicit companyId cannot silently retarget another tenant (finding
 
   it('defaults the flag to off, like every other gate', () => {
     expect(makeConfig().allowCrossCompany).toBe(false);
+  });
+});
+
+/**
+ * The two device-scoped metric tools were the hole in the pin. spec §12.3's path
+ * — `/metrics/devices/:id/modules/:moduleType` — carries no company segment, so
+ * neither tool called `resolveCompanyId` at all and a `deviceId` belonging to
+ * another tenant was read without any check. `deviceId` is exactly the kind of
+ * value SECURITY.md names as untrusted: "an id a model can pick up from a
+ * document… or an injected instruction sitting in a device description".
+ *
+ * The fix resolves the device's owning company with a company-scoped device read
+ * (spec §7.2) and pins on that before the metric read is issued.
+ */
+describe('the pin covers the device-scoped metric tools too (finding H5, second pass)', () => {
+  const DEVICE_METRIC_CALLS: readonly (readonly [string, Record<string, unknown>])[] = [
+    ['lumics_get_device_metrics', { deviceId: TEST_DEVICE_ID, moduleType: 'snmp' }],
+    [
+      'lumics_get_device_item_metrics',
+      { deviceId: TEST_DEVICE_ID, moduleType: 'snmp', itemId: TEST_COMPONENT_ID },
+    ],
+  ];
+
+  /** A tenant whose device reads answer with the given owner, or nothing at all. */
+  function tenant(
+    owner: string | undefined,
+    options: { readonly deviceStatus?: number } = {},
+  ): ReturnType<typeof recordFetch> {
+    return recordFetch((call) => {
+      if (call.path.startsWith('/companies/')) {
+        if (options.deviceStatus !== undefined) {
+          return errorResponse(options.deviceStatus, 'not found');
+        }
+        return jsonResponse({
+          id: TEST_DEVICE_ID,
+          name: 'edge-switch-1',
+          ...(owner === undefined ? {} : { company: owner }),
+        });
+      }
+      return jsonResponse({ data: [{ time: 1, stats: { cpu: { avg: 1 } } }] });
+    });
+  }
+
+  async function callWith(
+    fetcher: ReturnType<typeof recordFetch>,
+    tool: string,
+    args: Record<string, unknown>,
+    config = makeConfig(),
+  ): Promise<{ readonly isError: boolean; readonly text: string }> {
+    const harness = await connect(config, { clientOptions: { fetchImpl: fetcher.fetchImpl } });
+    try {
+      const called = await harness.call(tool, args);
+      const block = called.content[0];
+      return {
+        isError: called.isError === true,
+        text: block?.type === 'text' ? block.text : '',
+      };
+    } finally {
+      await harness.close();
+    }
+  }
+
+  it.each(DEVICE_METRIC_CALLS)(
+    '%s refuses a device owned by another tenant, and reads no metrics',
+    async (tool, args) => {
+      const fetcher = tenant(OTHER_COMPANY);
+      const called = await callWith(fetcher, tool, args);
+
+      expect(called.isError).toBe(true);
+      expect(called.text).toMatch(/^not_permitted: /);
+      expect(called.text).toContain(OTHER_COMPANY);
+      expect(called.text).toContain(TEST_COMPANY_ID);
+      expect(called.text).toContain('LUMICS_ALLOW_CROSS_COMPANY');
+      // The ownership read happened; the metric read did not.
+      expect(fetcher.calls.map((call) => call.path)).toEqual([
+        `/companies/${TEST_COMPANY_ID}/devices/${TEST_DEVICE_ID}`,
+      ]);
+    },
+  );
+
+  it.each(DEVICE_METRIC_CALLS)(
+    '%s reads metrics for a device in the pinned company',
+    async (tool, args) => {
+      const fetcher = tenant(TEST_COMPANY_ID);
+      const called = await callWith(fetcher, tool, args);
+
+      expect(called.isError).toBe(false);
+      expect(fetcher.calls).toHaveLength(2);
+      expect(fetcher.calls[0]?.path).toBe(
+        `/companies/${TEST_COMPANY_ID}/devices/${TEST_DEVICE_ID}`,
+      );
+      expect(fetcher.calls[1]?.path).toContain(`/metrics/devices/${TEST_DEVICE_ID}/modules/snmp`);
+    },
+  );
+
+  it.each(DEVICE_METRIC_CALLS)(
+    '%s refuses when the device record carries no company at all',
+    async (tool, args) => {
+      const fetcher = tenant(undefined);
+      const called = await callWith(fetcher, tool, args);
+
+      // Fail closed: an unverifiable owner is not a verified one.
+      expect(called.isError).toBe(true);
+      expect(called.text).toMatch(/^not_permitted: /);
+      expect(fetcher.calls).toHaveLength(1);
+    },
+  );
+
+  it.each(DEVICE_METRIC_CALLS)(
+    '%s refuses when the device is not in the pinned company at all (404)',
+    async (tool, args) => {
+      const fetcher = tenant(OTHER_COMPANY, { deviceStatus: 404 });
+      const called = await callWith(fetcher, tool, args);
+
+      expect(called.isError).toBe(true);
+      expect(called.text).toMatch(/^not_permitted: /);
+      expect(called.text).toContain('LUMICS_ALLOW_CROSS_COMPANY');
+      expect(fetcher.calls).toHaveLength(1);
+    },
+  );
+
+  it('reports a failed ownership read as the API failure it was, not as a refusal', async () => {
+    // A 403 or 500 on the pin read is not "this device belongs elsewhere"; saying
+    // so would send the model looking for a company problem that does not exist.
+    for (const status of [403, 500]) {
+      const fetcher = tenant(TEST_COMPANY_ID, { deviceStatus: status });
+      const called = await callWith(fetcher, 'lumics_get_device_metrics', {
+        deviceId: TEST_DEVICE_ID,
+        moduleType: 'snmp',
+      });
+
+      expect(called.isError).toBe(true);
+      expect(called.text).not.toMatch(/^not_permitted: /);
+      expect(called.text).toContain(String(status));
+      // Still no metric read: an unverified device is never read from.
+      expect(fetcher.calls.some((call) => call.path.includes('/metrics/'))).toBe(false);
+    }
+  });
+
+  it.each(DEVICE_METRIC_CALLS)(
+    '%s skips the ownership read entirely once the operator allows cross-company',
+    async (tool, args) => {
+      const fetcher = tenant(OTHER_COMPANY);
+      const called = await callWith(fetcher, tool, args, makeConfig({ allowCrossCompany: true }));
+
+      expect(called.isError).toBe(false);
+      // One call, straight to the metric path: the pin the operator turned off
+      // costs nothing when it is off.
+      expect(fetcher.calls).toHaveLength(1);
+      expect(fetcher.only().path).toContain(`/metrics/devices/${TEST_DEVICE_ID}/modules/snmp`);
+    },
+  );
+
+  it('withholds both tools when there is no LUMICS_COMPANY_ID to pin to', async () => {
+    const harness = await connect(makeConfig({ companyId: '' }), {
+      clientOptions: { fetchImpl: recordFetch(jsonResponse({})).fetchImpl },
+    });
+    try {
+      const names = harness.tools.map((tool) => tool.name);
+      expect(names).not.toContain('lumics_get_device_metrics');
+      expect(names).not.toContain('lumics_get_device_item_metrics');
+    } finally {
+      await harness.close();
+    }
+  });
+
+  it('says in both descriptions that the device is checked against the pin', async () => {
+    const harness = await connect(makeConfig(), {
+      clientOptions: { fetchImpl: recordFetch(jsonResponse({})).fetchImpl },
+    });
+    try {
+      for (const name of ['lumics_get_device_metrics', 'lumics_get_device_item_metrics']) {
+        const description = harness.tool(name)?.description ?? '';
+        expect(description, name).toContain('LUMICS_COMPANY_ID');
+      }
+    } finally {
+      await harness.close();
+    }
   });
 });
 

@@ -25,7 +25,13 @@ const LEVEL_RANK: Record<LogLevel, number> = {
   silent: 100,
 };
 
-let currentLevel: LogLevel = 'info';
+/**
+ * Level used until an operator says otherwise. `src/config.ts` defaults
+ * `LUMICS_LOG_LEVEL` to this same value, and `src/index.ts` applies it.
+ */
+export const DEFAULT_LOG_LEVEL: LogLevel = 'info';
+
+let currentLevel: LogLevel = DEFAULT_LOG_LEVEL;
 
 /**
  * Fields the log record owns. A context key with one of these names is emitted as

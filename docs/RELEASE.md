@@ -138,8 +138,18 @@ They are deliberately excluded from CI:
 
 So the gate is a person:
 
-1. A maintainer with access to a live tenant sets `LUMICS_TOKEN`, `LUMICS_COMPANY_ID`, and
-   `LUMICS_CONTRACT_TESTS=1` in a local `.env`.
+1. A maintainer with access to a live tenant supplies `LUMICS_TOKEN` and `LUMICS_COMPANY_ID` **in
+   the environment of the command** — `npm run test:contract` sets `LUMICS_CONTRACT_TESTS=1` itself.
+   A `.env` file does not do this on its own: the server never reads one (see
+   [SECURITY.md](../SECURITY.md)), and vitest reads `process.env`, so the values have to be exported
+   or prefixed:
+
+   ```bash
+   LUMICS_TOKEN=... LUMICS_COMPANY_ID=... npm run test:contract
+   # or, from a file you keep locally:
+   set -a && . ./.env && set +a && npm run test:contract
+   ```
+
 2. They run `npm run test:contract`.
 3. **They record the result in the release pull request** — pass or fail, the tenant used
    (identified, not credentialed), and the date. An unrecorded run did not happen.

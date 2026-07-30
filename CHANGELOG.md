@@ -28,13 +28,12 @@ and is finalised at tag time.
   `src/transport/http.ts` stays in the tree so v0.2 is additive, and the five `LUMICS_HTTP_*`
   variables are documented for forward reference only. Streamable HTTP is ADR-001 decision 4,
   scheduled for v0.2.
-- `LUMICS_COMPANY_ID` is **optional**. Without it the server starts, registers only the tools that
-  need no company (`lumics_get_me`, `lumics_get_device_definition_components`,
-  `lumics_get_device_metrics`, `lumics_get_device_item_metrics`) and logs a warning. This is what
-  makes the documented first-run flow possible: the way to discover a company id is `lumics_get_me`,
-  and a server that refused to start without the id could not run the tool that finds it. Call
-  `lumics_get_me`, set the variable, restart. A value that _is_ supplied is still format-checked at
-  startup.
+- `LUMICS_COMPANY_ID` is **optional**. Without it the server starts, registers only the two tools that
+  need no company (`lumics_get_me` and `lumics_get_device_definition_components`; three with
+  `LUMICS_ENABLE_TOKEN_REVOCATION` on) and logs a warning. This is what makes the documented first-run
+  flow possible: the way to discover a company id is `lumics_get_me`, and a server that refused to
+  start without the id could not run the tool that finds it. Call `lumics_get_me`, set the variable,
+  restart. A value that _is_ supplied is still format-checked at startup.
 - Operation classification on every tool — Read, Create, Update, Admin, or Destructive — with the MCP
   annotations (`readOnlyHint`, `destructiveHint`, `idempotentHint`) derived from the classification
   rather than written by hand, so an annotation cannot contradict it. `openWorldHint` is `true`
@@ -65,23 +64,37 @@ and is finalised at tag time.
   thirteen of the hundred devices it asked for, with two disclosure notes giving opposite advice.
   The projection is disclosed in every response, an explicit `fields` argument replaces it, and
   `fields: []` asks for whole records. No other list tool projects by default.
-- `LUMICS_ALLOW_CROSS_COMPANY`, off by default. Every tool takes an optional `companyId`; with the
-  flag unset, a value differing from `LUMICS_COMPANY_ID` is refused with `not_permitted`. See
-  **Security** below.
+- `LUMICS_ALLOW_CROSS_COMPANY`, off by default. Every tool is covered by the company pin: most take an
+  optional `companyId` and, with the flag unset, a value differing from `LUMICS_COMPANY_ID` is refused
+  with `not_permitted`. See **Security** below.
+- `LUMICS_LOG_LEVEL`, one of `debug`, `info` (default), `warn`, `error` or `silent`. Diagnostics have
+  always gone to stderr — stdout is the MCP protocol channel — but there was no way to turn the
+  verbosity up or off. `debug` adds a record per tool call with its duration, output size, whether the
+  limit was reached and how many items the output budget dropped, which is what Troubleshooting needs
+  when a tool returns less than expected. `silent` quiets stderr entirely, for a supervisor that treats
+  any stderr output as a fault. The level is parsed in `src/config.ts` and applied by `src/index.ts`,
+  so importing this package cannot change a host application's logging.
 - A default resolution of 60 `dataPoints` on metric calls, since the Lumics API requires `dataPoints`
   or `width` on every metric-data endpoint and rejects a call with neither. The effective value, and
   whether it was defaulted, is disclosed in the output.
 - Client-side ranking (`topN`, `sortBy`, `sortDirection`) for `metrics/summaries`, which accepts no
   `limit`, top-N or sort parameter of any kind. The output states that the ranking was applied by
   this server after fetching the full set, and reports how many items had no value at the sort path.
+  Lumics keys its results by item class, and the trim is applied **per class**: with `topN: 2` over two
+  classes you can get four rows, and no ranking crosses a class boundary. The response says so whenever
+  more than one class is present, rather than only when the output budget happened to drop something.
 - Local input validation ahead of the API: identifiers must be 24-character hex ObjectIds, IP
   addresses must parse as addresses, netmasks as dotted quads, MAC addresses as MAC addresses, and a
   PATCH with no changed fields is refused rather than reported as a successful no-op.
 - Output shaping with an optional `fields` projection and a `LUMICS_MAX_OUTPUT_CHARS` budget
-  (default 25,000). Arrays shed whole items **from the end** so what remains still parses and the
-  loss is positional; every drop is disclosed with a count. The completeness note and the truncation
-  note are generated together, so a response cut by both no longer tells you to raise the limit and
-  to lower it in the same breath.
+  (default 25,000). The budget caps the **entire** text a tool returns, disclosure notes and JSON
+  payload together: notes are reserved first and the payload is fitted to what remains. The one
+  exception is disclosures that exceed the budget by themselves — they are emitted in full and the
+  payload is reduced to nothing, because a disclosure is never dropped or shortened to save space.
+  Arrays shed whole items **from the end** so what remains still parses and the loss is positional;
+  every drop is disclosed with a count. The completeness note and the truncation note are generated
+  together, so a response cut by both no longer tells you to raise the limit and to lower it in the
+  same breath.
 - No `limit` is sent to a metric endpoint unless the caller supplies one — deliberately unlike the
   list tools, which default to 100. `limit` is optional upstream, and injecting a default silently
   truncated a multi-thousand-row time series in an order Lumics does not document, cutting across
@@ -97,6 +110,23 @@ and is finalised at tag time.
 
 ### Security
 
+- **The server reads no `.env` file.** An earlier build in this release cycle called Node's dotenv
+  loader with the relative path `.env`, which for a published MCP server resolves against whichever
+  directory the client launched it from — including a directory the agent being served can write to. A
+  planted file could redirect `LUMICS_BASE_URL` and exfiltrate the bearer token (reproduced during
+  review against a loopback sink) and reopen every `LUMICS_ENABLE_*` and cross-company gate the
+  operator had left unset, which is all of them by default. Real environment variables won over the
+  file, so only the defaults were hijackable — and the defaults are the security posture. The load is
+  gone; `tests/security/dotenv-not-loaded.test.ts` runs the built binary in a directory holding a
+  hostile `.env` and asserts the file changes nothing, in both directions. **This will break a setup
+  that relied on the implicit load**: use your MCP client's own `env` block, as every documented
+  install does, or `node --env-file=.env dist/index.js`.
+- **`LUMICS_BASE_URL` must use `https:`**, except for a loopback host (`127.0.0.1`, `localhost`,
+  `[::1]`), and is refused at startup otherwise. The Lumics token is a bearer credential sent on every
+  request, so plain `http:` to a remote host puts it on the wire in clear text. The hostname comparison
+  is exact, so `localhost.example.invalid` gets no exemption, and no flag widens the rule. **This will
+  reject a configuration that previously started**, namely a plaintext base URL for a remote
+  self-hosted Lumics.
 - `LUMICS_READ_ONLY=1` filters at **registration** time rather than refusing calls at runtime: write
   tools are never advertised, so a model cannot be talked into attempting one.
 - Bulk device update is classified **Admin**, not Update, and carries `destructiveHint`: one call
@@ -109,9 +139,33 @@ and is finalised at tag time.
   another tenant's id could otherwise read or write there — while the tool description told the
   approving human the call applied to the configured company. An explicit `companyId` differing from
   `LUMICS_COMPANY_ID` now fails with `not_permitted` unless the operator sets
-  `LUMICS_ALLOW_CROSS_COMPANY`, which is an out-of-band setting no prompt can change. With the flag
-  on, every write tool's description says so, so an approval prompt shows that a foreign `companyId`
-  will be honoured.
+  `LUMICS_ALLOW_CROSS_COMPANY`, which is an out-of-band setting no prompt — and, per the dotenv item
+  above, no file — can change. With the flag on, every write tool's description says so, so an approval
+  prompt shows that a foreign `companyId` will be honoured.
+- **The company pin now covers the two device-scoped metric tools.** `lumics_get_device_metrics` and
+  `lumics_get_device_item_metrics` take no `companyId`, because the Lumics metric path for a device
+  carries no company segment (spec §12.3), and they consequently bypassed the pin entirely: a reviewer
+  read metrics for a device in another company with the pin on, while every other tool refused the same
+  tenant. Both now resolve the device's owner first, with a company-scoped device read (spec §7.2)
+  against `LUMICS_COMPANY_ID`, and refuse the call unless the device belongs there — a 404 from that
+  read, or a device record with no `company` field, is a refusal rather than an assumption. The metric
+  request is not made at all when the check fails. This costs one extra round trip per call, and because
+  the check needs a configured company both tools are now **withheld when `LUMICS_COMPANY_ID` is
+  unset**, which changes the no-company tool set from four tools to two.
+- **A write is never retried after a transport failure, `DELETE` included.** `POST`, `PATCH` and
+  `DELETE` get exactly one attempt when the connection drops, the request times out, or the response
+  body arrives incomplete. `DELETE` was previously replayed on the grounds that HTTP calls it
+  idempotent, but idempotence guarantees the same state, not the same answer: a delete whose connection
+  dropped after Lumics applied it was retried, 404'd, and surfaced as `not_found` — "Lumics has no such
+  resource" — so a completed destructive action was reported as never having happened. Retries driven by
+  a **status code**, `429` included, are unchanged for every verb: a status proves the server answered
+  and did not act.
+- **Transport-failure errors on writes now instruct a verifying read instead of a retry.** On `POST`,
+  `PATCH` or `DELETE`, a timeout, network error or incomplete body says the request may already have
+  been applied, that this server deliberately did not retry it, and that the model should read the
+  record back or list its parent collection rather than reporting a failure. Read paths keep the old
+  "retry the call" advice, which is correct there because nothing changed either way. The same wording
+  applies when Lumics returns the documented `updated`/`deleted` envelope with nothing inside it.
 - `confirm: true` is required on every Admin and Destructive tool, injected by the tool factory so it
   cannot be forgotten. It is documented as a **prompt-level speed bump, not a control** — the model
   supplies it itself. The environment flags are the real gate.

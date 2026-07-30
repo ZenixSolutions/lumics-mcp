@@ -74,6 +74,19 @@ cp .env.example .env   # fill in LUMICS_TOKEN and LUMICS_COMPANY_ID
 npm run validate
 ```
 
+**The server does not read that `.env` on its own.** Nothing in `src/` looks for a dotfile; the
+implicit load was removed because it resolved a relative path against whatever directory the client
+launched the server from, which made a planted file a token-exfiltration and gate-escalation vector
+(`tests/security/dotenv-not-loaded.test.ts` locks that shut). Pass the file explicitly instead:
+
+```bash
+npm run build
+node --env-file=.env dist/index.js
+```
+
+For anything that reads `process.env` directly — the contract tests, a one-off script — export the
+variables in your shell, or prefix the command.
+
 `.env` is gitignored. **Never commit credentials**, and never paste a real token into an issue,
 pull request, test fixture, or example. See [SECURITY.md](./SECURITY.md).
 

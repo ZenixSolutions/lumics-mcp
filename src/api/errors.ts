@@ -43,6 +43,45 @@ export type LumicsErrorCode =
 /** Longest error-body snippet retained for diagnosis. */
 const MAX_BODY_SNIPPET_CHARS = 500;
 
+/**
+ * Verbs whose effect may already have landed when the transport failed, and
+ * which `LumicsClient` therefore refuses to replay (see `NON_IDEMPOTENT_METHODS`
+ * in `./client.ts`).
+ *
+ * `PUT` is absent on purpose: the only PUT this server issues writes an absolute
+ * `lastDiscovery` value (spec §7.4), so a replay writes the same timestamp.
+ */
+const UNREPLAYABLE_METHODS: ReadonlySet<string> = new Set(['POST', 'PATCH', 'DELETE']);
+
+/**
+ * The verb an `operation` describes. Every `operation` this module receives is
+ * built as `${method} ${path}` by `LumicsClient.request`, or as `PATCH device
+ * <id>` by a tool. Anything unrecognised is treated as a read, which is the
+ * conservative direction: a read gets retry advice, and advising a retry of
+ * something that is genuinely a read cannot duplicate a record.
+ */
+function methodOf(operation: string): string {
+  return (operation.trim().split(/\s+/)[0] ?? '').toUpperCase();
+}
+
+/**
+ * What to tell the model after a transport failure, which depends entirely on
+ * the verb.
+ *
+ * On a read, the request either arrived or it did not, nothing changed either
+ * way, and a retry is the right move. On a POST, PATCH or DELETE it is not: the
+ * request may have been applied before the connection died, the client made
+ * exactly one attempt for that reason, and telling the model to "retry the call"
+ * hands it an instruction to create a duplicate, re-apply a change, or delete a
+ * record it cannot see. It is sent to look at the current state instead.
+ */
+function transportGuidance(operation: string, readAdvice: string): string {
+  if (!UNREPLAYABLE_METHODS.has(methodOf(operation))) {
+    return readAdvice;
+  }
+  return 'This was a write, and it may already have been applied: the transport cannot distinguish a request Lumics never processed from one it processed and then failed to answer. This server deliberately did NOT retry it, because replaying a write whose outcome is unknown duplicates a record, re-applies a change, or turns a completed delete into a 404 that reads as a record which never existed. Do not retry it either: read the record back, or list its parent collection, to establish what the current state actually is, and report that. Do not report the write as having failed on the strength of this error alone.';
+}
+
 interface StatusMapping {
   readonly code: LumicsErrorCode;
   /** Actionable guidance. Present tense, addressed to the model. */
@@ -212,7 +251,14 @@ export class LumicsApiError extends Error {
     );
   }
 
-  /** The request exceeded `LUMICS_TIMEOUT_MS` and was aborted. */
+  /**
+   * The request exceeded `LUMICS_TIMEOUT_MS` and was aborted.
+   *
+   * Reachable on a write as well as a read, and the guidance differs: a timeout
+   * means *this server stopped waiting*, not that Lumics stopped working, so on
+   * a POST, PATCH or DELETE the change may well have been applied after the
+   * abort. See {@link transportGuidance}.
+   */
   static timeout(
     operation: string,
     timeoutMs: number,
@@ -220,7 +266,7 @@ export class LumicsApiError extends Error {
     cause?: unknown,
   ): LumicsApiError {
     return new LumicsApiError(
-      `${operation} timed out after ${String(timeoutMs)}ms across ${String(attempts)} attempt(s). Narrow the request — a smaller limit, a shorter time range, or fewer metric properties — or ask the operator to raise LUMICS_TIMEOUT_MS.`,
+      `${operation} timed out after ${String(timeoutMs)}ms across ${String(attempts)} attempt(s). ${transportGuidance(operation, 'Narrow the request — a smaller limit, a shorter time range, or fewer metric properties — or ask the operator to raise LUMICS_TIMEOUT_MS.')}`,
       {
         code: 'timeout',
         operation,
@@ -238,7 +284,7 @@ export class LumicsApiError extends Error {
    */
   static network(operation: string, attempts: number, cause: unknown): LumicsApiError {
     return new LumicsApiError(
-      `${operation} could not reach the Lumics API after ${String(attempts)} attempt(s): ${redactedMessage(describeCause(cause))}. Check LUMICS_BASE_URL and network connectivity. This is an environment problem, not an argument problem.`,
+      `${operation} could not reach the Lumics API after ${String(attempts)} attempt(s): ${redactedMessage(describeCause(cause))}. Check LUMICS_BASE_URL and network connectivity. This is an environment problem, not an argument problem. ${transportGuidance(operation, 'Retry the call once the environment is sound.')}`,
       { code: 'network_error', operation, retryable: true, attempts, cause },
     );
   }
@@ -248,15 +294,25 @@ export class LumicsApiError extends Error {
    * was reset mid-transfer, or the timeout fired while it was still coming.
    *
    * Classified `network_error` so the retry policy treats it exactly like any
-   * other transport failure — retried on an idempotent verb, never on POST or
-   * PATCH. The message is separate from {@link LumicsApiError.network} because
-   * "could not reach the API" would be untrue here, and because the *reason* this
-   * is an error at all is worth stating: a truncated body read as a complete one
-   * is an under-reported inventory presented as a confident answer.
+   * other transport failure — retried on a replayable verb, never on POST, PATCH
+   * or DELETE. The message is separate from {@link LumicsApiError.network}
+   * because "could not reach the API" would be untrue here, and because the
+   * *reason* this is an error at all is worth stating: a truncated body read as a
+   * complete one is an under-reported inventory presented as a confident answer.
+   *
+   * Both halves of the message are verb-aware. On a read, the discarded body is a
+   * possibly-truncated collection and a retry is the correct next step. On a
+   * write, "a truncated list is indistinguishable from a short one" describes
+   * nothing that happened, and "retry the call" is an instruction to replay a
+   * write this client refused to replay.
    */
   static incompleteBody(operation: string, attempts: number, cause: unknown): LumicsApiError {
+    const discarded = UNREPLAYABLE_METHODS.has(methodOf(operation))
+      ? 'The partial body was discarded rather than parsed, because half of a write response cannot be trusted to describe what was applied.'
+      : 'The partial body was discarded rather than parsed, because a truncated list is indistinguishable from a short one and would otherwise be reported as a complete result.';
+
     return new LumicsApiError(
-      `${operation} reached Lumics but the response body did not arrive completely after ${String(attempts)} attempt(s): ${redactedMessage(describeCause(cause))}. The partial body was discarded rather than parsed, because a truncated list is indistinguishable from a short one and would otherwise be reported as a complete result. Retry the call; if it keeps failing, narrow the request or ask the operator to raise LUMICS_TIMEOUT_MS.`,
+      `${operation} reached Lumics but the response body did not arrive completely after ${String(attempts)} attempt(s): ${redactedMessage(describeCause(cause))}. ${discarded} ${transportGuidance(operation, 'Retry the call; if it keeps failing, narrow the request or ask the operator to raise LUMICS_TIMEOUT_MS.')}`,
       { code: 'network_error', operation, retryable: true, attempts, cause },
     );
   }

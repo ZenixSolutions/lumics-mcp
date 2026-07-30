@@ -35,6 +35,7 @@ import {
   expectObject,
   unwrapDeleted,
   unwrapUpdated,
+  unwrapUpdatedArray,
 } from '../api/client.js';
 import { LumicsInputError } from '../api/errors.js';
 import {
@@ -319,10 +320,17 @@ const batchUpdateDevices = defineTool({
       // spec §7.6: the documented body field is `device` but the example is flat.
       body: patch,
     });
-    const updated = unwrapUpdated<readonly Device[]>(response, operation);
+    // `unwrapUpdatedArray`, not `unwrapUpdated`: the note below quotes a count,
+    // and a count is only meaningful if the envelope really held the array spec
+    // §7.6 documents. The previous `Array.isArray(updated) ? updated.length : 0`
+    // fallback printed "Lumics returned 0 updated record(s); ... some ids did not
+    // match" directly above a record that plainly had matched — a bulk change
+    // reported as a total failure, in a result marked successful. A shape this
+    // server cannot count is drift, and it is reported as drift.
+    const updated = unwrapUpdatedArray<Device>(response, operation);
     return result(updated, {
       notes: [
-        `Applied ${String(Object.keys(patch).length)} field change(s) to ${String(deviceIds.length)} device(s). Lumics returned ${String(Array.isArray(updated) ? updated.length : 0)} updated record(s); if that count is lower than the number of ids you sent, some ids did not match a device in this company.`,
+        `Applied ${String(Object.keys(patch).length)} field change(s) to ${String(deviceIds.length)} device(s). Lumics returned ${String(updated.length)} updated record(s); if that count is lower than the number of ids you sent, some ids did not match a device in this company.`,
       ],
     });
   },

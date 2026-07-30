@@ -11,9 +11,10 @@
  *  - turn every failure into a {@link LumicsApiError} whose message tells the
  *    model what to do.
  *
- * Retry safety is the part worth reading carefully. A network error on a POST or
- * PATCH is *ambiguous*: the request may have been applied before the connection
- * died, so retrying risks a duplicate device or a double update. Those verbs are
+ * Retry safety is the part worth reading carefully. A network error on a POST,
+ * PATCH or DELETE is *ambiguous*: the request may have been applied before the
+ * connection died, so retrying risks a duplicate device, a double update, or a
+ * 404 on a record the first attempt successfully deleted. Those verbs are
  * therefore never retried on a network error — only on a status code, which
  * proves the server answered and did not act.
  *
@@ -57,8 +58,34 @@ export interface LumicsClientOptions {
   readonly fetchImpl?: typeof fetch;
 }
 
-/** Verbs whose effect may have landed even when the connection failed. */
-const NON_IDEMPOTENT_METHODS: ReadonlySet<HttpMethod> = new Set<HttpMethod>(['POST', 'PATCH']);
+/**
+ * Verbs whose effect may have landed even when the connection failed, and which
+ * are therefore never replayed on a transport failure.
+ *
+ * `DELETE` is here even though it is idempotent in the HTTP sense. Idempotence
+ * guarantees the same *state*, not the same *answer*: a delete whose connection
+ * drops after Lumics applied it gets replayed onto a record that is already
+ * gone, the second attempt 404s, 404 is not retryable, and `not_found` — "Lumics
+ * has no such resource" — is what surfaces to the model. The user asked to delete
+ * a device, the device is gone, and the agent reports that it never existed. A
+ * completed destructive action described as never having happened is worse than
+ * a failure reported as a failure. `src/tools/factory.ts` states the same
+ * position for the tool annotations: destructive tools are `idempotentHint:
+ * false` because "the second call 404s rather than reproducing the first result".
+ *
+ * `PUT` is deliberately absent. The only PUT this server issues sets
+ * `lastDiscovery` to an absolute value (spec §7.4), so a replay writes the same
+ * timestamp and returns the same record.
+ *
+ * This set gates *transport* failures only. The status-code retry path is
+ * unaffected and stays safe for every verb: a status proves the server answered,
+ * which removes the ambiguity entirely.
+ */
+const NON_IDEMPOTENT_METHODS: ReadonlySet<HttpMethod> = new Set<HttpMethod>([
+  'POST',
+  'PATCH',
+  'DELETE',
+]);
 
 const DEFAULT_MAX_ERROR_BODY_CHARS = 500;
 
@@ -222,8 +249,8 @@ export class LumicsClient {
     // zero-byte body, which `expectArray` then turns into `[]` — a partial read
     // presented as an empty-but-complete collection, with no error and no
     // disclosure. It is classified as a transport failure instead, so it is
-    // retried on an idempotent verb and never on POST/PATCH (the request may
-    // already have been applied upstream).
+    // retried on a replayable verb and never on POST/PATCH/DELETE (the request
+    // may already have been applied upstream).
     let text: string;
     try {
       text = await response.text();
@@ -264,9 +291,10 @@ export class LumicsClient {
       return false;
     }
 
-    // A network failure on POST/PATCH may already have been applied upstream.
-    // Retrying could duplicate a device or double-apply an update, so it is
-    // never worth the risk; the model is told to verify state instead.
+    // A network failure on POST/PATCH/DELETE may already have been applied
+    // upstream. Retrying could duplicate a device, double-apply an update, or
+    // turn a delete that succeeded into a 404 reported as "no such resource", so
+    // it is never worth the risk; the model is told to verify state instead.
     if (outcome.networkFailure === true && NON_IDEMPOTENT_METHODS.has(method)) {
       return false;
     }
@@ -327,28 +355,94 @@ export class LumicsClient {
 }
 
 /**
- * Unwrap `{ updated: ... }` (spec §4.2, PATCH/PUT). Tool output stays consistent
- * with the equivalent read rather than exposing a vendor envelope the model then
- * has to reason about.
+ * Unwrap `{ updated: {...} }` (spec §4.2, PATCH/PUT). Tool output stays
+ * consistent with the equivalent read rather than exposing a vendor envelope the
+ * model then has to reason about.
+ *
+ * Use {@link unwrapUpdatedArray} for the batch endpoint, whose envelope holds an
+ * array (spec §7.6).
  */
 export function unwrapUpdated<T>(response: unknown, operation: string): T {
-  if (isRecord(response) && 'updated' in response) {
-    return response.updated as T;
+  return expectEnvelopeObject<T>(response, operation, 'updated');
+}
+
+/**
+ * Unwrap `{ updated: [...] }` (spec §4.2 with spec §7.6, the batch PATCH).
+ *
+ * A separate function rather than a flag, because the two shapes carry different
+ * claims: the singular form says "this record now looks like this" and the plural
+ * says "these N records were changed, and N is how many of your ids matched".
+ * Guessing at N is not an option — see the caller in `src/tools/devices.ts`.
+ */
+export function unwrapUpdatedArray<T>(response: unknown, operation: string): readonly T[] {
+  const inner = openEnvelope(response, operation, 'updated');
+  if (Array.isArray(inner)) {
+    return inner as readonly T[];
+  }
+  throw envelopeContentsError(operation, 'updated', inner, 'an array of the records it changed');
+}
+
+/** Unwrap `{ deleted: {...} }` (spec §4.2, DELETE). */
+export function unwrapDeleted<T>(response: unknown, operation: string): T {
+  return expectEnvelopeObject<T>(response, operation, 'deleted');
+}
+
+/**
+ * Assert the envelope is present *and* that it holds a record.
+ *
+ * Validating only the key is the hole this closes, and it was the write-path twin
+ * of the one {@link expectObject} was written to close on the read path.
+ * `{updated: null}` and `{deleted: null}` satisfied `'deleted' in response`, so
+ * they unwrapped to `null` and were returned as a *successful* tool result whose
+ * entire payload was the literal text `null` — beneath a note stating as fact
+ * that the record had been updated, or permanently deleted. That is a stronger
+ * claim than a read is permitted to make from the identical body, and it is the
+ * failure mode this codebase is organised against, on the one operation that
+ * cannot be undone.
+ */
+function expectEnvelopeObject<T>(
+  response: unknown,
+  operation: string,
+  key: 'updated' | 'deleted',
+): T {
+  const inner = openEnvelope(response, operation, key);
+  if (isRecord(inner)) {
+    return inner as T;
+  }
+  throw envelopeContentsError(operation, key, inner, 'the record it applies to');
+}
+
+/** The envelope key itself: present, or documented drift. */
+function openEnvelope(response: unknown, operation: string, key: 'updated' | 'deleted'): unknown {
+  if (isRecord(response) && key in response) {
+    return response[key];
   }
   throw LumicsApiError.invalidResponse(
     operation,
-    'the response did not contain the documented "updated" envelope (spec section 4.2)',
+    `the response did not contain the documented "${key}" envelope (spec section 4.2)`,
   );
 }
 
-/** Unwrap `{ deleted: ... }` (spec §4.2, DELETE). */
-export function unwrapDeleted<T>(response: unknown, operation: string): T {
-  if (isRecord(response) && 'deleted' in response) {
-    return response.deleted as T;
-  }
-  throw LumicsApiError.invalidResponse(
+/**
+ * The envelope arrived but its contents did not. The wording deliberately mirrors
+ * {@link expectObject} — a missing record is a documented 404, not an empty
+ * envelope — and adds what only a write needs: the operation may well have been
+ * applied, so the model is sent to look rather than told it failed.
+ */
+function envelopeContentsError(
+  operation: string,
+  key: 'updated' | 'deleted',
+  inner: unknown,
+  expected: string,
+): LumicsApiError {
+  const found =
+    inner === null || inner === undefined
+      ? 'it was empty'
+      : `it held ${describeJsonKind(inner)} instead`;
+
+  return LumicsApiError.invalidResponse(
     operation,
-    'the response did not contain the documented "deleted" envelope (spec section 4.2)',
+    `Lumics returned the documented "${key}" envelope (spec section 4.2) but ${found}, so this server cannot show what the write did. This is not the same as "the record does not exist" — a missing record is a documented 404 (spec section 3). The write may already have been applied: do not report it as failed, and do not report the record as absent or deleted. Read the record back, or list its parent collection, to establish the current state. The envelope should carry ${expected}`,
   );
 }
 
