@@ -11,8 +11,7 @@ to a tool name or its arguments ships as a **minor** bump with an explicit notic
 
 ## [0.1.0] - 2026-07-30
 
-First release. Nothing below has shipped yet; this section is the release note under construction
-and is finalised at tag time.
+First release.
 
 ### Added
 
