@@ -1,0 +1,102 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+# contents: read — the workflow does not write to the repository.
+# id-token: write — required to mint the OIDC token that npm provenance uses to
+# attest that this artifact was built by this workflow from this commit.
+permissions:
+  contents: read
+  id-token: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  LUMICS_BASE_URL: http://127.0.0.1:9/api/v1
+
+jobs:
+  release:
+    name: Validate, build, publish
+    runs-on: ubuntu-latest
+    environment: npm-publish
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+          registry-url: https://registry.npmjs.org
+
+      - name: Verify the tag is on main
+        # A release must be cut from the trunk. An annotated tag pointing at a
+        # commit that never reached main would publish unreviewed code.
+        run: |
+          set -euo pipefail
+          git fetch --no-tags --depth=100 origin main
+          if ! git merge-base --is-ancestor "$GITHUB_SHA" origin/main; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not point at a commit on main."
+            exit 1
+          fi
+          echo "Tag commit is an ancestor of main."
+
+      - name: Verify the tag matches package.json
+        # The single most important guard here. Publishing a version that does
+        # not match the tag that produced it makes the release history a lie,
+        # and tags are immutable, so it cannot be quietly corrected.
+        run: |
+          set -euo pipefail
+          tag="${GITHUB_REF_NAME#v}"
+          pkg="$(node -p 'require("./package.json").version')"
+          echo "tag version:          ${tag}"
+          echo "package.json version: ${pkg}"
+          if [ "$tag" != "$pkg" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version ${pkg}. Refusing to publish."
+            exit 1
+          fi
+
+      - name: Verify the changelog records this version
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          if ! grep -q "^## \[${version}\]" CHANGELOG.md; then
+            echo "::error file=CHANGELOG.md::CHANGELOG.md has no section for ${version}. See docs/RELEASE.md."
+            exit 1
+          fi
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
+
+      - name: Test
+        run: npm test
+
+      - name: Build
+        run: npm run build
+
+      - name: Inspect the package contents
+        run: npm pack --dry-run
+
+      - name: Publish to npm with provenance
+        # --provenance ties the published tarball to this workflow run and this
+        # commit, which is what lets a consumer verify where the package came
+        # from. It requires id-token: write, set at the workflow level above.
+        # --access public is required for a first publish under a scope.
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}

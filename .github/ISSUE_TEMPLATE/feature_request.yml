@@ -1,0 +1,129 @@
+name: Feature request
+description: Propose a new capability or a change to an existing one.
+title: 'feat: '
+labels:
+  - enhancement
+  - needs-triage
+body:
+  - type: markdown
+    attributes:
+      value: |
+        This repository is governed by Engineering OS, which means a feature goes through issue →
+        discovery → RFC where required → **approval before implementation** → review → validation.
+        This issue is the first step, not the last.
+
+        Do not open a pull request implementing this before it has been approved. That order exists
+        so nobody builds something that is then rejected on design grounds.
+
+        Two things are settled and are not open to reconsideration by feature request:
+
+        - **Raw Mongo query passthrough** (`componentQuery`, `filters`) is deliberately not exposed.
+          It is a NoSQL injection and unbounded-query surface. Reopening it needs concrete evidence
+          of a use case that the typed arguments genuinely cannot serve.
+        - **Pagination cannot be added.** The Lumics API has none. The server will not fabricate it.
+
+  - type: checkboxes
+    id: preflight
+    attributes:
+      label: Preflight
+      options:
+        - label: I have searched existing issues and RFCs in `docs/rfc/`
+          required: true
+        - label: I have read the README Limitations section
+          required: true
+        - label: I understand implementation requires approval before it starts
+          required: true
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: The problem
+      description: What are you trying to accomplish, and what stops you today? Describe the
+        problem, not the solution you have in mind.
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What you think should happen. A new tool, a new argument, a configuration option,
+        different output shaping.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Devices
+        - Collectors
+        - Components
+        - IPAM (subnets, addresses, groups)
+        - Metrics
+        - Identity
+        - Configuration or safety switches
+        - Transport or distribution
+        - Output shaping or token budget
+        - Documentation
+        - Other
+    validations:
+      required: true
+
+  - type: textarea
+    id: api-support
+    attributes:
+      label: Is this supported by the documented Lumics API?
+      description: >-
+        This is the question that most often decides the answer. Only officially documented API
+        surface may be used. Point at the section of `docs/reference/lumics-api-v1.md` that
+        documents the endpoint and parameters this needs. If nothing does, say so — that makes this
+        a documentation gap to report to the vendor rather than something we can build.
+      placeholder: 'Documented in §7.1, GET /:context/:contextId/devices — the `limit` query
+        parameter.'
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives you considered
+      description: Including doing nothing, and including whether existing tools already get you
+        most of the way there.
+    validations:
+      required: true
+
+  - type: dropdown
+    id: classification
+    attributes:
+      label: Operation classification, if this adds or changes a tool
+      description: Every tool carries one. Read-only additions are considerably easier to approve.
+      options:
+        - Read
+        - Create
+        - Update
+        - Admin
+        - Destructive
+        - Not applicable — no tool change
+
+  - type: checkboxes
+    id: impact
+    attributes:
+      label: Impact
+      options:
+        - label: This would be a breaking change to the tool surface or configuration
+        - label: This touches credential handling, redaction, or a safety gate
+        - label: This would need a new runtime dependency
+        - label: This changes architecture or a layer boundary
+
+  - type: markdown
+    attributes:
+      value: |
+        Anything checked above requires an RFC and explicit approval before implementation.
+
+  - type: textarea
+    id: context
+    attributes:
+      label: Anything else
+      description: Scale, urgency, whether you are willing to implement it yourself once approved.

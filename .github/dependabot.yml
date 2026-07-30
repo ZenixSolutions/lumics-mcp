@@ -1,0 +1,66 @@
+version: 2
+
+# See docs/DEPENDENCY_POLICY.md. Dependabot proposes; it does not decide. Every
+# pull request it opens goes through the same review as any other change: CI
+# green plus one non-author approval. Because dependencies are pinned to exact
+# versions, these pull requests edit package.json as well as the lockfile —
+# that visibility is the point.
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Etc/UTC
+    versioning-strategy: increase
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    commit-message:
+      prefix: 'build'
+      prefix-development: 'build'
+      include: scope
+    groups:
+      # Patch and minor updates are grouped so the queue stays reviewable.
+      production-minor-patch:
+        applies-to: version-updates
+        dependency-type: production
+        update-types:
+          - minor
+          - patch
+      development-minor-patch:
+        applies-to: version-updates
+        dependency-type: development
+        update-types:
+          - minor
+          - patch
+    ignore:
+      # Majors are raised individually, never grouped: each one needs its
+      # upstream changelog read for breaking changes, and owner approval per
+      # docs/DEPENDENCY_POLICY.md.
+      - dependency-name: '*'
+        update-types:
+          - version-update:semver-major
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: '06:00'
+      timezone: Etc/UTC
+    open-pull-requests-limit: 3
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: 'ci'
+      include: scope
+    groups:
+      # Actions are pinned by tag in the workflows. Keeping those pins current
+      # is what stops the pin becoming an excuse to run stale, unpatched CI.
+      github-actions:
+        applies-to: version-updates
+        patterns:
+          - '*'

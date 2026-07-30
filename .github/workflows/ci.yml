@@ -1,0 +1,183 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+# Least privilege: nothing in CI writes to the repository.
+permissions:
+  contents: read
+
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+env:
+  # Never resolve to a real API host in CI. Any accidental outbound call fails
+  # fast against a closed port instead of reaching the live Lumics API.
+  LUMICS_BASE_URL: http://127.0.0.1:9/api/v1
+
+jobs:
+  validate:
+    name: Validate (Node ${{ matrix.node }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        node: ['20', '22']
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node ${{ matrix.node }}
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Typecheck
+        run: npm run typecheck
+
+      - name: Lint
+        run: npm run lint
+
+      - name: Check formatting
+        run: npm run format:check
+
+      # Build BEFORE testing. tests/installation/stdio.test.ts is guarded on
+      # dist/index.js existing, so with the build last those 8 tests silently
+      # skipped and CI still reported success — the entire installation surface
+      # went unexercised on every run. A gate that passes without testing what
+      # it claims to test is worse than no gate.
+      - name: Build
+        run: npm run build
+
+      # Runs with coverage so the D-0003 thresholds (80/80/80/70 on src/api and
+      # src/tools, configured in vitest.config.ts) are actually enforced. Plain
+      # `npm test` skips the gate entirely, which made the approved decision
+      # prose rather than a control — coverage could fall below the threshold
+      # and CI would stay green.
+      - name: Test with coverage gate
+        run: npm run test:coverage
+
+  secret-scan:
+    name: Secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # Full history so the scan covers every commit, not just the tip.
+          fetch-depth: 0
+
+      - name: Scan for committed secrets
+        # Pinned to a release tag. Never use @master or @main for a third-party
+        # action: a mutable ref is a remote-code-execution path into CI.
+        # Dependabot keeps this pin current (.github/dependabot.yml).
+        uses: trufflesecurity/trufflehog@v3.88.0
+        with:
+          path: ./
+          # --only-verified keeps this a blocking gate rather than a noise
+          # generator: it fails on credentials TruffleHog can actively confirm
+          # are live. Unverified matches are deliberately not fatal, because
+          # .env.example and the API reference contain obvious placeholders.
+          extra_args: --only-verified
+
+      - name: Assert no credential files are tracked
+        # A cheap structural check that does not depend on entropy heuristics.
+        run: |
+          set -euo pipefail
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo '::error file=.env::.env must never be committed. See SECURITY.md.'
+            exit 1
+          fi
+          tracked=$(git ls-files -- '*.pem' '*.key' '.env.*' ':!:.env.example')
+          if [ -n "$tracked" ]; then
+            echo '::error::Credential-shaped files are tracked:'
+            echo "$tracked"
+            exit 1
+          fi
+          echo 'No credential files tracked.'
+
+  smoke-stdio:
+    name: Startup smoke test (stdio)
+    runs-on: ubuntu-latest
+    needs: validate
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build
+        run: npm run build
+
+      - name: Server answers an MCP initialize over stdio
+        # Dummy, non-functional credentials. This exercises startup and the
+        # protocol handshake only; no request reaches any API. If it did, the
+        # LUMICS_BASE_URL above points at a closed local port.
+        env:
+          LUMICS_TOKEN: dummy-token-not-a-credential
+          LUMICS_COMPANY_ID: '000000000000000000000000'
+          LUMICS_READ_ONLY: '1'
+        run: |
+          set -euo pipefail
+          request='{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-11-25","capabilities":{},"clientInfo":{"name":"ci-smoke","version":"0.0.0"}}}'
+          printf '%s\n' "$request" | timeout 30s node dist/index.js >stdout.txt 2>stderr.txt || true
+
+          echo '--- stderr ---'
+          cat stderr.txt || true
+          echo '--- stdout ---'
+          cat stdout.txt || true
+
+          if [ ! -s stdout.txt ]; then
+            echo '::error::Server produced no response on stdout.'
+            exit 1
+          fi
+
+          # stdout is the stdio protocol channel. Every line must be a valid
+          # JSON-RPC message; a stray console.log would corrupt the stream, so
+          # assert on the parse rather than trusting the lint rule alone.
+          node --input-type=module -e '
+            import { readFileSync } from "node:fs";
+            const lines = readFileSync("stdout.txt", "utf8").split("\n").filter((l) => l.trim() !== "");
+            let sawResult = false;
+            for (const line of lines) {
+              let msg;
+              try {
+                msg = JSON.parse(line);
+              } catch {
+                console.error(`stdout is not pure JSON-RPC. Offending line: ${line}`);
+                process.exit(1);
+              }
+              if (msg.jsonrpc !== "2.0") {
+                console.error(`Message is not JSON-RPC 2.0: ${line}`);
+                process.exit(1);
+              }
+              if (msg.error) {
+                console.error(`Server returned an error: ${line}`);
+                process.exit(1);
+              }
+              if (msg.id === 1 && msg.result) sawResult = true;
+            }
+            if (!sawResult) {
+              console.error("No initialize result received.");
+              process.exit(1);
+            }
+            console.log("Initialize handshake succeeded on stdio.");
+          '
+
+      - name: Package contents are publishable
+        run: npm pack --dry-run
