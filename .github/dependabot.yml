@@ -36,9 +36,13 @@ updates:
           - minor
           - patch
     ignore:
-      # Majors are raised individually, never grouped: each one needs its
-      # upstream changelog read for breaking changes, and owner approval per
-      # docs/DEPENDENCY_POLICY.md.
+      # npm majors are not proposed at all. Note that this is *suppression*, not
+      # the "raised individually" that docs/DEPENDENCY_POLICY.md describes —
+      # `ignore` stops Dependabot opening the pull request, it does not split it
+      # out. Upgrading a runtime or toolchain major here is therefore a manual,
+      # deliberate act, which matches the exact-version pinning philosophy but
+      # not the wording of the policy. See the pull request that added this
+      # comment; resolving the mismatch needs an owner decision.
       - dependency-name: '*'
         update-types:
           - version-update:semver-major
@@ -60,7 +64,19 @@ updates:
     groups:
       # Actions are pinned by tag in the workflows. Keeping those pins current
       # is what stops the pin becoming an excuse to run stale, unpatched CI.
-      github-actions:
+      #
+      # Minor and patch only. A major is a breaking change to something that
+      # runs with repository credentials, and docs/DEPENDENCY_POLICY.md requires
+      # each one to be raised separately and merged only after its upstream
+      # changelog has been read. Grouping them defeats that: PR #6 arrived as
+      # three majors in one diff, two of which touched release.yml — a workflow
+      # that runs only on tags and so is never exercised by pull-request CI.
+      # Excluding majors here does not silence them; Dependabot raises each one
+      # as its own pull request.
+      github-actions-minor-patch:
         applies-to: version-updates
         patterns:
           - '*'
+        update-types:
+          - minor
+          - patch
