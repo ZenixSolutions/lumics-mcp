@@ -72,7 +72,13 @@ assessment, a security assessment, and owner approval. In practice:
    Limitations all reflect what actually ships. A configuration change that appears in one of
    `.env.example` and the README but not the other blocks the release.
 6. **Changelog is finalised.** The `[Unreleased]` heading becomes `[X.Y.Z] - YYYY-MM-DD`, entries are
-   edited into release notes a user can read, and the comparison link is added.
+   edited into release notes a user can read, and the comparison link is added. Check it locally
+   with `npm run check:changelog -- X.Y.Z`; `release.yml` runs the same script and fails the release
+   if the section is unfinished. It catches a missing or undated heading, an empty section, a
+   missing comparison link, and scaffolding wording left in the body — but the scaffolding check is
+   a phrase list, so it is a floor, not a substitute for reading the section. `0.1.0` published with
+   "Nothing below has shipped yet ... finalised at tag time" still in it, because the old check
+   stopped at the heading (issue #10).
 7. **Compatibility assessment is recorded.** What breaks, for whom, and what they should do. State
    explicitly if nothing breaks.
 8. **Security assessment is recorded.** New or changed security-relevant behaviour, dependency
