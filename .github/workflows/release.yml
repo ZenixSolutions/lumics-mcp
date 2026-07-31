@@ -62,14 +62,17 @@ jobs:
             exit 1
           fi
 
-      - name: Verify the changelog records this version
-        run: |
-          set -euo pipefail
-          version="${GITHUB_REF_NAME#v}"
-          if ! grep -q "^## \[${version}\]" CHANGELOG.md; then
-            echo "::error file=CHANGELOG.md::CHANGELOG.md has no section for ${version}. See docs/RELEASE.md."
-            exit 1
-          fi
+      - name: Verify the changelog section is finalised
+        # Checking that a heading exists is not the same as checking the section
+        # is finished. 0.1.0 published with its section still saying "Nothing
+        # below has shipped yet ... finalised at tag time", because the old check
+        # here stopped at the heading. CHANGELOG.md ships inside the tarball, so
+        # that text reached the registry. Issue #10.
+        #
+        # Node builtins only, so this runs before `npm ci` — a tag that cannot
+        # produce a release should fail in seconds, not after a full install and
+        # test run.
+        run: node scripts/check-changelog.mjs "${GITHUB_REF_NAME}"
 
       - name: Install dependencies
         run: npm ci

@@ -12,8 +12,11 @@ export default tseslint.config(
         // Root-level config files (eslint.config.js, vitest.config.ts) are not
         // in tsconfig.json's `include`, so the project service has no program
         // for them. `allowDefaultProject` lints them with an inferred program.
+        // `scripts/*.mjs` is the same case: build and release tooling that runs
+        // under plain node, is deliberately outside every tsconfig, and would
+        // otherwise be linted by nothing at all.
         projectService: {
-          allowDefaultProject: ['*.js', '*.mjs', '*.cjs', '*.ts'],
+          allowDefaultProject: ['*.js', '*.mjs', '*.cjs', '*.ts', 'scripts/*.mjs'],
         },
         tsconfigRootDir: import.meta.dirname,
       },
@@ -61,9 +64,23 @@ export default tseslint.config(
     // Root-level tooling config is linted for syntax and correctness but not
     // with type-aware rules: it sits outside tsconfig.json's `include`, so the
     // inferred program types `import.meta` as `any` and every type-aware rule
-    // fires on our own config file.
-    files: ['*.js', '*.mjs', '*.cjs', '*.ts'],
+    // fires on our own config file. `scripts/**` is the same: release tooling
+    // that runs under plain node, outside every tsconfig by design.
+    files: ['*.js', '*.mjs', '*.cjs', '*.ts', 'scripts/**/*.mjs'],
     ...tseslint.configs.disableTypeChecked,
+  },
+  {
+    // `scripts/**` runs as a node CLI, so it needs node globals and it writes
+    // to stdout on purpose. The `no-console` ban exists because stdout is the
+    // MCP protocol channel on the stdio transport — that reasoning applies to
+    // the server, not to a release script whose entire job is to print
+    // diagnostics for a human and for the Actions log. It uses
+    // `process.stdout.write` rather than `console` regardless, so the ban is
+    // left in place and only the globals are declared.
+    files: ['scripts/**/*.mjs'],
+    languageOptions: {
+      globals: { process: 'readonly', console: 'readonly' },
+    },
   },
   {
     // Tests may reach for looser typing against mock payloads.
