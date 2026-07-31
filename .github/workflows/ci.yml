@@ -76,12 +76,21 @@ jobs:
           fetch-depth: 0
 
       - name: Scan for committed secrets
-        # Pinned to a release tag. Never use @master or @main for a third-party
-        # action: a mutable ref is a remote-code-execution path into CI.
-        # Dependabot keeps this pin current (.github/dependabot.yml).
+        # Two pins, not one. `uses:` pins the composite wrapper; `version:` pins
+        # the scanner the wrapper actually runs. The action's `version` input
+        # defaults to `latest`, so without the second pin this step downloads
+        # ghcr.io/trufflesecurity/trufflehog:latest on every run — the code that
+        # decides whether the job passes would be a mutable ref, which is the
+        # remote-code-execution path this comment used to claim was closed. It
+        # also meant an upstream change to exit-code behaviour reached this
+        # workflow with no pull request. Keep the two versions equal.
+        #
+        # Dependabot updates the `uses:` ref (.github/dependabot.yml); it does
+        # not know about `version:`. Update both together. See issue #14.
         uses: trufflesecurity/trufflehog@v3.96.0
         with:
           path: ./
+          version: v3.96.0
           # --only-verified keeps this a blocking gate rather than a noise
           # generator: it fails on credentials TruffleHog can actively confirm
           # are live. Unverified matches are deliberately not fatal, because
