@@ -9,7 +9,7 @@ Note that while the version is below `1.0.0`, the tool surface is not yet stable
 to a tool name or its arguments ships as a **minor** bump with an explicit notice in this file. See
 [docs/RELEASE.md](./docs/RELEASE.md).
 
-## [Unreleased]
+## [0.1.2] - 2026-07-31
 
 ### Changed
 
@@ -45,6 +45,12 @@ to a tool name or its arguments ships as a **minor** bump with an explicit notic
   Verified against that exact published text, which the gate rejects on four counts. Be candid
   about the limit: the structural checks are exact, but the scaffolding check is a phrase list and
   only catches wording someone thought to write down.
+
+  Quoted text is excluded from the scaffolding scan — inline code, fenced blocks, blockquotes and
+  double-quoted spans, including spans that wrap across lines. That was not foresight. The gate
+  failed this very release on its first run, because the entry you are reading quotes the wording
+  the gate bans. A changelog documenting a scaffolding phrase is not scaffolding, and a gate that
+  cannot tell the difference would push people to reword accurate notes to appease it.
 
 - `tests/installation/package-contents.test.ts` asks `npm pack` what it would publish and asserts
   the answer. It covers both directions in which `files` fails silently: too broad, which is how the
@@ -437,5 +443,6 @@ modules/:m`, with or without `/summarize`, now carries endpoint-specific guidanc
   component objects carry the Mongoose internals `__t` and `__v`. These are passed through as they
   arrive rather than normalised.
 
+[0.1.2]: https://github.com/ZenixSolutions/lumics-mcp/compare/v0.1.1...v0.1.2
 [0.1.1]: https://github.com/ZenixSolutions/lumics-mcp/compare/v0.1.0...v0.1.1
 [0.1.0]: https://github.com/ZenixSolutions/lumics-mcp/releases/tag/v0.1.0

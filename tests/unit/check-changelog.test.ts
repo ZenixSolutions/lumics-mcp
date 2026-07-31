@@ -181,6 +181,71 @@ describe('the changelog release gate', () => {
     expect(result.code).toBe(0);
   });
 
+  // Quoting a banned phrase is not using it. The gate failed its own 0.1.2
+  // release on exactly this, because the entry describing the gate quotes the
+  // wording the gate bans.
+  it('does not fire on a scaffolding phrase inside double quotes, across lines', () => {
+    const text = [
+      '# Changelog',
+      '',
+      '## [1.0.0] - 2026-07-31',
+      '',
+      '### Added',
+      '',
+      '- A release gate. The previous check missed it, and `0.9.0` published with "Nothing below',
+      '  has shipped yet; this section is the release note under construction and is finalised at',
+      '  tag time" still in it.',
+      '',
+      LINK,
+    ].join('\n');
+
+    const result = check(text, '1.0.0');
+    expect(result.code).toBe(0);
+  });
+
+  it('does not fire on a phrase in inline code, a fence, or a blockquote', () => {
+    const text = [
+      '# Changelog',
+      '',
+      '## [1.0.0] - 2026-07-31',
+      '',
+      '### Added',
+      '',
+      '- A gate that rejects `under construction` in a section body.',
+      '',
+      '  > It rejected: TBD',
+      '',
+      '  ```',
+      '  TODO: finish this',
+      '  ```',
+      '',
+      LINK,
+    ].join('\n');
+
+    const result = check(text, '1.0.0');
+    expect(result.code).toBe(0);
+  });
+
+  // The carve-out must not become a hole.
+  it('still fires when the phrase is unquoted in the same section as a quoted one', () => {
+    const text = [
+      '# Changelog',
+      '',
+      '## [1.0.0] - 2026-07-31',
+      '',
+      '### Added',
+      '',
+      '- A gate. It rejected "under construction" last time.',
+      '- This entry is still to be written.',
+      '',
+      LINK,
+    ].join('\n');
+
+    const result = check(text, '1.0.0');
+    expect(result.code).toBe(1);
+    expect(result.output).toContain('to be written');
+  });
+
   it('exits 2 with usage when given no version, rather than passing vacuously', () => {
     let code = 0;
     try {

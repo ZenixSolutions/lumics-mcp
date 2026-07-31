@@ -21,6 +21,13 @@
  * check is a phrase list, and a phrase list only catches wording someone thought
  * to write down. It is not a substitute for reading the section before tagging;
  * it is a floor under the one failure that has already happened.
+ *
+ * Quoted text is excluded from the scaffolding scan — inline code, fenced code
+ * blocks, blockquotes, and double-quoted spans. This was not foresight: the gate
+ * failed its own first release, because the `0.1.2` entry describing this script
+ * quotes the very phrase the script bans. A changelog that documents a
+ * scaffolding phrase is not scaffolding, and a gate that cannot tell the
+ * difference would push people to reword accurate notes to appease it.
  */
 
 import { readFileSync } from 'node:fs';
@@ -45,6 +52,34 @@ const SCAFFOLDING = [
   'fixme',
   'lorem ipsum',
 ];
+
+/**
+ * Remove spans that are quoting rather than asserting: fenced code blocks,
+ * inline code, blockquote lines, and double-quoted runs (straight or curly).
+ *
+ * Without this the gate cannot distinguish "this section is under construction"
+ * from a note explaining that a previous release said it was. The trade-off is
+ * accepted deliberately: scaffolding a human left behind is not usually in
+ * quotes, and a changelog quoting it almost always is.
+ *
+ * @param {string} body
+ * @returns {string}
+ */
+function stripQuoted(body) {
+  return (
+    body
+      .replace(/```[\s\S]*?```/g, ' ')
+      .replace(/`[^`\n]*`/g, ' ')
+      .split('\n')
+      .filter((line) => !line.trimStart().startsWith('>'))
+      .join('\n')
+      // Quoted spans may wrap across lines — changelog prose is hard-wrapped, and
+      // the quote that exposed this bug spans two. Bounded at 500 characters so an
+      // odd number of quote marks cannot pair wrongly and blank out the section.
+      .replace(/"[^"]{0,500}"/g, ' ')
+      .replace(/\u201c[^\u201d]{0,500}\u201d/g, ' ')
+  );
+}
 
 /** `## [1.2.3] - 2026-07-31` — the shape a finalised heading must have. */
 const DATED_HEADING = /^## \[(?<version>[^\]]+)\] - (?<date>\d{4}-\d{2}-\d{2})\s*$/;
@@ -96,7 +131,7 @@ function checkChangelog(text, version) {
     );
   }
 
-  const lowered = body.toLowerCase();
+  const lowered = stripQuoted(body).toLowerCase();
   for (const phrase of SCAFFOLDING) {
     if (lowered.includes(phrase)) {
       problems.push(
