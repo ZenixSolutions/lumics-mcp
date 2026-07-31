@@ -58,6 +58,7 @@
     "test:watch": "vitest",
     "test:coverage": "vitest run --coverage",
     "test:contract": "LUMICS_CONTRACT_TESTS=1 vitest run tests/contract",
+    "check:changelog": "node scripts/check-changelog.mjs",
     "validate": "npm run typecheck && npm run lint && npm run format:check && npm run build && npm test",
     "prepublishOnly": "npm run validate"
   },

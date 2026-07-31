@@ -29,6 +29,23 @@ to a tool name or its arguments ships as a **minor** bump with an explicit notic
 
 ### Added
 
+- **The release workflow now verifies the changelog section is finished, not merely present.**
+  `scripts/check-changelog.mjs` fails the release on a missing or undated heading, a heading still
+  marked `Unreleased`, an empty section, a missing comparison link, or scaffolding wording left in
+  the body. `release.yml` runs it before `npm ci`, so a tag that cannot produce a release fails in
+  seconds rather than after a full install and test run. Available locally as
+  `npm run check:changelog -- X.Y.Z`.
+
+  The previous check only grepped for the heading, which a section full of scaffolding satisfies —
+  and did: `0.1.0` published with "Nothing below has shipped yet; this section is the release note
+  under construction and is finalised at tag time" still in it, and `CHANGELOG.md` ships inside the
+  tarball, so the release announced on the registry that it had not happened
+  ([#10](https://github.com/ZenixSolutions/lumics-mcp/issues/10)).
+
+  Verified against that exact published text, which the gate rejects on four counts. Be candid
+  about the limit: the structural checks are exact, but the scaffolding check is a phrase list and
+  only catches wording someone thought to write down.
+
 - `tests/installation/package-contents.test.ts` asks `npm pack` what it would publish and asserts
   the answer. It covers both directions in which `files` fails silently: too broad, which is how the
   maps shipped, and too narrow, which would publish a package that installs and cannot start. It
