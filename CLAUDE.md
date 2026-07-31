@@ -55,11 +55,19 @@ Rules:
 
 - **Do not invent endpoints, paths, parameters, enum values, or response fields.** If it is not in
   that file, the code does not use it. Article IV permits only officially documented interfaces.
-- **Do not "fix" the API in code.** The spec records genuine upstream oddities: IPAM address reads
-  use singular `/ipsubnet/` while writes use plural `/ipsubnets/`; `:context` legal values vary per
-  endpoint; some documented parameters do not exist and some existing ones are undocumented. §14 of
-  the spec lists the known documentation defects. Follow what the spec says and reference it in a
-  comment where the behaviour looks wrong.
+- **Do not "fix" the API in code.** The spec records genuine upstream oddities: `PUT` is the only
+  routed verb on `/devices/:id/modules/:module/lastDiscovery` while every neighbouring device write
+  is `PATCH`; `:context` legal values vary per endpoint; identifiers come back as `id` from some
+  routes and `_id` from others; some documented parameters do not exist and some existing ones are
+  undocumented. §14 of the spec lists the known documentation defects. Follow what the spec says and
+  reference it in a comment where the behaviour looks wrong.
+- **But a confident note in the spec is not evidence that anyone checked.** §0 records live-tenant
+  measurements that contradict the vendor's text, marked and dated; where the two disagree, §0 is
+  what the code follows. Read §0 before you trust a page in §5–§15. The example that used to sit in
+  the bullet above was the IPAM `/ipsubnet/` versus `/ipsubnets/` split, presented as an upstream
+  oddity to preserve rather than correct. It was a vendor typo. Every ipaddress route is singular
+  (measured 2026-07-31, §0.5 M13), the plural is not routed for any verb, and `0.1.0` shipped three
+  IPAM write tools that could never have worked. **Do not put that example back.**
 - **Documentation gaps get reported, not guessed around.** If you need behaviour the spec does not
   document, say so and stop. Do not infer it from a plausible-looking pattern, and do not probe the
   live API to find out.

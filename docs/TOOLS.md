@@ -1026,10 +1026,18 @@ without losing anything, use `excludeFromScheduledScan` instead.
 
 ## IPAM addresses — spec §8
 
-> **The path asymmetry is real.** The two reads use the **singular** segment `/ipsubnet/`; POST,
-> PATCH and DELETE use the **plural** `/ipsubnets/`. Spec §13 Q1 confirms this from the vendor's own
-> generated route slugs, so it exists in the route definitions rather than only in prose. This
-> server sends each spelling as documented, per verb.
+> **Every address route is singular `/ipsubnet/`.** All five of the tools below use it. The vendor
+> documents the **plural** `/ipsubnets/` for POST, PATCH and DELETE, spec §13 Q1 read that as a real
+> per-verb split and told implementers not to "fix" it, and this server sent the plural. That is
+> wrong. Measured against the live API on 2026-07-31: the plural is not routed for **any** verb — it
+> answers with an HTML 404 error page, which is how a missing route is told apart from a missing
+> record here, because a routed path answers JSON even when it finds nothing.
+>
+> **This shipped as a defect in `0.1.0`.** `lumics_create_ipaddress`, `lumics_update_ipaddress` and
+> `lumics_delete_ipaddress` addressed a path that does not exist and could never have succeeded;
+> a create call against the published `0.1.0` is what surfaced it. Corrected in 0.1.1. The two reads
+> were unaffected and have always been right. Evidence: spec §0.5 M13, §13 Q1, §14 defect 26 and
+> [`contract-runs/2026-07-31-run-04.md`](./contract-runs/2026-07-31-run-04.md).
 
 ### `lumics_list_ipaddresses`
 
@@ -1074,7 +1082,8 @@ status-change history behind an intermittent host.
 ### `lumics_create_ipaddress`
 
 - **Class:** Create
-- **Endpoint:** `POST /companies/:companyId/ipsubnets/:ipSubnet/ipaddresses` (spec §8.3 — **plural**)
+- **Endpoint:** `POST /companies/:companyId/ipsubnet/:ipSubnet/ipaddresses` (spec §8.3 documents the
+  **plural** and is wrong — the routed path is **singular**, measured 2026-07-31; see the note above)
 - **Gating:** none
 
 | Argument      | Type   | Required     | Default             | Constraints                                                                   |
@@ -1102,8 +1111,9 @@ one.
 ### `lumics_update_ipaddress`
 
 - **Class:** Update
-- **Endpoint:** `PATCH /companies/:companyId/ipsubnets/:ipSubnet/ipaddresses/:id` (spec §8.4 —
-  **plural**)
+- **Endpoint:** `PATCH /companies/:companyId/ipsubnet/:ipSubnet/ipaddresses/:id` (spec §8.4
+  documents the **plural** and is wrong — the routed path is **singular**, measured 2026-07-31; see
+  the note above)
 - **Gating:** none
 
 | Argument                                                               | Type   | Required     | Default             | Constraints                                                                                                   |
@@ -1124,8 +1134,9 @@ Prefer this over delete when an address is being released but its history is wor
 ### `lumics_delete_ipaddress`
 
 - **Class:** Destructive
-- **Endpoint:** `DELETE /companies/:companyId/ipsubnets/:ipSubnet/ipaddresses/:id` (spec §8.5 —
-  **plural**)
+- **Endpoint:** `DELETE /companies/:companyId/ipsubnet/:ipSubnet/ipaddresses/:id` (spec §8.5
+  documents the **plural** and is wrong — the routed path is **singular**, measured 2026-07-31; see
+  the note above)
 - **Gating:** requires `confirm: true`; not registered under `LUMICS_READ_ONLY=1`
 
 | Argument      | Type           | Required     | Default             | Constraints            |

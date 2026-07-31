@@ -122,9 +122,20 @@ consumer verify where the package came from. It requires `id-token: write` on th
 Contract tests (`npm run test:contract`, gated on `LUMICS_CONTRACT_TESTS=1`) make real calls against
 a live Lumics tenant. They exist to validate the assumption the whole codebase rests on: that the
 captured contract in [`docs/reference/lumics-api-v1.md`](./reference/lumics-api-v1.md) matches live
-behaviour. That assumption is not free — the specification contains documented oddities such as the
-IPAM singular/plural path asymmetry and several parameters documented as optional that cannot be, and
-upstream drift is a real, rated risk.
+behaviour. That assumption is not free — the specification contains documented oddities such as
+several parameters documented as optional that cannot be, and upstream drift is a real, rated risk.
+
+The sharpest case so far is one the gate did not catch. The spec documented the IPAM address routes
+as singular `/ipsubnet/` for reads and plural `/ipsubnets/` for writes, and told implementers not to
+"fix" it. A hand-run `curl` probe of the write paths on 2026-07-31 found that every ipaddress route
+is singular and the plural is not routed for any verb, so `0.1.0` shipped with
+`lumics_create_ipaddress`, `lumics_update_ipaddress` and `lumics_delete_ipaddress` addressing a path
+that does not exist. The suite could not have found it: it is read-only by design (D-0006), so no
+run of it reaches a write path at all. The gate was working as designed and the defect went past it
+anyway. That is an argument for running the gate, not against it — it is the same class of drift the
+2026-07-30 run did catch in the metric layer — but it means the gate's coverage has to be described
+by what it cannot reach as well as by what it runs. Record:
+[`contract-runs/2026-07-31-run-04.md`](./contract-runs/2026-07-31-run-04.md).
 
 They are deliberately excluded from CI:
 

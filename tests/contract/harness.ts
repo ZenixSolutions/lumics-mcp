@@ -55,10 +55,21 @@
  * reported as **slow, and the assumption behind it UNVERIFIED**, in a bounded
  * amount of time.
  *
- * **READ-ONLY, without exception.** Every call this suite makes is a GET. It
- * never touches `GET /me/token`, `POST /me/token` or `POST /me/token/revoke` —
- * the first two mint credentials and the third would revoke the operator's own
- * working token mid-run (spec §11.2–§11.4).
+ * **NOTHING IS MUTATED, without exception.** Until 2026-07-31 that rule was
+ * stated as "every call this suite makes is a GET", and it was true — which is
+ * exactly how `0.1.0` shipped three IPAM write tools addressing a route that does
+ * not exist, past a gate that could not reach a write path at all (spec §0.5 M13,
+ * §14 defect 26, D-0014). `live-write-routes.test.ts` now issues POST, PATCH, PUT
+ * and DELETE **to check routing only**: every one is aimed at an id no record has
+ * and carries an empty body, so a routed request has nothing to act on, and the
+ * one thing being read off the answer is whether the path exists. The rule that
+ * matters is unchanged and is the stronger one: **no case in this directory may
+ * create, change or delete anything.** A case that needs a real record to write to
+ * does not belong here without its own approval (`docs/RELEASE.md`).
+ *
+ * The token endpoints are never touched, by any verb: `GET /me/token` and
+ * `POST /me/token` mint credentials, and `POST /me/token/revoke` would revoke the
+ * operator's own working token mid-run (spec §11.2–§11.4).
  *
  * **Configuration comes from the process environment and nowhere else.** The
  * server no longer reads a `.env` file (`tests/security/dotenv-not-loaded.test.ts`
@@ -74,6 +85,7 @@ import { randomBytes } from 'node:crypto';
 import { describe, expect, it, type TestContext } from 'vitest';
 import { expectArray, LumicsClient } from '../../src/api/client.js';
 import { devicesPath } from '../../src/api/paths.js';
+import { CONTEXT_COMPANIES } from '../../src/constants.js';
 import { loadConfig, type LumicsConfig } from '../../src/config.js';
 import type { Device } from '../../src/domain/index.js';
 
@@ -229,6 +241,39 @@ export async function pinnedCompanyDevices(limit = 3): Promise<readonly Device[]
  */
 export function syntheticObjectId(): string {
   return randomBytes(12).toString('hex');
+}
+
+// ---------------------------------------------------------------------------
+// The PLURAL ipaddress spelling, which src/api/paths.ts deliberately no longer
+// builds
+// ---------------------------------------------------------------------------
+
+/**
+ * `/companies/:c/ipsubnets/:s/ipaddresses` — the spelling spec §8.3–§8.5
+ * documented, `0.1.0` shipped, and the live API does not route for any verb
+ * (spec §0.5 M13).
+ *
+ * Built here rather than imported because `src/api/paths.ts` no longer builds it:
+ * that is the fix, and a case guarding against its return cannot borrow the code
+ * it is guarding. Two files need it — `live-read-only.test.ts` for the GET and
+ * `live-write-routes.test.ts` for the three write verbs — so it lives in the
+ * shared module rather than being written twice and drifting.
+ *
+ * Encoded the way `src/api/paths.ts` encodes. A test is not a licence to
+ * interpolate an unescaped value into a URL, and the company id here comes from
+ * configuration.
+ */
+export function pluralIpAddressesPath(companyId: string, ipSubnetId: string): string {
+  return `/${CONTEXT_COMPANIES}/${encodeURIComponent(companyId)}/ipsubnets/${encodeURIComponent(ipSubnetId)}/ipaddresses`;
+}
+
+/** The plural single-address path, for the §8.4 PATCH and §8.5 DELETE guards. */
+export function pluralIpAddressPath(
+  companyId: string,
+  ipSubnetId: string,
+  ipAddressId: string,
+): string {
+  return `${pluralIpAddressesPath(companyId, ipSubnetId)}/${encodeURIComponent(ipAddressId)}`;
 }
 
 // ---------------------------------------------------------------------------
