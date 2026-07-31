@@ -21,7 +21,7 @@ export const SERVER_NAME = 'lumics-mcp';
  * release that 0.1.1 exists to replace. `tests/unit/version.test.ts` now pins
  * the two together, because a hand step nothing verifies is not a step.
  */
-export const SERVER_VERSION = '0.1.1';
+export const SERVER_VERSION = '0.1.2';
 
 /** Prefix for every registered tool name. */
 export const TOOL_PREFIX = 'lumics_';
