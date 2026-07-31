@@ -1,6 +1,6 @@
 {
   "name": "@zenixsolutions/lumics-mcp",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "Model Context Protocol server for the Lumics network monitoring platform. Community project, not affiliated with or endorsed by Lumics or NetCuras.",
   "license": "MIT",
   "author": "Zenix Solutions",

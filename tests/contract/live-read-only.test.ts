@@ -20,10 +20,15 @@
  * both read at runtime.
  *
  * This file covers identity (spec §11.1), the list conventions of spec §4.2/§4.3
- * and the IPAM path asymmetry of spec §13 Q1. Its siblings cover the rest:
+ * and the IPAM address READ paths of spec §8.1. Its siblings cover the rest:
  * `live-metrics.test.ts` (spec §12, the largest and riskiest surface, plus the
  * spec §7.2 device-ownership pre-read that puts the device metric endpoints behind
- * the company pin) and `live-resources.test.ts` (spec §5, §6, §9). Shared gating,
+ * the company pin), `live-resources.test.ts` (spec §5, §6, §9) and
+ * `live-write-routes.test.ts`, which checks whether the POST, PATCH, PUT and
+ * DELETE paths this server sends are **routed at all** — without writing anything.
+ * That last one exists because this file could not have found the defect it now
+ * guards: a read-only run establishes the spelling of a read path and nothing
+ * whatever about a write path (spec §0.5 M13, §14 defect 26, D-0014). Shared gating,
  * the evidence ledger, the sparse-tenant mechanism and the one sanctioned source
  * of a device id live in `harness.ts`; read its header before adding a case.
  *
@@ -37,7 +42,6 @@ import {
   componentTypesPath,
   devicesPath,
   ipAddressesReadPath,
-  ipAddressesWritePath,
   ipSubnetsPath,
   mePath,
 } from '../../src/api/paths.js';
@@ -53,6 +57,7 @@ import {
   isObjectIdShaped,
   isRecord,
   keysOf,
+  pluralIpAddressesPath,
   recordAsserted,
   recordObserved,
   reportEvidence,
@@ -259,7 +264,10 @@ describe.skipIf(!RUNNABLE)(
   },
 );
 
-describe.skipIf(!RUNNABLE)('live contract: A1 — the IPAM ipsubnet/ipsubnets asymmetry', () => {
+// The heading used to say "asymmetry", which the 2026-07-31 measurement reduced
+// to a property of the vendor's documentation and of nothing else: on the
+// deployed API every ipaddress route is singular (spec §0.5 M13).
+describe.skipIf(!RUNNABLE)('live contract: A1 — the IPAM ipsubnet/ipsubnets spellings', () => {
   /** First subnet id on the tenant, or an UNVERIFIED skip. spec §10.1. */
   async function firstSubnetId(ctx: TestContext, claim: string): Promise<string> {
     const { client: api, config } = client();
@@ -291,7 +299,7 @@ describe.skipIf(!RUNNABLE)('live contract: A1 — the IPAM ipsubnet/ipsubnets as
   }
 
   it(
-    'ASSERT: the SINGULAR read path for ipaddresses works (spec section 8.1, section 13 Q1)',
+    'ASSERT: the SINGULAR read path for ipaddresses works (spec section 8.1)',
     async (ctx) => {
       const claim = 'the SINGULAR /ipsubnet/:id/ipaddresses path serves reads';
       const subnetId = await firstSubnetId(ctx, claim);
@@ -302,7 +310,7 @@ describe.skipIf(!RUNNABLE)('live contract: A1 — the IPAM ipsubnet/ipsubnets as
       });
       expect(
         Array.isArray(addresses),
-        `the SINGULAR /ipsubnet/ read path returned ${describeValue(addresses)} instead of the documented bare array. src/api/paths.ts uses the singular spelling for reads on the strength of spec section 13 Q1; if it does not work, every IPAM address read is broken.`,
+        `the SINGULAR /ipsubnet/ read path returned ${describeValue(addresses)} instead of the documented bare array. src/api/paths.ts now uses the singular spelling for EVERY ipaddress call, reads included, on the strength of the 2026-07-31 measurement (spec section 0.5 M13); if it does not work, every IPAM address tool is broken.`,
       ).toBe(true);
       recordAsserted('8.1', claim, `returned ${describeValue(addresses)}`);
     },
@@ -310,25 +318,47 @@ describe.skipIf(!RUNNABLE)('live contract: A1 — the IPAM ipsubnet/ipsubnets as
   );
 
   it(
-    'OBSERVE: whether the PLURAL path also serves reads, which the docs do not claim',
+    'OBSERVE: whether the PLURAL spelling answers a GET at all (spec section 0.5 M13)',
     async (ctx) => {
-      const claim = 'the PLURAL /ipsubnets/:id/ipaddresses spelling is write-only';
+      const claim = 'the PLURAL /ipsubnets/:id/ipaddresses spelling does not serve reads';
       const subnetId = await firstSubnetId(ctx, claim);
       const { client: api, config } = client();
 
-      // A GET against the write spelling. This is still read-only. Either outcome
-      // is informative: a 404 confirms the asymmetry is real and load-bearing, a
-      // 200 means the two spellings are interchangeable for reads and the code
-      // could be simplified — which is an issue to raise, not a change to make.
+      // WITHDRAWN INFERENCE, kept visible because how it happened is the useful
+      // part. Until 2026-07-31 this case was titled "whether the PLURAL path
+      // ALSO serves reads", its claim read "the plural spelling is write-only",
+      // and it reported a 404 here as evidence that "the asymmetry is real and
+      // the singular read path is load-bearing". Every word of the measurement
+      // was right and the inference was wrong: a 404 on a GET is equally
+      // consistent with "this spelling is reserved for writes" and with "this
+      // spelling is not routed at all", and spec §0.5 M13 measured the second —
+      // the plural answers an HTML 404 for GET, POST, PATCH and DELETE alike.
+      // That withdrawn reading is what `src/api/paths.ts` was built on, and it
+      // shipped: `lumics_create_ipaddress`, `lumics_update_ipaddress` and
+      // `lumics_delete_ipaddress` in 0.1.0 addressed a route that does not exist
+      // (spec §14 defect 26, D-0014, `docs/contract-runs/2026-07-31-run-04.md`).
       //
-      // The previous assertion here was `expect(['accepted','rejected'])
-      // .toContain(outcome)` over a value that could only be one of those two
-      // strings: a tautology, in the file that is supposed to be the release
-      // gate. What is actually assertable is that the API answered in a way spec
-      // section 3 documents — a 500 or an undocumented status is drift, not an
-      // answer — and the rest is recorded as an observation.
+      // The lesson is narrow and is why this comment survives: a read-only case
+      // can establish the spelling of a READ path and nothing whatever about a
+      // write path. The write verbs are checked in `live-write-routes.test.ts`,
+      // which reads routing off the body — HTML means no such route, JSON means
+      // no such record — and this case must not be read as saying anything about
+      // them.
+      //
+      // The path is built by `pluralIpAddressesPath` in the harness rather than
+      // by `src/api/paths.ts`, which no longer produces the plural at all. Before
+      // the fix this case called `ipAddressesWritePath`, which now returns the
+      // singular: it was silently GETting the same path as the case above and
+      // recording the answer as evidence about the plural.
+      //
+      // Still read-only, and still an observation rather than an assertion: the
+      // vendor could route the plural tomorrow, and a release gate should report
+      // that rather than fail on it. What IS asserted is that the API answered in
+      // a way spec section 3 documents.
       const outcome = await attempt(
-        api.get<unknown>(ipAddressesWritePath(config.companyId, subnetId), { query: { limit: 1 } }),
+        api.get<unknown>(pluralIpAddressesPath(config.companyId, subnetId), {
+          query: { limit: 1 },
+        }),
       );
 
       expect(
@@ -337,15 +367,15 @@ describe.skipIf(!RUNNABLE)('live contract: A1 — the IPAM ipsubnet/ipsubnets as
       ).toBe(true);
       expect(
         outcome.ok ? undefined : outcome.status,
-        'the plural spelling produced a 500 — that is a server fault rather than an answer about routing, and it tells us nothing about the asymmetry.',
+        'the plural spelling produced a 500 — that is a server fault rather than an answer about routing, and it tells us nothing about whether the route exists.',
       ).not.toBe(500);
 
       recordObserved(
-        '13 Q1',
-        'the docs use singular /ipsubnet/ for address reads and plural /ipsubnets/ for writes, without saying whether the plural also reads',
+        '0.5 M13',
+        'the docs spell the ipaddress writes with a plural /ipsubnets/ that the live API does not route for any verb; this case checks the GET half of that',
         outcome.ok
-          ? 'the PLURAL spelling ALSO serves reads — the two are interchangeable for GET, so the split in src/api/paths.ts is defensive rather than required. Raise an issue; do not simplify the code on the strength of one tenant.'
-          : `the PLURAL spelling was ${describeOutcome(outcome)} for a GET — the asymmetry is real and the singular read path in src/api/paths.ts is load-bearing.`,
+          ? 'the PLURAL spelling SERVES READS on this tenant, which spec section 0.5 M13 measured it not doing on 2026-07-31 — either the vendor has added the route or this tenant differs. Raise an issue; do not change src/api/paths.ts on the strength of one tenant, and note that live-write-routes.test.ts is what would tell you whether the write verbs moved with it.'
+          : `the PLURAL spelling was ${describeOutcome(outcome)} for a GET. That is consistent with the plural being NOT ROUTED (spec section 0.5 M13), and it does NOT mean the plural is "write-only" — the inference this case used to record, and which shipped as a defect in 0.1.0 (section 14 defect 26, D-0014). Two limits on what this line is worth. It is read off the STATUS, because this case asks through LumicsClient, which sends Accept: application/json — and under that header this API answers an unrouted path with a JSON 404 indistinguishable from a routed path reporting no such record. It is readable at all only because the subnet id here is a real one, so a routed collection read would have answered 200. The direct evidence, asked with a wildcard Accept so the router's HTML error page survives, is in live-write-routes.test.ts — which is also the only place the write verbs are established.`,
       );
     },
     TIMEOUT,

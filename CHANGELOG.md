@@ -9,6 +9,51 @@ Note that while the version is below `1.0.0`, the tool surface is not yet stable
 to a tool name or its arguments ships as a **minor** bump with an explicit notice in this file. See
 [docs/RELEASE.md](./docs/RELEASE.md).
 
+## [0.1.1] - 2026-07-31
+
+Fixes three tools that could never have worked in `0.1.0`.
+
+### Fixed
+
+- **`lumics_create_ipaddress`, `lumics_update_ipaddress` and `lumics_delete_ipaddress` addressed a
+  route that does not exist.** They sent the PLURAL `/ipsubnets/:id/ipaddresses` segment, which the
+  Lumics API does not route for any verb. All three now send the SINGULAR `/ipsubnet/`, which is
+  what every IP address route uses. Verified against a live tenant on 2026-07-31, including a real
+  create. The two read tools were unaffected and always worked.
+
+  The captured contract was the source of the error, not a slip in the code. `docs/reference/lumics-api-v1.md`
+  §13 Q1 documented a per-verb split — singular reads, plural writes — asserted it was "confirmed
+  present in the vendor's own route definitions", and instructed readers not to "fix" it. Measured
+  against the live API, there is no such split. §13 Q1 is corrected in place with the vendor's
+  original wording retained alongside, and the measurements are recorded in §0.5 (M13–M16), §14
+  defects 26–28, and [`docs/contract-runs/2026-07-31-run-04.md`](./docs/contract-runs/2026-07-31-run-04.md).
+
+  Surfaced by a user bug report of a hung `lumics_create_ipaddress` call. The hang came from the
+  prototype this server replaced; on `0.1.0` the same call fails in about 150ms with a clean 404.
+
+### Added
+
+- `tests/contract/live-write-routes.test.ts` — live routing coverage for **every** write path, not
+  just IPAM. It mutates nothing: probes address ids no record holds and send empty bodies, so a
+  routed path can answer without anything being created, changed or deleted.
+
+  This closes the gap that let the defect ship. The contract gate was read-only by design (D-0006),
+  so it had never issued a single write request, and `0.1.0` passed it with three broken tools. The
+  four top-level `POST` creates remain deliberately **UNVERIFIED** rather than probed, because a
+  top-level create has no parent id to falsify — recorded as such rather than asserted weakly.
+
+### Changed
+
+- Route probing must not use this project's own HTTP client. `LumicsClient` sends
+  `Accept: application/json`, and the API content-negotiates its router 404 into JSON — which makes
+  a dead route indistinguishable from a missing record. The first live run of the new suite passed
+  its positive assertions while establishing nothing for exactly this reason. The probes now issue
+  raw requests with `Accept: */*`, where an unrouted path answers an HTML error page, and the
+  premise is stated in the classifier's own documentation.
+- `README.md`, `CLAUDE.md`, `docs/TOOLS.md` and `docs/RELEASE.md` no longer state the withdrawn
+  per-verb rule. `CLAUDE.md`'s "do not fix the API in code" guidance stands; only its example
+  changed, since the old one would now lead an agent to reintroduce the defect.
+
 ## [0.1.0] - 2026-07-30
 
 First release.
@@ -349,4 +394,5 @@ modules/:m`, with or without `/summarize`, now carries endpoint-specific guidanc
   component objects carry the Mongoose internals `__t` and `__v`. These are passed through as they
   arrive rather than normalised.
 
-[0.1.0]: https://github.com/ZenixSolutions/lumics-mcp/commits/main
+[0.1.1]: https://github.com/ZenixSolutions/lumics-mcp/compare/v0.1.0...v0.1.1
+[0.1.0]: https://github.com/ZenixSolutions/lumics-mcp/releases/tag/v0.1.0

@@ -3,10 +3,14 @@
  *
  * Two things are locked in here.
  *
- * **1. The exact spelling of every path in spec §15**, including the IPAM
- * singular/plural asymmetry (`/ipsubnet/` on reads, `/ipsubnets/` on writes,
- * spec §13 Q1). That asymmetry looks like a bug and is not; a test is the only
- * thing standing between it and a well-meaning normalisation.
+ * **1. The exact spelling of every path in spec §15**, except where §0 records a
+ * live measurement that contradicts it. The IPAM address routes are the case
+ * that matters: §13 Q1 documents a per-verb singular/plural split and insists it
+ * is real, and it is not. Every address route is singular (MEASURED 2026-07-31).
+ * The case below used to assert the split, and so pinned a route that does not
+ * exist — three write tools shipped broken in 0.1.0 with this suite green. A
+ * test pinning a path proves the code matches the spec; it can never prove the
+ * spec matches the API.
  *
  * **2. That no caller-supplied segment can escape its position.** The prototype
  * interpolated ids straight into template literals, so an id of `../../me/token`
@@ -99,12 +103,12 @@ describe('path spellings match spec section 15', () => {
     [
       'ipAddressesWritePath',
       paths.ipAddressesWritePath(C, TEST_SUBNET_ID),
-      `/companies/${C}/ipsubnets/${TEST_SUBNET_ID}/ipaddresses`,
+      `/companies/${C}/ipsubnet/${TEST_SUBNET_ID}/ipaddresses`,
     ],
     [
       'ipAddressWritePath',
       paths.ipAddressWritePath(C, TEST_SUBNET_ID, TEST_ADDRESS_ID),
-      `/companies/${C}/ipsubnets/${TEST_SUBNET_ID}/ipaddresses/${TEST_ADDRESS_ID}`,
+      `/companies/${C}/ipsubnet/${TEST_SUBNET_ID}/ipaddresses/${TEST_ADDRESS_ID}`,
     ],
 
     // spec §9, §10 — groups and subnets
@@ -185,7 +189,7 @@ describe('path spellings match spec section 15', () => {
  * The IPAM asymmetry gets its own test with its own name, so a failure message
  * says what the intent was rather than just "path mismatch".
  */
-describe('IPAM ipsubnet/ipsubnets asymmetry (spec section 13 Q1) is intentional', () => {
+describe('IPAM address routes are singular for every verb (MEASURED 2026-07-31)', () => {
   it('address READS use the singular /ipsubnet/ segment', () => {
     expect(paths.ipAddressesReadPath(C, TEST_SUBNET_ID)).toContain(`/ipsubnet/${TEST_SUBNET_ID}/`);
     expect(paths.ipAddressesReadPath(C, TEST_SUBNET_ID)).not.toContain('/ipsubnets/');
@@ -195,11 +199,24 @@ describe('IPAM ipsubnet/ipsubnets asymmetry (spec section 13 Q1) is intentional'
     );
   });
 
-  it('address WRITES use the plural /ipsubnets/ segment', () => {
-    expect(paths.ipAddressesWritePath(C, TEST_SUBNET_ID)).toContain(
-      `/ipsubnets/${TEST_SUBNET_ID}/`,
+  it('address WRITES use the singular segment too — the documented plural is unrouted', () => {
+    expect(paths.ipAddressesWritePath(C, TEST_SUBNET_ID)).toContain(`/ipsubnet/${TEST_SUBNET_ID}/`);
+    expect(paths.ipAddressesWritePath(C, TEST_SUBNET_ID)).not.toContain('/ipsubnets/');
+    expect(paths.ipAddressWritePath(C, TEST_SUBNET_ID, TEST_ADDRESS_ID)).toContain('/ipsubnet/');
+    expect(paths.ipAddressWritePath(C, TEST_SUBNET_ID, TEST_ADDRESS_ID)).not.toContain(
+      '/ipsubnets/',
     );
-    expect(paths.ipAddressWritePath(C, TEST_SUBNET_ID, TEST_ADDRESS_ID)).toContain('/ipsubnets/');
+  });
+
+  it('the read and write builders now produce identical strings', () => {
+    // The inverse of what this file used to assert. Explicit so a future reader
+    // sees the equality is intended rather than an accident of refactoring.
+    expect(paths.ipAddressesWritePath(C, TEST_SUBNET_ID)).toBe(
+      paths.ipAddressesReadPath(C, TEST_SUBNET_ID),
+    );
+    expect(paths.ipAddressWritePath(C, TEST_SUBNET_ID, TEST_ADDRESS_ID)).toBe(
+      paths.ipAddressReadPath(C, TEST_SUBNET_ID, TEST_ADDRESS_ID),
+    );
   });
 
   it('the subnet resource itself is always plural', () => {

@@ -14,8 +14,11 @@
  * `companyId` rather than a `context`/`contextId` pair, which also removes a
  * whole class of malformed-URL mistakes the prototype made.
  *
- * Path spellings follow spec §15 exactly, including the IPAM singular/plural
- * asymmetry confirmed real in the vendor's route definitions (spec §13 Q1).
+ * Path spellings follow spec §15 exactly, EXCEPT where §0 records a live
+ * measurement that contradicts it. The IPAM address routes are that case: §13 Q1
+ * documents a per-verb singular/plural split and insists it is real, and it is
+ * not — every address route is singular (MEASURED 2026-07-31). See the IPAM
+ * section below.
  */
 
 import { CONTEXT_COMPANIES } from '../constants.js';
@@ -160,10 +163,23 @@ export function devicesBatchPath(companyId: string, deviceIds: readonly string[]
 // IPAM — spec §8, §9, §10
 // ---------------------------------------------------------------------------
 //
-// spec §13 Q1: the ipaddress routes use SINGULAR `/ipsubnet/` for the two reads
-// and PLURAL `/ipsubnets/` for POST/PATCH/DELETE. This is confirmed present in
-// the vendor's own route definitions (the generated doc slugs encode it), not a
-// prose typo. Do not "fix" it — the correct spelling differs per verb.
+// spec §13 Q1 claimed the ipaddress routes use SINGULAR `/ipsubnet/` for the two
+// reads and PLURAL `/ipsubnets/` for POST/PATCH/DELETE, and warned against
+// "fixing" it. MEASURED 2026-07-31: that is wrong, and it shipped as a defect in
+// 0.1.0 — create, update and delete could not work at all.
+//
+// EVERY ipaddress route is SINGULAR `/ipsubnet/`. The plural spelling is not
+// routed for any verb; it returns an HTML 404 error page, which is how routing
+// can be told apart from a missing record here (a routed path answers JSON).
+//
+//   GET    /companies/:c/ipsubnet/:s/ipaddresses       200   (plural: 404 html)
+//   POST   /companies/:c/ipsubnet/:s/ipaddresses       200   (plural: 404 html)
+//   PATCH  /companies/:c/ipsubnet/:s/ipaddresses/:id   200   (plural: 404 html)
+//   DELETE /companies/:c/ipsubnet/:s/ipaddresses/:id   routed (plural: 404 html)
+//
+// So the read and write paths are the same, and the read/write split below is
+// kept only so callers do not all have to change; both now build the singular
+// form. See docs/contract-runs/2026-07-31-run-04.md and §14 defect 26.
 
 /** spec §8.1 `GET /companies/:company/ipsubnet/:ipSubnet/ipaddresses` (singular). */
 export function ipAddressesReadPath(companyId: string, ipSubnetId: string): string {
@@ -182,12 +198,20 @@ export function ipAddressReadPath(
   return `${ipAddressesReadPath(companyId, ipSubnetId)}/${seg(ipAddressId, 'ipAddressId')}`;
 }
 
-/** spec §8.3 `POST /companies/:company/ipsubnets/:ipSubnet/ipaddresses` (plural). */
+/**
+ * spec §8.3 `POST /companies/:company/ipsubnet/:ipSubnet/ipaddresses`.
+ * SINGULAR, measured — the spec's plural is not routed. Identical to
+ * {@link ipAddressesReadPath}; kept as a separate name so the call sites read
+ * as writes.
+ */
 export function ipAddressesWritePath(companyId: string, ipSubnetId: string): string {
-  return `${ipSubnetPath(companyId, ipSubnetId)}/ipaddresses`;
+  return ipAddressesReadPath(companyId, ipSubnetId);
 }
 
-/** spec §8.4 `PATCH`, §8.5 `DELETE` on `/ipsubnets/:ipSubnet/ipaddresses/:id` (plural). */
+/**
+ * spec §8.4 `PATCH`, §8.5 `DELETE` on
+ * `/companies/:company/ipsubnet/:ipSubnet/ipaddresses/:id`. SINGULAR, measured.
+ */
 export function ipAddressWritePath(
   companyId: string,
   ipSubnetId: string,

@@ -619,9 +619,13 @@ we cannot tell you where the ceiling is because Lumics does not say.
   row a metric call returned. Metric **property** names are enumerable from one endpoint only, and
   only for device-scoped metrics — see
   [Metric tools require a `properties` argument](#metric-tools-require-a-properties-argument-and-a-wrong-one-is-not-an-error).
-- IPAM address routes use singular `/ipsubnet/` for reads and plural `/ipsubnets/` for writes.
-  This asymmetry is real in the vendor's route definitions, not a documentation typo, and the
-  server sends each spelling as documented.
+- **Every IPAM address route uses the singular `/ipsubnet/` segment** — all five of them. The vendor
+  documents the plural `/ipsubnets/` for POST, PATCH and DELETE, and told implementers not to "fix"
+  it. That is wrong: measured against the live API on 2026-07-31, the plural is not routed for any
+  verb. This shipped as a defect in `0.1.0`, where `lumics_create_ipaddress`,
+  `lumics_update_ipaddress` and `lumics_delete_ipaddress` addressed a path that does not exist and
+  could never have succeeded. Fixed in 0.1.1; the two address reads were always correct. Detail in
+  [`docs/reference/lumics-api-v1.md`](./docs/reference/lumics-api-v1.md) §0.5 and §14 defect 26.
 - **The vendor documentation does drift from live behaviour, and has been measured doing so.** The
   first contract run against a live tenant, on 2026-07-30, contradicted it in seven places, four of
   them in the metric layer. Those measurements are recorded, dated and marked in

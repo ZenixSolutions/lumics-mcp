@@ -8,13 +8,15 @@
 
 > **Redaction note:** all example ObjectIds, IP addresses, hostnames, e-mail addresses and tokens from the documentation examples have been replaced with placeholders. Identifier *shapes* are preserved: every `hex id` in this API is a 24-character hex MongoDB ObjectId (e.g. `5628b8174b6cf000001bf163` shape → written here as `<objectId>`).
 
-> **This document is no longer only the vendor's documentation.** On **2026-07-30** the contract suite was run against a live tenant for the first time and it contradicted the vendor's documentation in several places — including one, `properties`, that makes four of the five metric endpoints unusable as documented. Those measurements are recorded here, marked, and dated. **Read [§0](#0-live-tenant-measurements--2026-07-30) before implementing anything against §6 or §12.**
+> **This document is no longer only the vendor's documentation.** On **2026-07-30** the contract suite was run against a live tenant for the first time and it contradicted the vendor's documentation in several places — including one, `properties`, that makes four of the five metric endpoints unusable as documented. On **2026-07-31** a hand-run probe of every write path found a second: the ipaddress write routes documented in §8.3–§8.5 are **not routed at all**, and §13 Q1's instruction not to "fix" them is wrong. Those measurements are recorded here, marked, and dated. **Read [§0](#0-live-tenant-measurements--2026-07-30) before implementing anything against §6, §8 or §12.**
 
 ---
 
 ## 0. Live-tenant measurements — 2026-07-30
 
-Everything outside this section and the `MEASURED 2026-07-30` markers is still the vendor's documentation as captured on 2026-07-29. Nothing the vendor wrote has been deleted: where a measurement contradicts the documentation, both are shown, because the value of this file is that it can be audited against the source.
+Everything outside this section and the `MEASURED 2026-07-30` / `MEASURED 2026-07-31` markers is still the vendor's documentation as captured on 2026-07-29. Nothing the vendor wrote has been deleted: where a measurement contradicts the documentation, both are shown, because the value of this file is that it can be audited against the source.
+
+**There are now two measurement dates.** 2026-07-30 was the read-only contract suite: findings M1–M12, defects 17–25, all in §6 and §12. 2026-07-31 was a hand-run probe of the **write** paths: findings M13–M16, defects 26–28, in §8 and §10. The heading above and its anchor keep the first date so that existing links still resolve — including from [ADR-003](../adr/ADR-003-metric-layer-live-contract-corrections.md), which is approved and must not be edited in place.
 
 ### 0.1 How to read the markers
 
@@ -25,6 +27,10 @@ Everything outside this section and the `MEASURED 2026-07-30` markers is still t
 | `MEASURED 2026-07-30 — CONFIRMS` | The vendor text was checked and held. |
 | `MEASURED 2026-07-30 (run 02)` | From the **second** run of that date, made after the corrections in commit `0d14149` shipped. Same tenant, same marker meaning; the suffix exists only so the two runs can be told apart, since a re-check that agreed with run 01 and a finding that only run 02 could reach are different kinds of evidence. |
 | `OBSERVED 2026-07-30 (vendor UI)` | **Not an API measurement.** What the vendor's own web application was seen doing in a browser on that date — which requests its pages issue. It is evidence about how the vendor uses its own API, not about what the API returns, and it is marked separately so the two are never conflated. |
+| `MEASURED 2026-07-31` | **Observed behaviour** of the same tenant on 2026-07-31, from the hand-run **write-path** routing probe (§0.5). Same meaning as the 2026-07-30 marker. The date matters because the method differed: `curl` by hand, not `npm run test:contract`, and writes, not reads. |
+| `MEASURED 2026-07-31 — CONFIRMS` | The vendor text was checked against the write paths and held. |
+| `MEASURED 2026-07-31 — WITHDRAWS` | A **2026-07-30 conclusion is withdrawn** by a later measurement. Used at §0.4 and §13 Q1, where the 2026-07-30 observation was correct and the inference drawn from it was not. The withdrawn text stays in place; only its status changes. |
+| `OBSERVED 2026-07-31 (tenant permissions)` | **Not a statement about the API.** Something the tenant's own token was refused, which may be correct behaviour for this account's role. Marked separately so it is never read as a defect. |
 | `UNVERIFIED` | Neither confirmed nor contradicted: the run could not exercise it. Not the same as "fine". |
 
 A "Req" column that reads `optional — **MEASURED 2026-07-30: REQUIRED …**` has had only its *requirement marking* corrected. The Description column of every parameter table remains the vendor's verbatim wording.
@@ -34,6 +40,8 @@ A "Req" column that reads `optional — **MEASURED 2026-07-30: REQUIRED …**` h
 - **What ran:** `tests/contract/**`, read-only (`GET` only), against one production tenant, on 2026-07-30. No token endpoint was called. **Two runs, same date, same tenant:** run 01 produced M1–M8 and the corrections in commit `0d14149`; **run 02** was the re-run against those corrections and produced M9–M11. Findings from the second are marked `MEASURED 2026-07-30 (run 02)`.
 - **What run 02 was for, and what it cost:** it confirmed the M1 correction against the live API (see §0.4) — and it also exposed a defect in the *suite* rather than the API: 40 assumptions went UNVERIFIED because module discovery probed `componenttypes` for module names instead of the tenant's device records. That is recorded as M11 because a reader of this file needs to know which questions the second run did **not** answer, and why.
 - **What else was done on the same day:** a **manual probe** of §12.1 outside the suite (a single minimal query, which was served), and a **browser session against the vendor's own web application** in which the network traffic of a company dashboard load was observed. Both feed M12. The manual probe is an API measurement and is marked like one; the browser session is not, and carries its own marker (§0.1).
+- **What ran on 2026-07-31, and why the suite could not have found it:** a **hand-run `curl` probe of every write path** in this document — `POST`, `PATCH`, `PUT` and `DELETE` across collectors, devices, components, ipaddresses, ipsubnets and ipgroups. Not `npm run test:contract`: that suite is read-only by design (D-0006), so the routing of a write path was outside everything it can reach. It was prompted by a user bug report — `lumics_create_ipaddress` hung against the shipped 0.1.0 — not by a scheduled gate. Findings M13–M16, detailed in §0.5 and carried into §8, §10 and §14 defects 26–28. Record: `docs/contract-runs/2026-07-31-run-04.md`.
+- **How the 2026-07-31 probe avoided mutating the tenant, and the one exception:** every write was aimed at a **bogus 24-hex id** or carried a **deliberately invalid body**, so a routed request found nothing to change. Routing was read off the **response body, not the status**: an unrouted path answers with an **HTML** error page, a routed one answers **JSON**. Exactly one real record was created on purpose, at the Project Owner's request, to prove the create path end to end — `10.30.253.10` in subnet `6a2b08d1533f5ef7e1c3e8e1`. The subnet's addresses were re-listed afterwards and that was the only addition.
 - **Scope:** one tenant, one company, one point in time. A measurement is evidence about **this API's behaviour as deployed**, not a vendor commitment, and property names in particular are **tenant-specific** (§0.3 M2). Do not promote a measured example value to a constant in code.
 - **Reproducibility:** the credential used has since expired. Re-running requires a fresh token; every finding below is written so the suite can re-check it (`tests/contract/live-metrics.test.ts`, `tests/contract/live-resources.test.ts`).
 - **Not measured:** anything the tenant had no data for, and everything behind §12.2 `/summarize`, which never returned (M5). Those are UNVERIFIED, and the suite reports them as such rather than passing.
@@ -54,11 +62,18 @@ A "Req" column that reads `optional — **MEASURED 2026-07-30: REQUIRED …**` h
 | **M10** _(run 02)_ | §12.4 `data` can carry a **non-array `company` entry** alongside the array-valued item classes. | **Extends** §12.4, which documents `data` as keyed by item class and shows only arrays. | §12.4, §12.5 M10 |
 | **M11** _(run 02)_ | Metric modules are **not** discoverable from `componenttypes`. Probing the four modules that catalogue ranked first (`cisco`, `clearpass`, `cohesity`, `common`) yielded **no** property names from §12.4 — `common` returned 500 — and 40 assumptions went UNVERIFIED. The tenant's device records named `ping` 27, `snmp` 24, `deviceConfigs` 20, `http` 1, `syslog` 1 across 27 devices; `snmp` enumerates property names. | **Extends** — the catalogue is platform-wide component *types*, not this tenant's polling modules. A metric call is scoped to a module a device reports (§7.1). | §7.1, §12.4, §12.5 M11, §14 defect 14 |
 | **M12** _(runs 01–02, manual probe, vendor UI)_ | The **company-scoped metric endpoint is unreliable in practice**. §12.1 returned **HTTP 500** on ordinary queries carrying a valid `properties` — with `lastMetric`, `isMonitored`, `minIntervals`, `limit`, and with `interval=minute` and `interval=fiveMin` — while `interval=hour`, `interval=day`, `aggregate`, `alignTimeRange` and a minimal manual probe were **served**. §12.2 never returned at all (M5). §12.3 device-scoped answered in 1–2 s with populated `data` throughout. The vendor's own company dashboard issued **57 API calls on load, including its "Top devices by CPU" and "Top devices by memory" widgets, and never called `/api/v1/metrics/companies/`**. | **Extends** §12.1 and §12.2: nothing documents any failure mode, cost or reliability caveat on either. **Intermittent, not dead** — no cause established. | §12.1, §12.2, §12.5 M12, §14 defect 25 |
+| **M13** _(2026-07-31)_ | **Every ipaddress route is SINGULAR `/ipsubnet/`.** The plural `/ipsubnets/` that §8.3–§8.5 document for POST, PATCH and DELETE is **not routed for any verb**: all four verbs against the plural returned an HTML 404 error page, while all four against the singular were served. | **Contradicts** §8, §8.3–§8.5, §13 Q1 and §15 rows 20–22, and **withdraws** the corresponding §0.4 entry. Shipped as a defect in 0.1.0: three tools addressed a route that does not exist. | §8, §13 Q1, §0.5 M13, §14 defect 26 |
+| **M14** _(2026-07-31)_ | `DELETE /companies/:c/ipsubnet/:s/ipaddresses/:id` with a **nonexistent** id returns **500**, not 404. | **Extends** — §3's status table offers 404 for "not found" and 500 for a server error; this route uses the second for the first. A client cannot distinguish "already gone" from "the API broke". | §8.5, §0.5 M14, §14 defect 27 |
+| **M15** _(2026-07-31)_ | `POST /companies/:c/ipsubnets` with an **empty JSON body** returns **500 with an HTML body**, not a 400. | **Extends** — §10.3 marks four fields required and documents no rejection behaviour. The HTML body is the same non-JSON failure mode as M7. | §10.3, §0.5 M15, §14 defect 28 |
+| **M16** _(2026-07-31)_ | `OBSERVED 2026-07-31 (tenant permissions)`. **POST create** on collectors, devices and ipgroups returned **403 `{"error":"forbidden to access this resource"}`** for this tenant's own token, while PATCH and DELETE on the same resources were permitted and POST of an ipaddress succeeded. | **None. This is not a defect** and is not counted as one. It may be correct behaviour for this account's role; nothing was measured about what the API grants a differently-privileged token. Recorded so a future run does not mistake it for a routing failure. | §0.5 M16 |
 
 ### 0.4 Vendor claims the run confirmed (do not "correct" these)
 
+> **One entry below has been WITHDRAWN.** The IPAM asymmetry bullet is left in place, marked, because how a correct measurement produced a wrong instruction is the part worth keeping.
+
 - **No pagination anywhere** (§4.3): list reads are bare arrays with no envelope, total or cursor; `limit` is honoured on devices, collectors and ipgroups; `offset` is ignored.
 - **The IPAM singular/plural asymmetry is real** (§8, §13 Q1), and the plural spelling returns **404 on a GET** — the singular read path is load-bearing, not defensive.
+  - **MEASURED 2026-07-31 — WITHDRAWS this entry.** The observation was right; the conclusion drawn from it was not. Only a **GET** was ever issued against the plural spelling on 2026-07-30, because the contract suite is read-only. A 404 on the plural GET is equally consistent with "the asymmetry is real" and with "the plural is not routed at all" — and it is the second: **every** ipaddress verb is singular, and the plural returns an HTML 404 for POST, PATCH and DELETE too (M13). Filed here, in the one section that tells a reader **not** to correct it, it hardened a false claim in the vendor's documentation into a measured one, and the code followed. The lesson is narrow and worth stating: a read-only run can confirm the spelling of a read path and **nothing whatever** about a write path. See §0.5 M13, §13 Q1 and §14 defect 26.
 - **`id` vs `_id`** (§4.2): the ipgroup list returns `id` while the single read returns `_id`.
 - Device records carry an ObjectId-shaped `company` (§7.1/§7.2) — the field the device-metric ownership pre-read depends on. **Re-confirmed run 02**, together with the other half of the pre-read: a company-scoped read of a foreign device id returns **404**, so the design is sound — a device the configured company does not own cannot be read through it, and the metric tools' refusal is the API's answer rather than a client-side guess.
 - A company-scoped read of a device id the company does not have returns **404**.
@@ -69,6 +84,57 @@ A "Req" column that reads `optional — **MEASURED 2026-07-30: REQUIRED …**` h
 - **`properties` is REQUIRED on §12.1, §12.2 and both §12.3 endpoints** — re-measured, unchanged. The requirement markings shipped in commit `0d14149` are correct.
 - **`properties` is genuinely optional on §12.4** — a call omitting it is served. The asymmetry in the M1 table is real, not an artefact of one run.
 - **`itemType` is validated before `properties`** (the M3 ordering trap) — a wrong `itemType` is rejected naming the unknown component and **never mentions `properties`**. A client debugging the M1 requirement against a wrong `itemType` will still be told about the wrong parameter.
+
+### 0.5 Write-path routing — live tenant, 2026-07-31
+
+Nothing in this subsection came from the vendor's documentation, and nothing in it came from `npm run test:contract` either. It is what a **hand-run `curl` probe of every write path** in this document observed on 2026-07-31, against the same production tenant. It exists because 0.1.0 shipped with three IPAM write tools pointed at a route that does not exist, and no gate this project had could have caught it: D-0006's contract suite is read-only, so it never issues a POST, PATCH, PUT or DELETE at all.
+
+**How routing was distinguished from a missing record.** This API answers an **unrouted** path with an **HTML** error page and a **routed** path with **JSON** — including when the routed request finds nothing. The status code alone does not separate the two, because both can be 404. Every conclusion below rests on the body, not the status.
+
+**What was mutated.** Nothing, except on purpose once. Bogus 24-hex ids and deliberately invalid bodies were used throughout, so a routed write had nothing to act on. One real IP address, `10.30.253.10`, was created in subnet `6a2b08d1533f5ef7e1c3e8e1` at the Project Owner's request to prove the create path end to end; the subnet was re-listed afterwards and that was the only new record. The company id is withheld from this file, as elsewhere.
+
+#### M13 — every ipaddress route is singular; the documented plural is not routed
+
+The finding, in full:
+
+| Verb | plural `/ipsubnets/:s/ipaddresses` (as documented in §8.3–§8.5) | singular `/ipsubnet/:s/ipaddresses` |
+|---|---|---|
+| `GET` | **404, HTML** — no route | **200** |
+| `POST` | **404, HTML** — no route | **200**, record created |
+| `PATCH` | **404, HTML** — no route | **200** `{"updated":null}` for a bogus id |
+| `DELETE` | **404, HTML** — no route | **500** for a bogus id — routed (M14) |
+
+The plural spelling is not a per-verb alternative to the singular. It is not routed for **any** verb. The two reads (§8.1, §8.2) are documented correctly and always were; the three writes (§8.3, §8.4, §8.5) are documented with a path that reaches nothing.
+
+Note what the singular column shows about the last two rows. A `PATCH` at a bogus id returns `200 {"updated":null}` and a `DELETE` at a bogus id returns `500` — neither is a success, and neither is an HTML 404. Both are the API answering, which is the whole of what is claimed here: the route exists.
+
+**Consequences for a client.** All five ipaddress calls use `/ipsubnet/` (singular). There is no fallback worth writing: retrying the plural on a 404 accomplishes nothing, in either direction, because the plural is never routed. §13 Q1's "optionally retry with the other spelling on a 404" should not be implemented.
+
+**This shipped.** `lumics_create_ipaddress`, `lumics_update_ipaddress` and `lumics_delete_ipaddress` in 0.1.0 send the plural and cannot ever have worked. Corrected on branch `fix/ipaddress-write-paths-singular` for 0.1.1; recorded as §14 defect 26 and in `docs/contract-runs/2026-07-31-run-04.md`.
+
+#### M14 — `DELETE` of a nonexistent ip address returns 500, not 404
+
+`DELETE /companies/:c/ipsubnet/:s/ipaddresses/<bogus 24-hex id>` returned **500**. §3's status table documents 404 for "not found" and 500 for a server error, and §8.5 documents neither. A client therefore cannot tell "this address is already gone" from "the API failed", and a delete tool that treats 500 as retryable will re-issue a request that will fail identically every time. Recorded as §14 defect 27.
+
+#### M15 — `POST /companies/:c/ipsubnets` with an empty body returns 500, in HTML
+
+`POST /companies/:c/ipsubnets` with a body of `{}` returned **500 with an HTML body**. §10.3 marks `company`, `network`, `netmask` and `cidr` required, so a rejection is expected — a **400** with a JSON body naming the missing field. What arrives instead cannot be classified by a JSON client at all: it fails while parsing, the same non-JSON failure mode as M7 and §14 defect 23, and §1's "The API uses JSON as its data format" does not hold here either. Recorded as §14 defect 28.
+
+#### M16 — `OBSERVED 2026-07-31 (tenant permissions)`: create is refused on three resources
+
+**This is not a defect and is not counted as one.** `POST` create returned **403 `{"error":"forbidden to access this resource"}`** on collectors, devices and ipgroups for this tenant's own token, while `PATCH` and `DELETE` on those same three resources were permitted, and `POST` of an ipaddress succeeded.
+
+It is recorded for two reasons and no others. First, so that a later run does not read a 403 as a routing failure: a 403 is JSON, from a routed path, and says nothing about the spelling. Second, so the coverage of M13 is stated honestly — the create path was proved end to end on ipaddresses, and on collectors, devices and ipgroups the probe reached authorization and stopped there.
+
+**It may be correct.** Nothing here establishes what this API grants a differently-privileged token, and an account permitted to modify and delete but not create is an ordinary role shape. Whether this tenant's role is configured as intended is a question for the tenant's administrator, not a claim about the API. Do not carry it into §14.
+
+#### Confirmed as documented — MEASURED 2026-07-31 — CONFIRMS
+
+Everything else probed on 2026-07-31 matched the documentation. Recorded because a routing probe that reports only its failures misrepresents its own result:
+
+- **Collectors** (§5.3–§5.5), **components** (§6.3), **devices** (§7.3, §7.5, §7.7), **ipsubnets** (§10.3–§10.5) and **ipgroups** (§9.3–§9.5) write paths are spelled correctly.
+- **§7.4 `PUT /devices/:id/modules/:module/lastDiscovery`** — `PUT` is the **only** routed verb on that path. `PATCH` and `POST` against it both return an HTML 404. The vendor documents `PUT`, and the vendor is right; a client that "corrects" it to `PATCH` for consistency with the neighbouring device writes will reach nothing.
+- **§7.6 `PATCH /devices/:ids/batch`** is routed as documented.
 
 ---
 
@@ -428,6 +494,8 @@ Response: `{ "deleted": { ...full device... } }`.
 
 > ⚠️ **Path asymmetry is real in the docs:** the two GET endpoints use the **singular** `ipsubnet` segment; POST/PATCH/DELETE use the **plural** `ipsubnets`. See §12 Q1.
 
+> **MEASURED 2026-07-31 — the asymmetry is real in the documentation and nowhere else.** On the deployed API **every** ipaddress route is **singular** `/ipsubnet/`, for all five endpoints below. The plural spelling documented for POST, PATCH and DELETE is **not routed for any verb**: it answers with an **HTML 404 error page**, which is how a missing route is told apart from a missing record here — a routed path answers **JSON**, even when it finds nothing. The line above describes the documentation accurately and the API not at all, and the sentence it points at (§13 Q1) told implementers not to "fix" it. Sending the documented plural on §8.3, §8.4 or §8.5 reaches nothing at all. **This shipped in 0.1.0** and is corrected in 0.1.1. Evidence: §0.5 M13; defect: §14 defect 26; record: `docs/contract-runs/2026-07-31-run-04.md`.
+
 ### 8.1 `GET /api/v1/companies/:company/ipsubnet/:ipSubnet/ipaddresses`
 Description: *"Retrieve a list of all ip addresses for a subnet."*
 
@@ -440,12 +508,18 @@ Description: *"Retrieve a list of all ip addresses for a subnet."*
 No `parent` filter here (unlike ipgroups/ipsubnets). Response: bare array of ip address objects: `company`, `ipAddress`, `ipSubnet`, `dnsName`, `macAddress`, `nat`, `description`, `note`, `state` (`"used"` / `"reserved"`), `id`, and
 `scanHistory: { firstUp: <date>, lastScan: <date>, lastStatus: "up"|"down", statusChanges: [ { newStatus: "up"|"down", time: <date> } ] }`.
 
+> **MEASURED 2026-07-31 — CONFIRMS.** The documented **singular** path returned **200**. The plural `/ipsubnets/:ipSubnet/ipaddresses` returned an **HTML 404**. This endpoint is documented correctly, and always was.
+
 ### 8.2 `GET /api/v1/companies/:company/ipsubnet/:ipSubnet/ipaddresses/:id`
 Description: *"Retrieve a single IP address by id."*
 Path: `company` (required, hex id), `ipSubnet` (required, hex id, "ID of the subnet"), `id` (required, hex id, "ID of the IP address"). No query params. Response: bare ip address object.
 
+> **MEASURED 2026-07-31 — CONFIRMS the spelling, not the endpoint.** This exact path was **not** re-issued on 2026-07-31; the probe was of write paths. It is listed as confirmed because it is documented **singular**, which M13 shows to be the only routed spelling, and because the singular `/ipsubnet/:ipSubnet/ipaddresses/:id` shape **is** routed — §8.4 and §8.5 were both answered on it. Its own status codes remain as measured by the read-only run of 2026-07-30.
+
 ### 8.3 `POST /api/v1/companies/:company/ipsubnets/:ipSubnet/ipaddresses`
 Description: *"Create a new IP address."*
+
+> **MEASURED 2026-07-31 — the documented path is wrong.** The routed path is **`POST /api/v1/companies/:company/ipsubnet/:ipSubnet/ipaddresses`** — **singular** `ipsubnet`, identical to §8.1. The documented plural returned an **HTML 404**; the singular returned **200 and created the record** (`10.30.253.10` in the probed subnet). Everything else on this page — the body table, the required `company`/`ipSubnet` repetition, the `state` default — is unaffected and untested by this measurement except as noted. §0.5 M13, §14 defect 26.
 
 Path: `company` (required, hex id, "Company ID"), `ipSubnet` (required, hex id, "ID of the subnet the IP address belongs to").
 
@@ -476,10 +550,16 @@ Path: `company`, `ipSubnet`, `id` (all required, hex id).
 Body: same 12 fields as POST, but **every field is optional** (including `company`, `ipSubnet`, `ipAddress`); descriptions identical.
 Example request `{ "ipAddress": "<ip>", "name": "<name>" }`. Response: `{ "updated": { ...full ip address... } }`.
 
+> **MEASURED 2026-07-31 — the documented path is wrong.** The routed path is **`PATCH /api/v1/companies/:company/ipsubnet/:ipSubnet/ipaddresses/:id`** — **singular** `ipsubnet`. The documented plural returned an **HTML 404**; the singular answered **200** with `{"updated":null}` for a deliberately bogus id. A `null` under `updated` — rather than a 404 — is how this route reports that no such address exists; that is a JSON answer from a real route, which is the point being made. §0.5 M13, §14 defect 26.
+
 ### 8.5 `DELETE /api/v1/companies/:company/ipsubnets/:ipSubnet/ipaddresses/:id`
 Description (verbatim, typo in original): *"Remove am IP address from the database."*
 Path: `company`, `ipSubnet`, `id` (all required, hex id). No body/query.
 Response: `{ "deleted": { ...full ip address... } }`.
+
+> **MEASURED 2026-07-31 — the documented path is wrong.** The routed path is **`DELETE /api/v1/companies/:company/ipsubnet/:ipSubnet/ipaddresses/:id`** — **singular** `ipsubnet`. The documented plural returned an **HTML 404**. §0.5 M13, §14 defect 26.
+
+> **MEASURED 2026-07-31 — a nonexistent id returns 500, not 404.** The singular path with a bogus 24-hex id answered **500**. §3 offers 404 for "not found" and 500 for a server error, and this route uses the second for the first, so a client cannot tell an already-deleted address from a broken API — and must not treat the 500 as a transient fault worth retrying. Note the contrast with §8.4, which reports the same condition as `200 {"updated":null}`: the two write verbs on the same resource disagree about how absence is reported. §0.5 M14, §14 defect 27.
 
 ---
 
@@ -569,6 +649,8 @@ Description: *"Create a new subnet."* Path: `company` (required, hex id).
 
 `customProperties` element shape (from examples): `{ "customProperty": "<objectId>", "value": <any> }`.
 Response: bare created object echoing only the supplied fields plus `_id`.
+
+> **MEASURED 2026-07-31 — CONFIRMS the path; an empty body returns 500 in HTML.** The documented path is routed and spelled correctly. But a `POST` carrying `{}` — omitting all four required fields — returned **500 with an HTML body**, not the **400** a required-field table implies and not JSON. A client cannot classify that answer at all: it fails while parsing, the same non-JSON failure mode as §14 defect 23, and §1's "The API uses JSON as its data format" does not hold on this path. Validate the four required fields client-side; the API's rejection is unusable. §0.5 M15, §14 defect 28.
 
 ### 10.4 `PATCH /api/v1/companies/:company/ipsubnets/:id`
 Description: *"Modify an existing subnet."* Path: `company` (required), `id` (required, hex id, "ID of the subnet").
@@ -978,6 +1060,8 @@ This is the strongest single piece of evidence in the finding and also the one m
 
 ### Q1 — ipaddress singular vs plural `ipsubnet(s)`: the asymmetry is real in the documentation
 
+> **MEASURED 2026-07-31 — read this before the answer below.** Everything in this subsection about the **documentation** is accurate and is left standing. Its **verdict and recommendation are wrong**, and the recommendation shipped: **every** ipaddress route on the deployed API is **singular** `/ipsubnet/`, and the plural is not routed for any verb. The heading is still true as written — the asymmetry is real *in the documentation* — and true of nothing else. Corrected verdict at the end of this subsection; evidence in §0.5 M13; defect §14 defect 26.
+
 The detail pages confirm the index page. Quoting the detail pages' own path headings:
 
 - `GET /api/v1/companies/:company/ipsubnet/:ipSubnet/ipaddresses` — *"Retrieve a list of all ip addresses for a subnet."* (**singular**)
@@ -991,6 +1075,21 @@ Additional corroboration: the generated documentation anchors/slugs themselves e
 **Verdict:** real and consistent in the docs, but nothing in the docs calls it intentional — no note, no rationale, and the same pages contain other obvious typos ("Remove am IP address", `name` described as "The description of the group"). Read it as an upstream route inconsistency that has been faithfully documented. **Recommendation for the MCP server:** send `ipsubnet` (singular) for the two GETs and `ipsubnets` (plural) for POST/PATCH/DELETE exactly as documented; optionally retry with the other spelling on a 404, and flag it to the vendor.
 
 > **MEASURED 2026-07-30 — CONFIRMS.** The asymmetry is real in the deployed API, not only in the docs: a **GET against the plural spelling returned 404**. The singular read path is load-bearing. The "optionally retry with the other spelling on a 404" suggestion above would therefore accomplish nothing for reads — a 404 on the plural GET is the routing itself, not a missing record.
+
+> **MEASURED 2026-07-31 — WITHDRAWS the entry above, and corrects the verdict.** Both of the 2026-07-30 observations are unchanged and both were correct. The word "CONFIRMS" was not. That run was **read-only**: it issued a GET against the plural spelling and never a POST, PATCH or DELETE, so it could establish that the plural is unrouted **for GET** and nothing more. "The asymmetry is real in the deployed API" does not follow from it, and is false.
+>
+> **Corrected verdict — MEASURED 2026-07-31.** All five ipaddress routes are **singular** `/ipsubnet/`. The plural is not routed for any verb:
+>
+> | Verb | plural `/ipsubnets/:s/ipaddresses` | singular `/ipsubnet/:s/ipaddresses` |
+> |---|---|---|
+> | `GET` | 404, HTML — no route | **200** |
+> | `POST` | 404, HTML — no route | **200**, record created |
+> | `PATCH` | 404, HTML — no route | **200** `{"updated":null}` for a bogus id |
+> | `DELETE` | 404, HTML — no route | **500** for a bogus id — routed |
+>
+> **Corrected recommendation for the MCP server:** send `ipsubnet` (singular) on all five calls. Do **not** implement a retry with the other spelling, in either direction: the plural is never routed, so a retry can only add a request that cannot succeed. The vendor's documentation of §8.3–§8.5 is wrong and should still be flagged to them.
+>
+> **Where the reasoning above went wrong, since it is the part that shipped.** The slug argument — "these slugs are derived from the route strings the docs are generated from, so the split is present in the route definitions" — is an inference about the vendor's *documentation generator*, not a measurement of the *router*. It is exactly as strong as the prose it was offered as corroboration for, because it has the same single source. Standing next to a documented plural that a reader might otherwise have doubted, it converted a typo into a fact, and the "do not fix this" instruction it produced was carried into `src/api/paths.ts` and `src/tools/ipam.ts` and shipped in 0.1.0 — where the three write tools addressed a route that does not exist. **Two sources that trace back to one source are one source.** Compare §12.5 M3, where the same shape of inference — a construction rule read off one example — was correctly marked UNVALIDATED rather than confirmed.
 
 ### Q2 — legal values of `:context`, and whether `system` takes a `contextId`
 
@@ -1026,7 +1125,9 @@ Response: `{ "token": "<jwt>", "expiresIn": 86400 }`.
 
 ## 14. Documentation defects and caveats to carry into the implementation
 
-Defects 1–16 are **internal defects of the vendor's documentation**: contradictions, typos and omissions visible on the doc pages themselves, found on 2026-07-29 without calling the API. Defects 17–25 are of a different kind — places where the documentation is **contradicted by the live API**, measured on 2026-07-30 (§0, §12.5). Keep the two groups distinct: the first can be fixed by reading the docs more carefully, the second cannot be found that way at all.
+Defects 1–16 are **internal defects of the vendor's documentation**: contradictions, typos and omissions visible on the doc pages themselves, found on 2026-07-29 without calling the API. Defects 17–25 are of a different kind — places where the documentation is **contradicted by the live API**, measured on 2026-07-30 (§0, §12.5). Defects 26–28 are the same kind, measured on 2026-07-31 (§0.5) by a probe of the **write** paths, which no read-only run can reach. Keep the groups distinct: the first can be fixed by reading the docs more carefully, the others cannot be found that way at all — and the third could not be found by the gate this project had.
+
+The 2026-07-31 finding about this tenant's create permissions (§0.5 M16) is deliberately **not** a defect here. It is an observation about one account's role and may be correct behaviour; see M16.
 
 ### Defects internal to the documentation (2026-07-29)
 
@@ -1061,6 +1162,14 @@ Each of these is a divergence between the vendor's documentation and the deploye
 24. **(M9, run 02) `GET /:context/:contextId/componenttypes/` ids do not compose as documented.** §6.4 states `id` is `<module>_<group>_<type>`; `snmp_common_ups_upsbatteries` carries all four fields with `type` = `ups` and a fourth segment the rule cannot express (6 of 246 ids have four segments). Only the prefix relationship holds. Read together with defect 20 — the same field is both conditional and not composable — this means **`id` must be treated as opaque**: derive `module` and `group` from their own fields, never by splitting the id, and never rebuild an id from parts. The related §12.5 M3 rule for constructing an `itemType` from §6.5 is inferred from one example and remains **unvalidated**; it should not be relied on either.
 
 25. **(M12) The company-scoped metric endpoints are unreliable in practice, and nothing documents it.** §12.1 returned `500 {"error":"Sorry, an error occurred. Please try again.","code":500,"level":"error"}` on ordinary queries carrying a valid `properties` — with `lastMetric`, `isMonitored`, `minIntervals`, `limit`, `interval=minute` and `interval=fiveMin` — while `interval=hour`, `interval=day`, `aggregate`, `alignTimeRange` and a minimal probe were served; §12.2 never returned at all (defect 21); §12.3 answered the same tenant in 1–2 s throughout. The documentation describes no failure mode, cost, scale or reliability caveat on either company-scoped endpoint, and §3 offers only the generic "500 Server Error" — which, uniquely on this route, is misleading, because the arguments **do** correlate with the failure and a working alternative exists. Separately, `OBSERVED 2026-07-30 (vendor UI)`: the vendor's own company dashboard issued 57 API calls on load, including its top-N device widgets, and never called `/api/v1/metrics/companies/`. **Intermittent, not dead; no cause established.** Detail: §12.5 M12.
+
+### Defects the live API contradicted (MEASURED 2026-07-31)
+
+Found by a hand-run `curl` probe of the **write** paths, not by the contract suite — which is read-only, and so could not have found any of them. Numbering continues from above. Detail and evidence: §0.5.
+
+26. **(M13) The plural `ipsubnets` documented on §8.3, §8.4 and §8.5 is not routed for any verb.** Every ipaddress route is **singular** `/ipsubnet/`. Against the plural, `GET`, `POST`, `PATCH` and `DELETE` all returned an **HTML 404 error page**; against the singular, all four were answered in JSON (`GET` 200, `POST` 200 with the record created, `PATCH` 200 `{"updated":null}` for a bogus id, `DELETE` 500 for a bogus id — see defect 27). The documented per-verb split exists only in the documentation, and §13 Q1 wrongly promoted it to a fact about the deployed API on the strength of the vendor's own generated doc slugs — a second source that traces back to the first. **This is the only defect in this document that has caused a shipped failure**: 0.1.0's `lumics_create_ipaddress`, `lumics_update_ipaddress` and `lumics_delete_ipaddress` sent the plural and could never have succeeded. Corrected in 0.1.1. Send the singular on all five calls, and implement no fallback: a retry with the other spelling can only add a request that cannot be routed.
+27. **(M14) `DELETE .../ipaddresses/:id` returns 500 for a nonexistent id, not 404.** §3's status table documents 404 for "not found" and 500 for a server error; this route reports the first condition with the second, and §8.5 documents neither. Two consequences. A client cannot distinguish an address that is already gone from an API that has failed, so a delete tool cannot honestly report "already absent". And a client that treats 500 as transient will retry a request that will fail identically every time — this repository's does not, because 500 is absent from its retryable set. Note also that §8.4 reports the same condition on the same resource as `200 {"updated":null}`: the two write verbs disagree with each other as well as with §3.
+28. **(M15) `POST /companies/:company/ipsubnets` with an empty body returns 500, with an HTML body.** §10.3 marks `company`, `network`, `netmask` and `cidr` required, so a rejection is correct and expected — a **400** naming the missing field would be. What arrives is a 500 whose body is **not JSON**, so it cannot be classified by a JSON client at all: the client fails while parsing and there is no API answer left to classify. Same failure mode as defect 23, on a different resource, which makes it a property of this API rather than of §12.4. It contradicts §1's "The API uses JSON as its data format" and §3's status table together. Validate the required fields client-side; the API's own rejection is unusable.
 
 ---
 
@@ -1109,5 +1218,7 @@ Each of these is a divergence between the vendor's documentation and the deploye
 | 39 | GET /api/v1/metrics/devices/:id/modules/:moduleType | `_api_v1_metrics_devices_id_modules_moduleType_get_1440` |
 | 40 | GET /api/v1/metrics/devices/:id/modules/:moduleType/:item | `_api_v1_metrics_devices_id_modules_moduleType_item_get_1460` |
 | 41 | GET /api/v1/:context/:contextId/metrics/summaries/:moduleType | `_api_v1_context_contextId_metrics_summaries_moduleType_get_1480` |
+
+> **MEASURED 2026-07-31 — rows 20, 21 and 22 are not callable as printed.** Those three paths, and the doc slugs beside them, are reproduced exactly as the vendor publishes them, which is what this table is for. The deployed API routes all three under the **singular** `/ipsubnet/` — rows 18 and 19's spelling. Do not copy a path out of this table for the ipaddress writes; see §8, §13 Q1 and §14 defect 26.
 
 Doc pages visited outside the endpoint list: `/documentation/api/overview`, `/authentication`, `/index` (Resources), `/errors`. All loaded successfully.

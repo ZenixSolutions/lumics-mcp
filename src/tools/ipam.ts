@@ -9,17 +9,25 @@
  * anywhere. Four things are specific to IPAM and worth reading before changing
  * anything here.
  *
- * **1. The `ipsubnet`/`ipsubnets` asymmetry is real (spec §8, §13 Q1).** The
- * ipaddress routes use the SINGULAR segment `/ipsubnet/` for the two GETs and
- * the PLURAL `/ipsubnets/` for POST, PATCH and DELETE. spec §13 Q1 confirms this
- * from the vendor's own generated doc slugs, which are derived from the route
- * strings — so the split exists in the route definitions, not just in prose.
- * `ipAddressesReadPath`/`ipAddressReadPath` (singular) and
- * `ipAddressesWritePath`/`ipAddressWritePath` (plural) already encode the
- * correct per-verb spelling. **Do not normalise them.** The prototype used the
- * singular form for all five calls while its own tool description claimed the
- * opposite, so its code and its documentation disagreed and at least one of them
- * was wrong against the API.
+ * **1. The `ipsubnet`/`ipsubnets` asymmetry is NOT real. MEASURED 2026-07-31.**
+ * Every ipaddress route uses the SINGULAR segment `/ipsubnet/`, for all five
+ * calls. The plural spelling is not routed for any verb — it returns an HTML 404
+ * error page rather than JSON, which is what separates "no such route" from "no
+ * such record" on this API.
+ *
+ * This comment previously asserted the opposite, citing spec §13 Q1 and the
+ * vendor's generated doc slugs, and instructed the reader not to normalise the
+ * two spellings. That was wrong and it shipped: in 0.1.0
+ * `lumics_create_ipaddress`, `lumics_update_ipaddress` and
+ * `lumics_delete_ipaddress` addressed a route that does not exist and could
+ * never have succeeded.
+ *
+ * Worth remembering how it got here. The prototype used the singular form for
+ * all five calls while its own tool description claimed the plural; this comment
+ * read that disagreement as evidence the prototype's code was wrong. It was the
+ * prototype's *description* that was wrong. Two sources agreeing — the vendor's
+ * docs and a plausible reading of its slugs — outweighed the one source that had
+ * actually been executed against the API. Prefer the executed evidence.
  *
  * **2. Every IPAM route is `companies`-scoped in the spec itself.** Unlike
  * devices and collectors these paths hard-code `companies` and take a
@@ -369,10 +377,10 @@ const deleteIpSubnet = defineTool({
 // IP Address — spec §8
 // ---------------------------------------------------------------------------
 //
-// spec §13 Q1: the read paths use SINGULAR `/ipsubnet/` and the write paths use
-// PLURAL `/ipsubnets/`. The builders below differ accordingly and by design —
-// `...ReadPath` for the GETs, `...WritePath` for POST/PATCH/DELETE. Do not
-// "tidy" them into one spelling.
+// MEASURED 2026-07-31: every route here is SINGULAR `/ipsubnet/`, for all five
+// calls. `...ReadPath` and `...WritePath` now build the same string; the two
+// names are kept so the call sites still read as reads and writes. spec §13 Q1
+// claimed a per-verb split and it is wrong — see the module header.
 
 const ipSubnetIdArgSchema = objectIdSchema.describe(
   'Lumics id of the subnet the address belongs to. Every IP address route is nested under a subnet, so this is required; get it from lumics_list_ipsubnets.',
@@ -481,8 +489,8 @@ const getIpAddress = defineTool({
 });
 
 /**
- * spec §8.3 `POST /companies/:company/ipsubnets/:ipSubnet/ipaddresses` —
- * PLURAL `ipsubnets`, per spec §13 Q1.
+ * spec §8.3 `POST /companies/:company/ipsubnet/:ipSubnet/ipaddresses` —
+ * SINGULAR `ipsubnet`, measured 2026-07-31. The spec's plural is not routed.
  *
  * `company` and `ipSubnet` are required in the body as well as in the path, so
  * the handler repeats them rather than asking the caller twice.
@@ -502,7 +510,7 @@ const createIpAddress = defineTool({
   async handler(args, context) {
     const companyId = context.resolveCompanyId(args.companyId);
     const { ipSubnetId, companyId: _companyId, ...fields } = args;
-    // spec §13 Q1: plural `ipsubnets` on the writes.
+    // spec §8.3: singular `ipsubnet`, measured 2026-07-31; see the header.
     const created = await context.client.post<IpAddress>(
       ipAddressesWritePath(companyId, ipSubnetId),
       {
@@ -518,8 +526,8 @@ const createIpAddress = defineTool({
 });
 
 /**
- * spec §8.4 `PATCH /companies/:company/ipsubnets/:ipSubnet/ipaddresses/:id` —
- * PLURAL `ipsubnets`, per spec §13 Q1.
+ * spec §8.4 `PATCH /companies/:company/ipsubnet/:ipSubnet/ipaddresses/:id` —
+ * SINGULAR `ipsubnet`, measured 2026-07-31. The spec's plural is not routed.
  *
  * spec §8.4 makes every field optional, including `company` and `ipSubnet`, and
  * its example sends a flat partial body. `ipSubnet` is not offered as a
@@ -548,7 +556,7 @@ const updateIpAddress = defineTool({
     const companyId = context.resolveCompanyId(args.companyId);
     const { ipSubnetId, ipAddressId, companyId: _companyId, ...changes } = args;
     return patchResource<IpAddress>(context, {
-      // spec §13 Q1: plural `ipsubnets` on the writes.
+      // spec §8.3: singular `ipsubnet`, measured 2026-07-31; see the header.
       path: ipAddressWritePath(companyId, ipSubnetId, ipAddressId),
       operation: `PATCH ipaddress ${ipAddressId}`,
       changes,
@@ -558,8 +566,8 @@ const updateIpAddress = defineTool({
 });
 
 /**
- * spec §8.5 `DELETE /companies/:company/ipsubnets/:ipSubnet/ipaddresses/:id` —
- * PLURAL `ipsubnets`, per spec §13 Q1.
+ * spec §8.5 `DELETE /companies/:company/ipsubnet/:ipSubnet/ipaddresses/:id` —
+ * SINGULAR `ipsubnet`, measured 2026-07-31. The spec's plural is not routed.
  */
 const deleteIpAddress = defineTool({
   name: 'lumics_delete_ipaddress',
@@ -577,7 +585,7 @@ const deleteIpAddress = defineTool({
   async handler(args, context) {
     const companyId = context.resolveCompanyId(args.companyId);
     return deleteResource<IpAddress>(context, {
-      // spec §13 Q1: plural `ipsubnets` on the writes.
+      // spec §8.3: singular `ipsubnet`, measured 2026-07-31; see the header.
       path: ipAddressWritePath(companyId, args.ipSubnetId, args.ipAddressId),
       operation: `DELETE ipaddress ${args.ipAddressId}`,
       note: (deleted) =>

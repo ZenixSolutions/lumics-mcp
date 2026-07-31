@@ -2,13 +2,14 @@
  * IPAM tools — the fifteen endpoints of spec §10 (subnets), §8 (addresses) and
  * §9 (groups).
  *
- * The single most important assertion in this file is the `ipsubnet` /
- * `ipsubnets` asymmetry (spec §13 Q1): the two address READS use the singular
- * segment and the three address WRITES use the plural one. That looks like a bug
- * and is not — it is confirmed present in the vendor's own route definitions —
- * and the prototype used the singular form for all five calls while its
- * documentation claimed the opposite. The asymmetry gets its own describe block
- * with an explicit name so a failure says what the intent was.
+ * The single most important assertion in this file is that all five address
+ * routes use the SINGULAR `/ipsubnet/` segment (MEASURED 2026-07-31). spec §13
+ * Q1 documents a per-verb split — singular reads, plural writes — and states it
+ * is confirmed in the vendor's route definitions. It is not: the plural is
+ * unrouted for every verb. This file used to assert the split, which is how
+ * 0.1.0 shipped three IPAM write tools addressing a route that does not exist,
+ * with this suite green throughout. The prototype used the singular form for all
+ * five calls and was right; its own documentation was what disagreed.
  *
  * `parent: null` is also asserted to survive, because it means "top level" here
  * rather than "wipe this field": IPAM's `pruneUndefined` deliberately keeps nulls
@@ -39,7 +40,7 @@ const GROUP = `${GROUPS}/${TEST_GROUP_ID}`;
 /** SINGULAR — spec §8.1/§8.2 reads. */
 const ADDRESSES_READ = `/companies/${C}/ipsubnet/${TEST_SUBNET_ID}/ipaddresses`;
 /** PLURAL — spec §8.3/§8.4/§8.5 writes. */
-const ADDRESSES_WRITE = `/companies/${C}/ipsubnets/${TEST_SUBNET_ID}/ipaddresses`;
+const ADDRESSES_WRITE = `/companies/${C}/ipsubnet/${TEST_SUBNET_ID}/ipaddresses`;
 
 const SAMPLE_SUBNET = {
   id: TEST_SUBNET_ID,
@@ -58,10 +59,10 @@ const SAMPLE_ADDRESS = {
 const SAMPLE_GROUP = { _id: TEST_GROUP_ID, name: 'Branch sites', type: 'group', parent: null };
 
 // ---------------------------------------------------------------------------
-// The asymmetry. Read this block first.
+// Route spelling. Read this block first.
 // ---------------------------------------------------------------------------
 
-describe('the ipsubnet/ipsubnets asymmetry of spec section 13 Q1 is preserved', () => {
+describe('every IPAM address route uses the singular segment (MEASURED 2026-07-31)', () => {
   it('lumics_list_ipaddresses (READ) uses the SINGULAR /ipsubnet/ segment', async () => {
     const { call } = await exchange('lumics_list_ipaddresses', { ipSubnetId: TEST_SUBNET_ID }, [
       SAMPLE_ADDRESS,
@@ -81,38 +82,42 @@ describe('the ipsubnet/ipsubnets asymmetry of spec section 13 Q1 is preserved', 
     expect(call.path).not.toContain('/ipsubnets/');
   });
 
-  it('lumics_create_ipaddress (WRITE) uses the PLURAL /ipsubnets/ segment', async () => {
+  it('lumics_create_ipaddress (WRITE) uses the SINGULAR /ipsubnet/ segment', async () => {
     const { call } = await exchange(
       'lumics_create_ipaddress',
       { ipSubnetId: TEST_SUBNET_ID, ipAddress: '172.27.16.20' },
       SAMPLE_ADDRESS,
     );
     expect(call.path).toBe(ADDRESSES_WRITE);
-    expect(call.path).toContain(`/ipsubnets/${TEST_SUBNET_ID}/`);
+    expect(call.path).toContain(`/ipsubnet/${TEST_SUBNET_ID}/`);
+    expect(call.path).not.toContain('/ipsubnets/');
   });
 
-  it('lumics_update_ipaddress (WRITE) uses the PLURAL /ipsubnets/ segment', async () => {
+  it('lumics_update_ipaddress (WRITE) uses the SINGULAR /ipsubnet/ segment', async () => {
     const { call } = await exchange(
       'lumics_update_ipaddress',
       { ipSubnetId: TEST_SUBNET_ID, ipAddressId: TEST_ADDRESS_ID, state: 'reserved' },
       { updated: SAMPLE_ADDRESS },
     );
     expect(call.path).toBe(`${ADDRESSES_WRITE}/${TEST_ADDRESS_ID}`);
-    expect(call.path).toContain('/ipsubnets/');
+    expect(call.path).not.toContain('/ipsubnets/');
   });
 
-  it('lumics_delete_ipaddress (WRITE) uses the PLURAL /ipsubnets/ segment', async () => {
+  it('lumics_delete_ipaddress (WRITE) uses the SINGULAR /ipsubnet/ segment', async () => {
     const { call } = await exchange(
       'lumics_delete_ipaddress',
       { ipSubnetId: TEST_SUBNET_ID, ipAddressId: TEST_ADDRESS_ID, confirm: true },
       { deleted: SAMPLE_ADDRESS },
     );
     expect(call.path).toBe(`${ADDRESSES_WRITE}/${TEST_ADDRESS_ID}`);
-    expect(call.path).toContain('/ipsubnets/');
+    expect(call.path).not.toContain('/ipsubnets/');
   });
 
-  it('the two spellings are genuinely different, so normalising either would fail a test', () => {
-    expect(ADDRESSES_READ).not.toBe(ADDRESSES_WRITE);
+  it('the read and write spellings are identical, so a reintroduced plural would fail', () => {
+    // This assertion is the inverse of the one that used to stand here, which
+    // required the two to differ and thereby protected the defect.
+    expect(ADDRESSES_READ).toBe(ADDRESSES_WRITE);
+    expect(ADDRESSES_WRITE).not.toContain('/ipsubnets/');
   });
 });
 
