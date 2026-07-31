@@ -35,6 +35,8 @@ import { tmpdir } from 'node:os';
 import { dirname, join, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { afterEach, beforeEach, describe, expect, it } from 'vitest';
+
+import { isStructuredRecord, parseNdjson } from '../helpers/ndjson.js';
 import { DEFAULT_BASE_URL } from '../../src/constants.js';
 import { TEST_COMPANY_ID, TEST_TOKEN } from '../helpers/config.js';
 
@@ -132,19 +134,11 @@ async function runInDirectory(cwd: string): Promise<Session> {
 }
 
 function parseFrames(stdout: string): JsonRpcResponse[] {
-  return stdout
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line) => JSON.parse(line) as JsonRpcResponse);
+  return parseNdjson<JsonRpcResponse>(stdout);
 }
 
 function parseStderr(stderr: string): StderrRecord[] {
-  return stderr
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.startsWith('{'))
-    .map((line) => JSON.parse(line) as StderrRecord);
+  return parseNdjson<StderrRecord>(stderr, isStructuredRecord);
 }
 
 describe.skipIf(!BUILT)('a .env in the process working directory configures nothing', () => {

@@ -25,6 +25,8 @@ import { fileURLToPath } from 'node:url';
 import { dirname, resolve } from 'node:path';
 import { describe, expect, it } from 'vitest';
 
+import { parseNdjson } from '../helpers/ndjson.js';
+
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..', '..');
 const ENTRY = resolve(REPO_ROOT, 'dist', 'index.js');
 const BUILT = existsSync(ENTRY);
@@ -112,13 +114,13 @@ function countFrames(stdout: string): number {
   return parseFrames(stdout).filter((frame) => frame.id !== undefined).length;
 }
 
-/** Parse newline-delimited JSON, failing loudly on any line that is not JSON. */
+/**
+ * Parse newline-delimited JSON, failing loudly on any line that is not JSON.
+ * See `tests/helpers/ndjson.ts` for why an incomplete trailing line is skipped
+ * rather than treated as a failure.
+ */
 function parseFrames(stdout: string): JsonRpcResponse[] {
-  return stdout
-    .split('\n')
-    .map((line) => line.trim())
-    .filter((line) => line.length > 0)
-    .map((line) => JSON.parse(line) as JsonRpcResponse);
+  return parseNdjson<JsonRpcResponse>(stdout);
 }
 
 const DUMMY_ENV = {
