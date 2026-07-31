@@ -14,8 +14,14 @@ export const SERVER_NAME = 'lumics-mcp';
  * Kept in step with `package.json` by hand. Reading `package.json` at runtime
  * would require `resolveJsonModule` output to land in `dist/`, which it does
  * not, and would break the published `bin` shim.
+ *
+ * "By hand" failed once already: 0.1.1 bumped `package.json` and left this at
+ * `0.1.0`, and it reached `dist/` — so the MCP `initialize` handshake, the
+ * `--version` flag and the startup log would all have reported the broken
+ * release that 0.1.1 exists to replace. `tests/unit/version.test.ts` now pins
+ * the two together, because a hand step nothing verifies is not a step.
  */
-export const SERVER_VERSION = '0.1.0';
+export const SERVER_VERSION = '0.1.1';
 
 /** Prefix for every registered tool name. */
 export const TOOL_PREFIX = 'lumics_';

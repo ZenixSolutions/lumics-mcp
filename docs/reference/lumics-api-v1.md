@@ -91,6 +91,12 @@ Nothing in this subsection came from the vendor's documentation, and nothing in 
 
 **How routing was distinguished from a missing record.** This API answers an **unrouted** path with an **HTML** error page and a **routed** path with **JSON** — including when the routed request finds nothing. The status code alone does not separate the two, because both can be 404. Every conclusion below rests on the body, not the status.
 
+> **This discriminator depends on the request's `Accept` header, and fails silently without it.** The measurements below were taken with `curl`, which sends `Accept: */*`. Under `Accept: application/json` — which `src/api/client.ts` sets on **every** request — the API content-negotiates its router 404 into JSON, so an unrouted path answers `404 {"error":"not found"}` and becomes indistinguishable from a routed path that found no record. A probe issued through this project's own HTTP client therefore classifies **every** path as routed, including dead ones.
+>
+> This is not hypothetical. The first live run of `tests/contract/live-write-routes.test.ts` went through `LumicsClient` and passed its positive assertions while establishing nothing at all. Route probes must send `Accept: */*` and must not use `LumicsClient`; see `probeRoute` and `classifyRouting` in that file.
+>
+> A consequence worth stating separately: through this server's own client, **a dead route and a missing record are indistinguishable to a caller**. That is why the 0.1.0 IPAM write tools could report nothing more diagnosable than "no such resource".
+
 **What was mutated.** Nothing, except on purpose once. Bogus 24-hex ids and deliberately invalid bodies were used throughout, so a routed write had nothing to act on. One real IP address, `10.30.253.10`, was created in subnet `6a2b08d1533f5ef7e1c3e8e1` at the Project Owner's request to prove the create path end to end; the subnet was re-listed afterwards and that was the only new record. The company id is withheld from this file, as elsewhere.
 
 #### M13 — every ipaddress route is singular; the documented plural is not routed
