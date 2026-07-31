@@ -556,7 +556,7 @@ const updateIpAddress = defineTool({
     const companyId = context.resolveCompanyId(args.companyId);
     const { ipSubnetId, ipAddressId, companyId: _companyId, ...changes } = args;
     return patchResource<IpAddress>(context, {
-      // spec §8.3: singular `ipsubnet`, measured 2026-07-31; see the header.
+      // spec §8.4: singular `ipsubnet`, measured 2026-07-31; see the header.
       path: ipAddressWritePath(companyId, ipSubnetId, ipAddressId),
       operation: `PATCH ipaddress ${ipAddressId}`,
       changes,
@@ -585,7 +585,7 @@ const deleteIpAddress = defineTool({
   async handler(args, context) {
     const companyId = context.resolveCompanyId(args.companyId);
     return deleteResource<IpAddress>(context, {
-      // spec §8.3: singular `ipsubnet`, measured 2026-07-31; see the header.
+      // spec §8.5: singular `ipsubnet`, measured 2026-07-31; see the header.
       path: ipAddressWritePath(companyId, args.ipSubnetId, args.ipAddressId),
       operation: `DELETE ipaddress ${args.ipAddressId}`,
       note: (deleted) =>

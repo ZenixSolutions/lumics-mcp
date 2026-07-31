@@ -88,8 +88,16 @@ git switch main && git pull
 npm run validate
 npm run test:contract          # requires a real token; see the gate below
 
-npm version 0.1.0 --no-git-tag-version   # edits package.json only
-# finalise CHANGELOG.md, commit both through a reviewed pull request
+npm version 0.1.1 --no-git-tag-version   # edits package.json and the lockfile ONLY
+
+# `npm version` does NOT touch src/constants.ts. SERVER_VERSION is kept in step
+# by hand, and it is what the MCP initialize handshake, --version and the startup
+# log report — so a stale value means the released build misreports itself.
+# 0.1.1 skipped this step and nearly shipped announcing itself as 0.1.0.
+# tests/unit/version.test.ts now fails on the mismatch; update the constant:
+#   src/constants.ts  ->  export const SERVER_VERSION = '0.1.1';
+
+# finalise CHANGELOG.md, commit all three through a reviewed pull request
 
 git switch main && git pull
 git tag -a v0.1.0 -m 'v0.1.0'
@@ -168,8 +176,23 @@ So the gate is a person:
    `docs/reference/lumics-api-v1.md` before the release proceeds. The captured contract is the thing
    that must be corrected; the code follows it.
 
-The contract tests are read-only by design. They do not create, modify, or delete tenant data. A
-contract test that needed to write would need its own approval and is not currently in scope.
+**The contract tests do not create, modify or delete tenant data.** That guarantee stands and is the
+one that matters. They are no longer read-only, though: `tests/contract/live-write-routes.test.ts`
+issues `POST`, `PATCH`, `PUT` and `DELETE` requests in order to establish whether a write path is
+routed at all. It mutates nothing by construction — every probe addresses an id no record holds and
+carries an empty body, so a routed path can answer without anything existing to change.
+
+That change was made because read-only was not a safe default, it was a blind spot. `0.1.0` shipped
+three IPAM write tools addressing a route that does not exist, and passed this gate, because the gate
+had never issued a write request in its life. A gate's coverage has to be described by what it
+cannot reach, not only by what it checks.
+
+Two limits are deliberate and must not be quietly relaxed. The four **top-level** `POST` creates
+(collectors, devices, ipgroups, ipsubnets) are recorded UNVERIFIED rather than probed: a top-level
+create has no parent id to falsify, so the only guard would be the API rejecting an incomplete body,
+and §0.5 M15 measured it answering 500 instead. And **route probes must not use `LumicsClient`** —
+it sends `Accept: application/json`, under which the API's router 404 is negotiated into JSON and
+every path, dead or alive, classifies as routed. See spec §0.5.
 
 If no maintainer can run them for a given release, say so in the release notes rather than skipping
 the step silently. An undisclosed skip is worse than a disclosed one.

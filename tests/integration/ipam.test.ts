@@ -39,7 +39,7 @@ const GROUP = `${GROUPS}/${TEST_GROUP_ID}`;
 
 /** SINGULAR — spec §8.1/§8.2 reads. */
 const ADDRESSES_READ = `/companies/${C}/ipsubnet/${TEST_SUBNET_ID}/ipaddresses`;
-/** PLURAL — spec §8.3/§8.4/§8.5 writes. */
+/** SINGULAR too — spec §8.3/§8.4/§8.5 document the plural and are wrong (MEASURED 2026-07-31). */
 const ADDRESSES_WRITE = `/companies/${C}/ipsubnet/${TEST_SUBNET_ID}/ipaddresses`;
 
 const SAMPLE_SUBNET = {
