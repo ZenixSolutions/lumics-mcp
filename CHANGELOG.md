@@ -9,6 +9,32 @@ Note that while the version is below `1.0.0`, the tool surface is not yet stable
 to a tool name or its arguments ships as a **minor** bump with an explicit notice in this file. See
 [docs/RELEASE.md](./docs/RELEASE.md).
 
+## [Unreleased]
+
+### Changed
+
+- **Source maps are no longer published.** `dist/**/*.map` is excluded from the tarball, cutting it
+  from 92 files and 748.7 kB unpacked to **48 files and 573.9 kB** — about 23% off every `npx`
+  invocation and every install.
+
+  They were inert. The 44 maps `0.1.0` and `0.1.1` shipped point at `../src/*.ts`, carry no
+  `sourcesContent`, and `src` is not in the package, so nothing existed at the targets on a
+  consumer's disk. Every consumer paid 181 kB for debugging support that could not work.
+
+  They are still emitted by `npm run build` and still work locally, where the sources are present.
+  The exclusion is a negated pattern in `package.json` `files`, not a build change, so nothing about
+  the local development experience changes. Shipping resolvable maps instead would have meant
+  publishing `src` and growing the package to roughly 1.15 MB; that trade-off is recorded in
+  [#9](https://github.com/ZenixSolutions/lumics-mcp/issues/9).
+
+### Added
+
+- `tests/installation/package-contents.test.ts` asks `npm pack` what it would publish and asserts
+  the answer. It covers both directions in which `files` fails silently: too broad, which is how the
+  maps shipped, and too narrow, which would publish a package that installs and cannot start. It
+  also asserts no `.env`, key or `.npmrc` is packed, and that nothing outside `dist/` and the four
+  named documents appears at all. Verified it fails when the map exclusion is removed.
+
 ## [0.1.1] - 2026-07-31
 
 Fixes three tools that could never have worked in `0.1.0`.
