@@ -29,10 +29,10 @@ jobs:
         node: ['20', '22']
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node ${{ matrix.node }}
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: ${{ matrix.node }}
           cache: npm
@@ -70,7 +70,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           # Full history so the scan covers every commit, not just the tip.
           fetch-depth: 0
@@ -79,7 +79,7 @@ jobs:
         # Pinned to a release tag. Never use @master or @main for a third-party
         # action: a mutable ref is a remote-code-execution path into CI.
         # Dependabot keeps this pin current (.github/dependabot.yml).
-        uses: trufflesecurity/trufflehog@v3.88.0
+        uses: trufflesecurity/trufflehog@v3.96.0
         with:
           path: ./
           # --only-verified keeps this a blocking gate rather than a noise
@@ -110,10 +110,10 @@ jobs:
     needs: validate
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Set up Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v7
         with:
           node-version: '20'
           cache: npm
