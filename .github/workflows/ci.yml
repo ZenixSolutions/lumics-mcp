@@ -92,7 +92,7 @@ jobs:
         # tagged `3.96.0`. Passing the `v` form here fails the job with
         # `manifest unknown` and exit 125 — noisy, but fail-closed, which is the
         # right direction for a security gate.
-        uses: trufflesecurity/trufflehog@v3.96.0
+        uses: trufflesecurity/trufflehog@v3.97.0
         with:
           path: ./
           version: 3.96.0
