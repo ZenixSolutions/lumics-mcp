@@ -71,13 +71,13 @@
   "devDependencies": {
     "@eslint/js": "10.0.1",
     "@types/express": "5.0.6",
-    "@types/node": "22.20.1",
-    "@vitest/coverage-v8": "4.1.10",
-    "eslint": "10.8.0",
-    "prettier": "3.9.6",
+    "@types/node": "22.20.3",
+    "@vitest/coverage-v8": "4.1.11",
+    "eslint": "10.10.0",
+    "prettier": "3.9.8",
     "typescript": "6.0.3",
-    "typescript-eslint": "8.65.0",
-    "vitest": "4.1.10"
+    "typescript-eslint": "8.70.0",
+    "vitest": "4.1.11"
   },
   "mcpName": "io.github.zenixsolutions/lumics-mcp"
 }
